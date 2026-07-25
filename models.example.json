@@ -1,0 +1,29 @@
+{
+  "providers": {
+    "openai-compatible": {
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "compat": {
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": true
+      },
+      "models": [
+        {
+          "id": "example-coder",
+          "name": "Example Coder",
+          "reasoning": true,
+          "contextWindow": 128000,
+          "thinkingLevelMap": {
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          }
+        }
+      ]
+    }
+  }
+}

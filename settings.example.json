@@ -1,0 +1,12 @@
+{
+  "defaultProvider": "openai-compatible",
+  "defaultModel": "example-coder",
+  "defaultThinkingLevel": "high",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "enabled": true
+    }
+  }
+}
