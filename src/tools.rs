@@ -12,19 +12,24 @@ use rmcp::{RoleClient, ServiceExt};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStderr, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::McpServerConfig;
 use crate::protocol::{FunctionDefinition, ToolCall, ToolDefinition};
+use crate::session::ToolReplayPolicy;
 
 const MAX_TOOL_OUTPUT_CHARS: usize = 60_000;
+const MCP_CALL_TIMEOUT: Duration = Duration::from_mins(2);
+const MAX_MCP_STDERR_BYTES: usize = 16_000;
 
 pub struct ToolRegistry {
     root: PathBuf,
     definitions: Vec<ToolDefinition>,
     mcp_servers: Vec<McpService>,
     mcp_routes: BTreeMap<String, McpToolRoute>,
+    mcp_startup_failures: Vec<McpStartupFailure>,
 }
 
 type McpService = RunningService<RoleClient, ()>;
@@ -33,6 +38,12 @@ type McpService = RunningService<RoleClient, ()>;
 struct McpToolRoute {
     server_index: usize,
     tool_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpStartupFailure {
+    pub server: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -68,14 +79,24 @@ impl ToolRegistry {
             definitions: Self::builtin_definitions(),
             mcp_servers: Vec::new(),
             mcp_routes: BTreeMap::new(),
+            mcp_startup_failures: Vec::new(),
         })
     }
 
     pub async fn with_mcp(root: impl AsRef<Path>, servers: &[McpServerConfig]) -> Result<Self> {
         let mut registry = Self::new(root)?;
         for server in servers {
-            let service = connect_mcp_server(server, &registry.root).await?;
-            registry.register_mcp_server(&server.name, service).await?;
+            let result = async {
+                let service = connect_mcp_server(server, &registry.root).await?;
+                registry.register_mcp_server(&server.name, service).await
+            }
+            .await;
+            if let Err(error) = result {
+                registry.mcp_startup_failures.push(McpStartupFailure {
+                    server: server.name.clone(),
+                    message: format!("{error:#}"),
+                });
+            }
         }
         Ok(registry)
     }
@@ -95,6 +116,25 @@ impl ToolRegistry {
         self.mcp_routes.len()
     }
 
+    #[must_use]
+    pub fn mcp_startup_failures(&self) -> &[McpStartupFailure] {
+        &self.mcp_startup_failures
+    }
+
+    #[must_use]
+    pub fn requires_approval(&self, name: &str) -> bool {
+        name == "shell" || self.mcp_routes.contains_key(name)
+    }
+
+    #[must_use]
+    pub fn replay_policy(&self, name: &str) -> ToolReplayPolicy {
+        if name == "read_file" {
+            ToolReplayPolicy::Safe
+        } else {
+            ToolReplayPolicy::Never
+        }
+    }
+
     fn builtin_definitions() -> Vec<ToolDefinition> {
         vec![
             ToolDefinition {
@@ -106,12 +146,13 @@ impl ToolRegistry {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string"},
-                            "offset": {"type": "integer", "minimum": 1},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
+                            "offset": {"type": ["integer", "null"], "minimum": 1},
+                            "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 2000}
                         },
-                        "required": ["path"],
+                        "required": ["path", "offset", "limit"],
                         "additionalProperties": false
                     }),
+                    strict: Some(true),
                 },
             },
             ToolDefinition {
@@ -128,6 +169,7 @@ impl ToolRegistry {
                         "required": ["path", "content"],
                         "additionalProperties": false
                     }),
+                    strict: Some(true),
                 },
             },
             ToolDefinition {
@@ -141,11 +183,12 @@ impl ToolRegistry {
                             "path": {"type": "string"},
                             "old_text": {"type": "string"},
                             "new_text": {"type": "string"},
-                            "replace_all": {"type": "boolean", "default": false}
+                            "replace_all": {"type": "boolean"}
                         },
-                        "required": ["path", "old_text", "new_text"],
+                        "required": ["path", "old_text", "new_text", "replace_all"],
                         "additionalProperties": false
                     }),
+                    strict: Some(true),
                 },
             },
             ToolDefinition {
@@ -158,15 +201,15 @@ impl ToolRegistry {
                         "properties": {
                             "command": {"type": "string"},
                             "timeout_seconds": {
-                                "type": "integer",
+                                "type": ["integer", "null"],
                                 "minimum": 1,
-                                "maximum": 1800,
-                                "default": 120
+                                "maximum": 1800
                             }
                         },
-                        "required": ["command"],
+                        "required": ["command", "timeout_seconds"],
                         "additionalProperties": false
                     }),
+                    strict: Some(true),
                 },
             },
         ]
@@ -235,6 +278,7 @@ impl ToolRegistry {
                     name: exposed_name.clone(),
                     description,
                     parameters: serde_json::Value::Object((*tool.input_schema).clone()),
+                    strict: None,
                 },
             });
             self.mcp_routes.insert(
@@ -265,11 +309,18 @@ impl ToolRegistry {
         let request = CallToolRequestParams::new(route.tool_name.clone()).with_arguments(arguments);
         let result = tokio::select! {
             () = cancel.cancelled() => return ToolExecution::error("MCP tool call cancelled"),
-            result = self.mcp_servers[route.server_index].peer().call_tool(request) => result,
+            result = tokio::time::timeout(
+                MCP_CALL_TIMEOUT,
+                self.mcp_servers[route.server_index].peer().call_tool(request),
+            ) => result,
         };
         match result {
-            Ok(result) => mcp_result_to_execution(result),
-            Err(error) => ToolExecution::error(format!("MCP tool call failed: {error}")),
+            Ok(Ok(result)) => mcp_result_to_execution(result),
+            Ok(Err(error)) => ToolExecution::error(format!("MCP tool call failed: {error}")),
+            Err(_) => ToolExecution::error(format!(
+                "MCP tool call timed out after {} seconds",
+                MCP_CALL_TIMEOUT.as_secs()
+            )),
         }
     }
 
@@ -299,7 +350,7 @@ impl ToolRegistry {
                 .await
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        tokio::fs::write(&path, args.content.as_bytes())
+        atomic_write(&path, args.content.as_bytes())
             .await
             .with_context(|| format!("failed to write {}", display_relative(&self.root, &path)))?;
         Ok(format!(
@@ -335,7 +386,7 @@ impl ToolRegistry {
         } else {
             text.replacen(&args.old_text, &args.new_text, 1)
         };
-        tokio::fs::write(&path, updated.as_bytes())
+        atomic_write(&path, updated.as_bytes())
             .await
             .with_context(|| format!("failed to write {}", display_relative(&self.root, &path)))?;
         Ok(format!(
@@ -424,6 +475,51 @@ impl ToolRegistry {
     }
 }
 
+async fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("file path has no parent: {}", path.display()))?;
+    let existing_permissions = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let temporary = parent.join(format!(".mcode-write-{}.tmp", uuid::Uuid::now_v7()));
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .await
+            .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+        file.write_all(contents)
+            .await
+            .with_context(|| format!("failed to write temporary file in {}", parent.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("failed to flush temporary file in {}", parent.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to sync temporary file in {}", parent.display()))?;
+        drop(file);
+        if let Some(permissions) = existing_permissions {
+            tokio::fs::set_permissions(&temporary, permissions)
+                .await
+                .with_context(|| {
+                    format!("failed to preserve permissions for {}", path.display())
+                })?;
+        }
+        tokio::fs::rename(&temporary, path)
+            .await
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
+}
+
 async fn connect_mcp_server(server: &McpServerConfig, root: &Path) -> Result<McpService> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -432,8 +528,8 @@ async fn connect_mcp_server(server: &McpServerConfig, root: &Path) -> Result<Mcp
         .args(&server.args)
         .envs(&server.env)
         .current_dir(root);
-    let (transport, _) = TokioChildProcess::builder(command)
-        .stderr(Stdio::null())
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| {
             format!(
@@ -441,16 +537,57 @@ async fn connect_mcp_server(server: &McpServerConfig, root: &Path) -> Result<Mcp
                 server.name, server.command
             )
         })?;
-    tokio::time::timeout(STARTUP_TIMEOUT, ().serve(transport))
+    let stderr_task = stderr.map(|stderr| tokio::spawn(capture_mcp_stderr(stderr)));
+    let startup = tokio::time::timeout(STARTUP_TIMEOUT, ().serve(transport)).await;
+    match startup {
+        Ok(Ok(service)) => Ok(service),
+        result => {
+            let stderr = collect_mcp_stderr(stderr_task).await;
+            let detail = match result {
+                Err(_) => format!(
+                    "MCP server {:?} did not initialize within {} seconds",
+                    server.name,
+                    STARTUP_TIMEOUT.as_secs()
+                ),
+                Ok(Err(error)) => {
+                    format!("failed to initialize MCP server {:?}: {error}", server.name)
+                }
+                Ok(Ok(_)) => unreachable!("successful MCP startup returned above"),
+            };
+            if stderr.is_empty() {
+                bail!(detail);
+            }
+            bail!("{detail}; stderr: {stderr}");
+        }
+    }
+}
+
+async fn capture_mcp_stderr(mut stderr: ChildStderr) -> String {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    while let Ok(read) = stderr.read(&mut buffer).await {
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_MCP_STDERR_BYTES.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    let mut text = String::from_utf8_lossy(&captured).trim().to_string();
+    if captured.len() == MAX_MCP_STDERR_BYTES {
+        text.push_str(" ... <stderr truncated>");
+    }
+    text
+}
+
+async fn collect_mcp_stderr(task: Option<tokio::task::JoinHandle<String>>) -> String {
+    let Some(task) = task else {
+        return String::new();
+    };
+    tokio::time::timeout(Duration::from_secs(1), task)
         .await
-        .with_context(|| {
-            format!(
-                "MCP server {:?} did not initialize within {} seconds",
-                server.name,
-                STARTUP_TIMEOUT.as_secs()
-            )
-        })?
-        .with_context(|| format!("failed to initialize MCP server {:?}", server.name))
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default()
 }
 
 fn unique_mcp_tool_name(server: &str, tool: &str, used: &BTreeSet<String>) -> String {
@@ -716,6 +853,16 @@ mod tests {
             .await;
         assert!(!result.is_error, "{}", result.output);
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                temp.path().join("src/lib.rs"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+        }
+
         let result = registry
             .execute(
                 &call(
@@ -730,6 +877,27 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "{}", result.output);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(temp.path().join("src/lib.rs"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+        assert!(
+            std::fs::read_dir(temp.path().join("src"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcode-write-"))
+        );
 
         let result = registry
             .execute(&call("read_file", &json!({"path": "src/lib.rs"})), &cancel)
@@ -772,6 +940,9 @@ mod tests {
 
         assert_eq!(registry.mcp_server_count(), 1);
         assert_eq!(registry.mcp_tool_count(), 1);
+        assert!(registry.requires_approval("mcp__fixture_server__echo"));
+        assert!(registry.requires_approval("shell"));
+        assert!(!registry.requires_approval("read_file"));
         assert!(
             registry
                 .definitions()
@@ -818,15 +989,33 @@ done
 "#,
         )
         .unwrap();
+        let broken_server = McpServerConfig {
+            name: "broken".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo fixture-startup-error >&2; exit 1".to_string(),
+            ],
+            env: BTreeMap::new(),
+        };
         let server = McpServerConfig {
             name: "stdio".to_string(),
             command: "/bin/sh".to_string(),
             args: vec![script.to_string_lossy().into_owned()],
             env: BTreeMap::new(),
         };
-        let registry = ToolRegistry::with_mcp(temp.path(), &[server])
+        let registry = ToolRegistry::with_mcp(temp.path(), &[broken_server, server])
             .await
             .unwrap();
+
+        assert_eq!(registry.mcp_server_count(), 1);
+        assert_eq!(registry.mcp_startup_failures().len(), 1);
+        assert_eq!(registry.mcp_startup_failures()[0].server, "broken");
+        assert!(
+            registry.mcp_startup_failures()[0]
+                .message
+                .contains("fixture-startup-error")
+        );
 
         let result = registry
             .execute(

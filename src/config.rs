@@ -12,6 +12,23 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4.1";
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionSettings {
+    pub enabled: bool,
+    pub reserve_tokens: u64,
+    pub keep_recent_tokens: u64,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum,
 )]
@@ -59,18 +76,109 @@ impl fmt::Display for ReasoningEffort {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApiProtocol {
+    #[serde(rename = "openai-completions")]
+    ChatCompletions,
+    #[serde(rename = "openai-responses")]
+    Responses,
+}
+
+impl ApiProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "openai-completions",
+            Self::Responses => "openai-responses",
+        }
+    }
+}
+
+impl fmt::Display for ApiProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lower")]
+pub enum WebSearchMode {
+    #[default]
+    Disabled,
+    Cached,
+    Live,
+}
+
+impl WebSearchMode {
+    pub const ALL: [Self; 3] = [Self::Disabled, Self::Cached, Self::Live];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Cached => "cached",
+            Self::Live => "live",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+impl fmt::Display for WebSearchMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchContextSize {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchLocation {
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebSearchSettings {
+    pub mode: WebSearchMode,
+    pub context_size: Option<WebSearchContextSize>,
+    pub allowed_domains: Vec<String>,
+    pub location: Option<WebSearchLocation>,
+}
+
 #[derive(Clone)]
 pub struct ModelProfile {
     pub provider: String,
     pub id: String,
     pub name: Option<String>,
+    pub api: ApiProtocol,
     pub base_url: String,
     pub api_key: Option<String>,
     pub context_window: u64,
+    pub max_input_tokens: u64,
     pub reasoning: bool,
-    pub supports_reasoning_effort: bool,
-    pub supports_usage_in_streaming: bool,
+    pub compat: ModelCompat,
     thinking_level_map: BTreeMap<ReasoningEffort, Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCompat {
+    pub reasoning_effort: bool,
+    pub usage_in_streaming: bool,
+    pub strict_tools: bool,
 }
 
 impl ModelProfile {
@@ -139,16 +247,21 @@ impl ModelProfile {
 pub struct AppConfig {
     pub model: String,
     pub provider: Option<String>,
+    pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
     pub reasoning_value: Option<String>,
     pub base_url: String,
     pub api_key: Option<String>,
     pub context_window: u64,
+    pub max_input_tokens: u64,
     pub supports_reasoning_effort: bool,
     pub supports_usage_in_streaming: bool,
+    pub supports_strict_tools: bool,
     pub cwd: PathBuf,
     pub max_tool_turns: usize,
     pub request_timeout_secs: u64,
+    pub compaction: CompactionSettings,
+    pub web_search: WebSearchSettings,
     pub model_profiles: Vec<ModelProfile>,
     pub mcp_servers: Vec<McpServerConfig>,
 }
@@ -168,9 +281,11 @@ pub struct ConfigOverrides {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub context_window: Option<u64>,
+    pub max_input_tokens: Option<u64>,
     pub cwd: Option<PathBuf>,
     pub max_tool_turns: Option<usize>,
     pub request_timeout_secs: Option<u64>,
+    pub web_search: Option<WebSearchMode>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -183,6 +298,28 @@ struct SettingsFile {
     thinking_level: Option<ReasoningEffort>,
     #[serde(default, rename = "mcpServers")]
     mcp_servers: BTreeMap<String, McpServerFile>,
+    #[serde(default)]
+    compaction: CompactionSettingsFile,
+    #[serde(rename = "webSearch")]
+    web_search: Option<WebSearchMode>,
+    #[serde(default, rename = "webSearchConfig")]
+    web_search_config: WebSearchSettingsFile,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactionSettingsFile {
+    enabled: Option<bool>,
+    reserve_tokens: Option<u64>,
+    keep_recent_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSearchSettingsFile {
+    context_size: Option<WebSearchContextSize>,
+    allowed_domains: Option<Vec<String>>,
+    location: Option<WebSearchLocation>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -205,6 +342,27 @@ impl SettingsFile {
         }
         if other.thinking_level.is_some() {
             self.thinking_level = other.thinking_level;
+        }
+        if other.compaction.enabled.is_some() {
+            self.compaction.enabled = other.compaction.enabled;
+        }
+        if other.compaction.reserve_tokens.is_some() {
+            self.compaction.reserve_tokens = other.compaction.reserve_tokens;
+        }
+        if other.compaction.keep_recent_tokens.is_some() {
+            self.compaction.keep_recent_tokens = other.compaction.keep_recent_tokens;
+        }
+        if other.web_search.is_some() {
+            self.web_search = other.web_search;
+        }
+        if other.web_search_config.context_size.is_some() {
+            self.web_search_config.context_size = other.web_search_config.context_size;
+        }
+        if other.web_search_config.allowed_domains.is_some() {
+            self.web_search_config.allowed_domains = other.web_search_config.allowed_domains;
+        }
+        if other.web_search_config.location.is_some() {
+            self.web_search_config.location = other.web_search_config.location;
         }
         self.mcp_servers.extend(other.mcp_servers);
     }
@@ -236,6 +394,7 @@ struct ModelFile {
     api: Option<String>,
     reasoning: Option<bool>,
     context_window: Option<u64>,
+    max_input_tokens: Option<u64>,
     #[serde(default)]
     compat: CompatFile,
     #[serde(default)]
@@ -243,21 +402,21 @@ struct ModelFile {
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CompatFile {
-    supports_reasoning_effort: Option<bool>,
-    supports_usage_in_streaming: Option<bool>,
+    #[serde(rename = "supportsReasoningEffort")]
+    reasoning_effort: Option<bool>,
+    #[serde(rename = "supportsUsageInStreaming")]
+    usage_in_streaming: Option<bool>,
+    #[serde(rename = "supportsStrictTools")]
+    strict_tools: Option<bool>,
 }
 
 impl CompatFile {
     fn merge(self, model: Self) -> Self {
         Self {
-            supports_reasoning_effort: model
-                .supports_reasoning_effort
-                .or(self.supports_reasoning_effort),
-            supports_usage_in_streaming: model
-                .supports_usage_in_streaming
-                .or(self.supports_usage_in_streaming),
+            reasoning_effort: model.reasoning_effort.or(self.reasoning_effort),
+            usage_in_streaming: model.usage_in_streaming.or(self.usage_in_streaming),
+            strict_tools: model.strict_tools.or(self.strict_tools),
         }
     }
 }
@@ -272,10 +431,10 @@ impl AppConfig {
             .canonicalize()
             .with_context(|| format!("working directory does not exist: {}", cwd.display()))?;
 
-        let home = dirs::home_dir();
+        let home = mcode_home_dir();
         let mut settings = SettingsFile::default();
         if let Some(home) = &home {
-            let global_path = home.join(".mcode/agent/settings.json");
+            let global_path = home.join("agent/settings.json");
             if global_path.is_file() {
                 settings.overlay(read_json(&global_path)?);
             }
@@ -293,8 +452,10 @@ impl AppConfig {
         let fallback_api_key = env_non_empty("OPENAI_API_KEY");
         let environment_context = env_u64("OPENAI_CONTEXT_WINDOW").transpose()?;
         let context_window_override = overrides.context_window.or(environment_context);
+        let environment_max_input = env_u64("OPENAI_MAX_INPUT_TOKENS").transpose()?;
+        let max_input_tokens_override = overrides.max_input_tokens.or(environment_max_input);
         let mut model_profiles = if let Some(home) = &home {
-            let models_path = home.join(".mcode/agent/models.json");
+            let models_path = home.join("agent/models.json");
             if models_path.is_file() {
                 build_model_profiles(
                     read_json::<ModelsFile>(&models_path)?,
@@ -302,6 +463,7 @@ impl AppConfig {
                     overrides.api_key_env.as_ref().map(|_| &forced_api_key),
                     fallback_api_key.as_ref(),
                     context_window_override,
+                    max_input_tokens_override,
                 )?
             } else {
                 Vec::new()
@@ -331,6 +493,17 @@ impl AppConfig {
         let provider = selected_profile
             .map(|profile| profile.provider.clone())
             .or_else(|| settings.provider.clone());
+        let configured_web_search = overrides.web_search.or(settings.web_search);
+        let api = selected_profile.map_or_else(
+            || {
+                if configured_web_search.is_some_and(WebSearchMode::is_enabled) {
+                    ApiProtocol::Responses
+                } else {
+                    ApiProtocol::ChatCompletions
+                }
+            },
+            |profile| profile.api,
+        );
 
         let environment_reasoning = env_reasoning("OPENAI_REASONING_EFFORT").transpose()?;
         let requested_reasoning_effort = overrides
@@ -362,12 +535,43 @@ impl AppConfig {
         let context_window = context_window_override
             .or_else(|| selected_profile.map(|profile| profile.context_window))
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let max_input_tokens = max_input_tokens_override
+            .or_else(|| selected_profile.map(|profile| profile.max_input_tokens))
+            .unwrap_or(context_window);
         let supports_reasoning_effort =
-            selected_profile.is_none_or(|profile| profile.supports_reasoning_effort);
+            selected_profile.is_none_or(|profile| profile.compat.reasoning_effort);
         let supports_usage_in_streaming =
-            selected_profile.is_none_or(|profile| profile.supports_usage_in_streaming);
+            selected_profile.is_none_or(|profile| profile.compat.usage_in_streaming);
+        let supports_strict_tools = selected_profile.map_or_else(
+            || api == ApiProtocol::Responses && is_official_openai_url(&base_url),
+            |profile| profile.compat.strict_tools,
+        );
         let max_tool_turns = overrides.max_tool_turns.unwrap_or(32);
         let request_timeout_secs = overrides.request_timeout_secs.unwrap_or(300);
+        let defaults = CompactionSettings::default();
+        let compaction = CompactionSettings {
+            enabled: settings.compaction.enabled.unwrap_or(defaults.enabled),
+            reserve_tokens: settings
+                .compaction
+                .reserve_tokens
+                .unwrap_or(defaults.reserve_tokens),
+            keep_recent_tokens: settings
+                .compaction
+                .keep_recent_tokens
+                .unwrap_or(defaults.keep_recent_tokens),
+        };
+        let web_search = WebSearchSettings {
+            mode: configured_web_search.unwrap_or(match api {
+                ApiProtocol::ChatCompletions => WebSearchMode::Disabled,
+                ApiProtocol::Responses => WebSearchMode::Cached,
+            }),
+            context_size: settings.web_search_config.context_size,
+            allowed_domains: settings
+                .web_search_config
+                .allowed_domains
+                .unwrap_or_default(),
+            location: settings.web_search_config.location,
+        };
         let mcp_servers = build_mcp_servers(&settings.mcp_servers)?;
 
         if selected_model.trim().is_empty() {
@@ -376,26 +580,43 @@ impl AppConfig {
         if context_window == 0 {
             bail!("context window must be at least 1");
         }
+        if max_input_tokens == 0 || max_input_tokens > context_window {
+            bail!(
+                "max input tokens must be between 1 and the {context_window}-token context window"
+            );
+        }
         if max_tool_turns == 0 {
             bail!("max tool turns must be at least 1");
         }
         if request_timeout_secs == 0 {
             bail!("request timeout must be at least 1 second");
         }
+        if compaction.reserve_tokens == 0 {
+            bail!("compaction.reserveTokens must be at least 1");
+        }
+        if compaction.keep_recent_tokens == 0 {
+            bail!("compaction.keepRecentTokens must be at least 1");
+        }
+        validate_web_search(api, &web_search)?;
 
         Ok(Self {
             model: selected_model,
             provider,
+            api,
             reasoning_effort,
             reasoning_value,
             base_url,
             api_key,
             context_window,
+            max_input_tokens,
             supports_reasoning_effort,
             supports_usage_in_streaming,
+            supports_strict_tools,
             cwd,
             max_tool_turns,
             request_timeout_secs,
+            compaction,
+            web_search,
             model_profiles,
             mcp_servers,
         })
@@ -405,15 +626,19 @@ impl AppConfig {
         let profile =
             find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?.cloned();
         if let Some(profile) = profile {
+            validate_web_search(profile.api, &self.web_search)?;
             self.reasoning_effort = profile.clamp_reasoning_effort(self.reasoning_effort);
             self.reasoning_value = profile.reasoning_value(self.reasoning_effort)?;
             self.model = profile.id;
             self.provider = Some(profile.provider);
+            self.api = profile.api;
             self.base_url = profile.base_url;
             self.api_key = profile.api_key;
             self.context_window = profile.context_window;
-            self.supports_reasoning_effort = profile.supports_reasoning_effort;
-            self.supports_usage_in_streaming = profile.supports_usage_in_streaming;
+            self.max_input_tokens = profile.max_input_tokens;
+            self.supports_reasoning_effort = profile.compat.reasoning_effort;
+            self.supports_usage_in_streaming = profile.compat.usage_in_streaming;
+            self.supports_strict_tools = profile.compat.strict_tools;
         } else {
             let query = query.trim();
             if query.is_empty() {
@@ -459,6 +684,14 @@ impl AppConfig {
     }
 }
 
+#[must_use]
+pub fn mcode_home_dir() -> Option<PathBuf> {
+    env::var_os("MCODE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".mcode")))
+}
+
 fn build_mcp_servers(servers: &BTreeMap<String, McpServerFile>) -> Result<Vec<McpServerConfig>> {
     let mut configured = Vec::new();
     for (name, server) in servers {
@@ -500,6 +733,26 @@ fn build_mcp_servers(servers: &BTreeMap<String, McpServerFile>) -> Result<Vec<Mc
     Ok(configured)
 }
 
+fn validate_web_search(api: ApiProtocol, settings: &WebSearchSettings) -> Result<()> {
+    if settings.mode.is_enabled() && api != ApiProtocol::Responses {
+        bail!(
+            "web search mode {} requires an openai-responses model",
+            settings.mode
+        );
+    }
+    if settings.allowed_domains.len() > 100 {
+        bail!("webSearchConfig.allowedDomains cannot contain more than 100 domains");
+    }
+    for domain in &settings.allowed_domains {
+        if domain.trim().is_empty() || domain.contains("://") {
+            bail!(
+                "invalid web search domain {domain:?}; use a hostname without http:// or https://"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn find_model_profile<'a>(
     profiles: &'a [ModelProfile],
     preferred_provider: Option<&str>,
@@ -516,17 +769,17 @@ pub fn find_model_profile<'a>(
     {
         return Ok(Some(profile));
     }
-    if let Some(provider) = preferred_provider {
-        if let Some(profile) = profiles.iter().find(|profile| {
+    if let Some(provider) = preferred_provider
+        && let Some(profile) = profiles.iter().find(|profile| {
             profile.provider == provider
                 && (profile.id == query
                     || profile
                         .name
                         .as_deref()
                         .is_some_and(|name| name.eq_ignore_ascii_case(query)))
-        }) {
-            return Ok(Some(profile));
-        }
+        })
+    {
+        return Ok(Some(profile));
     }
 
     let matches = profiles
@@ -559,14 +812,19 @@ fn build_model_profiles(
     forced_api_key: Option<&Option<String>>,
     fallback_api_key: Option<&String>,
     context_window_override: Option<u64>,
+    max_input_tokens_override: Option<u64>,
 ) -> Result<Vec<ModelProfile>> {
     let mut profiles = Vec::new();
     for (provider_name, provider) in file.providers {
         for model in provider.models {
-            let api = model.api.as_deref().or(provider.api.as_deref());
-            if api != Some("openai-completions") {
+            let Some(api) = model
+                .api
+                .as_deref()
+                .or(provider.api.as_deref())
+                .and_then(parse_api_protocol)
+            else {
                 continue;
-            }
+            };
             if model.id.trim().is_empty() {
                 bail!("provider {provider_name} contains a model with an empty id");
             }
@@ -602,6 +860,10 @@ fn build_model_profiles(
             let context_window = context_window_override
                 .or(model.context_window)
                 .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+            let max_input_tokens = max_input_tokens_override
+                .or(context_window_override)
+                .or(model.max_input_tokens)
+                .unwrap_or(context_window);
             let compat = provider.compat.merge(model.compat);
             if context_window == 0 {
                 bail!(
@@ -610,21 +872,51 @@ fn build_model_profiles(
                     model.id
                 );
             }
+            if max_input_tokens == 0 || max_input_tokens > context_window {
+                bail!(
+                    "model {}/{} has maxInputTokens outside its 1..={context_window} context window",
+                    provider_name,
+                    model.id
+                );
+            }
+            let supports_strict_tools = compat.strict_tools.unwrap_or_else(|| {
+                api == ApiProtocol::Responses && is_official_openai_url(&base_url)
+            });
             profiles.push(ModelProfile {
                 provider: provider_name.clone(),
                 id: model.id,
                 name: model.name,
+                api,
                 base_url,
                 api_key,
                 context_window,
+                max_input_tokens,
                 reasoning: model.reasoning.unwrap_or(false),
-                supports_reasoning_effort: compat.supports_reasoning_effort.unwrap_or(true),
-                supports_usage_in_streaming: compat.supports_usage_in_streaming.unwrap_or(true),
+                compat: ModelCompat {
+                    reasoning_effort: compat.reasoning_effort.unwrap_or(true),
+                    usage_in_streaming: compat.usage_in_streaming.unwrap_or(true),
+                    strict_tools: supports_strict_tools,
+                },
                 thinking_level_map,
             });
         }
     }
     Ok(profiles)
+}
+
+fn is_official_openai_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+}
+
+fn parse_api_protocol(value: &str) -> Option<ApiProtocol> {
+    match value {
+        "openai-completions" => Some(ApiProtocol::ChatCompletions),
+        "openai-responses" => Some(ApiProtocol::Responses),
+        _ => None,
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -722,6 +1014,9 @@ mod tests {
             model: Some("model-one".into()),
             thinking_level: Some(ReasoningEffort::Low),
             mcp_servers: BTreeMap::new(),
+            compaction: CompactionSettingsFile::default(),
+            web_search: None,
+            web_search_config: WebSearchSettingsFile::default(),
         };
         base.overlay(SettingsFile {
             model: Some("model-two".into()),
@@ -731,6 +1026,30 @@ mod tests {
         assert_eq!(base.provider.as_deref(), Some("one"));
         assert_eq!(base.model.as_deref(), Some("model-two"));
         assert_eq!(base.thinking_level, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn compaction_settings_use_pi_fields_and_overlay_individually() {
+        let mut global: SettingsFile = serde_json::from_str(
+            r#"{
+                "compaction": {
+                    "enabled": false,
+                    "reserveTokens": 8192,
+                    "keepRecentTokens": 12000
+                }
+            }"#,
+        )
+        .unwrap();
+        let project: SettingsFile =
+            serde_json::from_str(r#"{"compaction":{"enabled":true,"keepRecentTokens":24000}}"#)
+                .unwrap();
+        global.overlay(project);
+
+        assert_eq!(global.compaction.enabled, Some(true));
+        assert_eq!(global.compaction.reserve_tokens, Some(8_192));
+        assert_eq!(global.compaction.keep_recent_tokens, Some(24_000));
+        assert_eq!(CompactionSettings::default().reserve_tokens, 16_384);
+        assert_eq!(CompactionSettings::default().keep_recent_tokens, 20_000);
     }
 
     #[test]
@@ -759,13 +1078,14 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let profiles = build_model_profiles(file, None, None, None, None).unwrap();
+        let profiles = build_model_profiles(file, None, None, None, None, None).unwrap();
         let profile = &profiles[0];
         assert_eq!(profile.qualified_id(), "proxy/coder");
+        assert_eq!(profile.api, ApiProtocol::ChatCompletions);
         assert_eq!(profile.context_window, 200_000);
         assert!(profile.reasoning);
-        assert!(profile.supports_reasoning_effort);
-        assert!(!profile.supports_usage_in_streaming);
+        assert!(profile.compat.reasoning_effort);
+        assert!(!profile.compat.usage_in_streaming);
         assert_eq!(
             profile.reasoning_value(ReasoningEffort::High).unwrap(),
             Some("high".to_string())
@@ -775,6 +1095,70 @@ mod tests {
             ReasoningEffort::High
         );
         assert!(profile.reasoning_value(ReasoningEffort::Max).is_err());
+    }
+
+    #[test]
+    fn parses_responses_model_and_codex_web_search_settings() {
+        let settings: SettingsFile = serde_json::from_str(
+            r#"{
+                "webSearch": "live",
+                "webSearchConfig": {
+                    "contextSize": "high",
+                    "allowedDomains": ["openai.com", "rust-lang.org"],
+                    "location": {"country": "CN", "timezone": "Asia/Shanghai"}
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(settings.web_search, Some(WebSearchMode::Live));
+        assert_eq!(
+            settings.web_search_config.context_size,
+            Some(WebSearchContextSize::High)
+        );
+        assert_eq!(
+            settings.web_search_config.allowed_domains.as_deref(),
+            Some(["openai.com".to_string(), "rust-lang.org".to_string()].as_slice())
+        );
+        assert_eq!(
+            settings
+                .web_search_config
+                .location
+                .as_ref()
+                .and_then(|location| location.timezone.as_deref()),
+            Some("Asia/Shanghai")
+        );
+
+        let models: ModelsFile = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "openai": {
+                        "api": "openai-responses",
+                        "models": [{
+                            "id": "gpt-test",
+                            "contextWindow": 300000,
+                            "maxInputTokens": 272000
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let profiles = build_model_profiles(models, None, None, None, None, None).unwrap();
+        assert_eq!(profiles[0].api, ApiProtocol::Responses);
+        assert_eq!(profiles[0].context_window, 300_000);
+        assert_eq!(profiles[0].max_input_tokens, 272_000);
+
+        let search = WebSearchSettings {
+            mode: WebSearchMode::Live,
+            context_size: settings.web_search_config.context_size,
+            allowed_domains: settings
+                .web_search_config
+                .allowed_domains
+                .unwrap_or_default(),
+            location: settings.web_search_config.location,
+        };
+        validate_web_search(ApiProtocol::Responses, &search).unwrap();
+        assert!(validate_web_search(ApiProtocol::ChatCompletions, &search).is_err());
     }
 
     #[test]
@@ -788,17 +1172,61 @@ mod tests {
     }
 
     #[test]
+    fn strict_tools_default_only_for_official_responses_profiles() {
+        let models: ModelsFile = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "openai": {
+                        "api": "openai-responses",
+                        "models": [
+                            {"id": "official-default"},
+                            {
+                                "id": "official-disabled",
+                                "compat": {"supportsStrictTools": false}
+                            }
+                        ]
+                    },
+                    "proxy": {
+                        "baseUrl": "https://proxy.test/v1",
+                        "api": "openai-responses",
+                        "models": [{"id": "proxy-default"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let profiles = build_model_profiles(models, None, None, None, None, None).unwrap();
+        let strict = |provider: &str, model: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile.provider == provider && profile.id == model)
+                .unwrap()
+                .compat
+                .strict_tools
+        };
+
+        assert!(strict("openai", "official-default"));
+        assert!(!strict("openai", "official-disabled"));
+        assert!(!strict("proxy", "proxy-default"));
+    }
+
+    #[test]
     fn model_resolution_requires_provider_for_ambiguous_ids() {
         let profile = |provider: &str| ModelProfile {
             provider: provider.to_string(),
             id: "same".to_string(),
             name: None,
+            api: ApiProtocol::ChatCompletions,
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            max_input_tokens: DEFAULT_CONTEXT_WINDOW,
             reasoning: false,
-            supports_reasoning_effort: true,
-            supports_usage_in_streaming: true,
+            compat: ModelCompat {
+                reasoning_effort: true,
+                usage_in_streaming: true,
+                strict_tools: false,
+            },
             thinking_level_map: BTreeMap::new(),
         };
         let profiles = vec![profile("one"), profile("two")];
@@ -820,27 +1248,37 @@ mod tests {
             provider: "proxy".to_string(),
             id: "coder".to_string(),
             name: None,
+            api: ApiProtocol::ChatCompletions,
             base_url: "https://proxy.test/v1".to_string(),
             api_key: Some("secret".to_string()),
             context_window: 200_000,
+            max_input_tokens: 180_000,
             reasoning: true,
-            supports_reasoning_effort: false,
-            supports_usage_in_streaming: false,
+            compat: ModelCompat {
+                reasoning_effort: false,
+                usage_in_streaming: false,
+                strict_tools: false,
+            },
             thinking_level_map: map,
         };
         let mut config = AppConfig {
             model: "old-model".to_string(),
             provider: None,
+            api: ApiProtocol::ChatCompletions,
             reasoning_effort: ReasoningEffort::High,
             reasoning_value: Some("high".to_string()),
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            max_input_tokens: DEFAULT_CONTEXT_WINDOW,
             supports_reasoning_effort: true,
             supports_usage_in_streaming: true,
+            supports_strict_tools: true,
             cwd: PathBuf::from("."),
             max_tool_turns: 32,
             request_timeout_secs: 300,
+            compaction: CompactionSettings::default(),
+            web_search: WebSearchSettings::default(),
             model_profiles: vec![profile],
             mcp_servers: Vec::new(),
         };
@@ -850,9 +1288,11 @@ mod tests {
         assert_eq!(config.provider.as_deref(), Some("proxy"));
         assert_eq!(config.base_url, "https://proxy.test/v1");
         assert_eq!(config.context_window, 200_000);
+        assert_eq!(config.max_input_tokens, 180_000);
         assert_eq!(config.reasoning_value.as_deref(), Some("deep"));
         assert!(!config.supports_reasoning_effort);
         assert!(!config.supports_usage_in_streaming);
+        assert!(!config.supports_strict_tools);
     }
 
     #[test]
@@ -861,12 +1301,17 @@ mod tests {
             provider: "proxy".to_string(),
             id: "plain".to_string(),
             name: None,
+            api: ApiProtocol::ChatCompletions,
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            max_input_tokens: DEFAULT_CONTEXT_WINDOW,
             reasoning: false,
-            supports_reasoning_effort: true,
-            supports_usage_in_streaming: true,
+            compat: ModelCompat {
+                reasoning_effort: true,
+                usage_in_streaming: true,
+                strict_tools: false,
+            },
             thinking_level_map: BTreeMap::new(),
         };
         assert!(profile.reasoning_value(ReasoningEffort::Medium).is_err());
@@ -883,12 +1328,17 @@ mod tests {
             provider: "proxy".to_string(),
             id: "only-model".to_string(),
             name: None,
+            api: ApiProtocol::ChatCompletions,
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            max_input_tokens: DEFAULT_CONTEXT_WINDOW,
             reasoning: true,
-            supports_reasoning_effort: true,
-            supports_usage_in_streaming: true,
+            compat: ModelCompat {
+                reasoning_effort: true,
+                usage_in_streaming: true,
+                strict_tools: false,
+            },
             thinking_level_map: BTreeMap::new(),
         };
         let profiles = [profile];

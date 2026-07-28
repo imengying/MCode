@@ -22,6 +22,10 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAttachment>,
+    /// Raw Responses API output items that must be replayed unchanged for
+    /// stateless multi-turn reasoning and tool calls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_items: Vec<serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -44,6 +48,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             images,
+            response_items: Vec::new(),
         }
     }
 
@@ -53,6 +58,16 @@ impl ChatMessage {
         reasoning_content: Option<String>,
         tool_calls: Vec<ToolCall>,
     ) -> Self {
+        Self::assistant_with_response_items(content, reasoning_content, tool_calls, Vec::new())
+    }
+
+    #[must_use]
+    pub fn assistant_with_response_items(
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+        response_items: Vec<serde_json::Value>,
+    ) -> Self {
         Self {
             role: MessageRole::Assistant,
             content,
@@ -60,6 +75,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content,
             images: Vec::new(),
+            response_items,
         }
     }
 
@@ -72,6 +88,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             reasoning_content: None,
             images: Vec::new(),
+            response_items: Vec::new(),
         }
     }
 
@@ -83,8 +100,23 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             images: Vec::new(),
+            response_items: Vec::new(),
         }
     }
+}
+
+/// Removes terminal control sequences from untrusted model, tool, MCP, and
+/// provider text while preserving ordinary layout characters.
+#[must_use]
+pub fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|character| match character {
+            '\n' | '\t' => Some(character),
+            '\r' => Some('\n'),
+            character if character.is_control() => None,
+            character => Some(character),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +197,52 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebSearchAction {
+    Search {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        queries: Vec<String>,
+    },
+    OpenPage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    FindInPage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+impl WebSearchAction {
+    #[must_use]
+    pub fn description(&self) -> String {
+        match self {
+            Self::Search { query, queries } => query
+                .clone()
+                .or_else(|| (!queries.is_empty()).then(|| queries.join(", ")))
+                .unwrap_or_else(|| "search completed".to_string()),
+            Self::OpenPage { url } => url.as_deref().map_or_else(
+                || "opened a page".to_string(),
+                |url| format!("opened {url}"),
+            ),
+            Self::FindInPage { url, pattern } => match (pattern, url) {
+                (Some(pattern), Some(url)) => format!("found {pattern:?} in {url}"),
+                (Some(pattern), None) => format!("found {pattern:?} in page"),
+                (None, Some(url)) => format!("searched within {url}"),
+                (None, None) => "searched within a page".to_string(),
+            },
+            Self::Other => "web search completed".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ToolDefinition {
     #[serde(rename = "type")]
@@ -197,6 +275,14 @@ mod tests {
             serde_json::to_value(ChatMessage::user_with_images("look", vec![image])).unwrap();
         assert_eq!(encoded["images"][0]["name"], "pixel.png");
     }
+
+    #[test]
+    fn strips_terminal_control_sequences_from_untrusted_text() {
+        assert_eq!(
+            sanitize_terminal_text("safe\u{1b}]52;c;secret\u{7}\r\ntext\tend"),
+            "safe]52;c;secret\n\ntext\tend"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -204,6 +290,8 @@ pub struct FunctionDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

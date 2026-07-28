@@ -1,3 +1,5 @@
 /target
-.pi/
-
+/.mcode/
+.env
+*.log
+.DS_Store

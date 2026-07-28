@@ -2,6 +2,20 @@
   "defaultProvider": "openai-compatible",
   "defaultModel": "example-coder",
   "defaultThinkingLevel": "high",
+  "webSearch": "disabled",
+  "webSearchConfig": {
+    "contextSize": "medium",
+    "allowedDomains": [],
+    "location": {
+      "country": "CN",
+      "timezone": "Asia/Shanghai"
+    }
+  },
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  },
   "mcpServers": {
     "filesystem": {
       "command": "npx",

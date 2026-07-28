@@ -1,27 +1,139 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::config::ReasoningEffort;
-use crate::protocol::ChatMessage;
+use crate::config::{ApiProtocol, AppConfig, ReasoningEffort, WebSearchMode, mcode_home_dir};
+use crate::protocol::{ChatMessage, MessageRole, ToolCall, Usage};
 
-const SESSION_VERSION: u32 = 1;
+const SESSION_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub model: String,
+    pub api: ApiProtocol,
+    pub reasoning_effort: ReasoningEffort,
+    pub web_search_mode: WebSearchMode,
+}
+
+impl SessionMetadata {
+    #[must_use]
+    pub fn local(model: impl Into<String>, reasoning_effort: ReasoningEffort) -> Self {
+        Self {
+            provider: None,
+            model: model.into(),
+            api: ApiProtocol::ChatCompletions,
+            reasoning_effort,
+            web_search_mode: WebSearchMode::Disabled,
+        }
+    }
+}
+
+impl From<&AppConfig> for SessionMetadata {
+    fn from(config: &AppConfig) -> Self {
+        Self {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            api: config.api,
+            reasoning_effort: config.reasoning_effort,
+            web_search_mode: config.web_search.mode,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Session {
     id: Uuid,
     cwd: PathBuf,
-    model: String,
-    reasoning_effort: ReasoningEffort,
+    metadata: SessionMetadata,
     created_at: u64,
     path: Option<PathBuf>,
+    writer: Option<File>,
     messages: Vec<ChatMessage>,
+    latest_compaction: Option<CompactionCheckpoint>,
+    total_usage: Usage,
+    active_run: Option<ActiveRun>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReplayPolicy {
+    Safe,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolIntent {
+    pub run_id: Uuid,
+    pub call: ToolCall,
+    pub result_id: Uuid,
+    pub replay: ToolReplayPolicy,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingToolCall {
+    pub call: ToolCall,
+    pub intent: Option<ToolIntent>,
+}
+
+#[derive(Debug)]
+struct ActiveRun {
+    id: Uuid,
+    message_start: usize,
+    completed_steps: usize,
+    generation_attempts: usize,
+    tools: BTreeMap<String, ToolIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionCheckpoint {
+    pub summary: String,
+    pub first_kept_message_index: usize,
+    pub message_count: usize,
+    pub tokens_before: u64,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modified_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub created_at: u64,
+    pub provider: Option<String>,
+    pub model: String,
+    pub api: ApiProtocol,
+    pub reasoning_effort: ReasoningEffort,
+    pub web_search_mode: WebSearchMode,
+    pub message_count: usize,
+    pub total_usage: Usage,
+    pub has_pending_run: bool,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,73 +143,117 @@ enum SessionRecord {
         version: u32,
         id: Uuid,
         cwd: PathBuf,
-        model: String,
-        #[serde(default)]
-        reasoning_effort: ReasoningEffort,
+        #[serde(flatten)]
+        metadata: SessionMetadata,
         created_at: u64,
     },
     Message {
         message: ChatMessage,
     },
-    ModelChanged {
+    RunStarted {
+        run_id: Uuid,
+        message: ChatMessage,
+        created_at: u64,
+    },
+    GenerationStarted {
+        run_id: Uuid,
+        attempt: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         model: String,
+        api: ApiProtocol,
+        created_at: u64,
+    },
+    AssistantCompleted {
+        run_id: Uuid,
+        message: ChatMessage,
+        usage: Usage,
+        estimated: bool,
+    },
+    ToolStarted {
+        #[serde(flatten)]
+        intent: ToolIntent,
+    },
+    ToolCompleted {
+        run_id: Uuid,
+        result_id: Uuid,
+        message: ChatMessage,
+    },
+    RunFinished {
+        run_id: Uuid,
+        outcome: RunOutcome,
+        created_at: u64,
+    },
+    ModelChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        model: String,
+        api: ApiProtocol,
     },
     ReasoningChanged {
         reasoning_effort: ReasoningEffort,
     },
+    WebSearchChanged {
+        web_search_mode: WebSearchMode,
+    },
+    Compaction {
+        #[serde(flatten)]
+        checkpoint: CompactionCheckpoint,
+    },
 }
 
 impl Session {
-    pub fn create(
-        cwd: &Path,
-        model: &str,
-        reasoning_effort: ReasoningEffort,
-        persist: bool,
-    ) -> Result<Self> {
+    pub fn create(cwd: &Path, metadata: SessionMetadata, persist: bool) -> Result<Self> {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
         if !persist {
             return Ok(Self {
-                id: Uuid::new_v4(),
+                id: Uuid::now_v7(),
                 cwd,
-                model: model.to_string(),
-                reasoning_effort,
+                metadata,
                 created_at: unix_timestamp(),
                 path: None,
+                writer: None,
                 messages: Vec::new(),
+                latest_compaction: None,
+                total_usage: Usage::default(),
+                active_run: None,
             });
         }
         let base = default_session_base()?;
-        Self::create_in(&base, &cwd, model, reasoning_effort)
+        Self::create_in(&base, &cwd, metadata)
     }
 
-    pub fn create_in(
-        base: &Path,
-        cwd: &Path,
-        model: &str,
-        reasoning_effort: ReasoningEffort,
-    ) -> Result<Self> {
+    pub fn create_in(base: &Path, cwd: &Path, metadata: SessionMetadata) -> Result<Self> {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let created_at = unix_timestamp();
         let directory = project_session_dir(base, &cwd);
-        fs::create_dir_all(&directory)
-            .with_context(|| format!("failed to create {}", directory.display()))?;
-        let path = directory.join(format!("{created_at}-{id}.jsonl"));
-        let session = Self {
+        create_private_directory(&directory)?;
+        let path = directory.join(rollout_filename(created_at, id)?);
+        let header = SessionRecord::Session {
+            version: SESSION_VERSION,
+            id,
+            cwd: cwd.clone(),
+            metadata: metadata.clone(),
+            created_at,
+        };
+        let writer = create_session_file(&path, &header)?;
+        Ok(Self {
             id,
             cwd,
-            model: model.to_string(),
-            reasoning_effort,
+            metadata,
             created_at,
             path: Some(path),
+            writer: Some(writer),
             messages: Vec::new(),
-        };
-        session.write_header()?;
-        Ok(session)
+            latest_compaction: None,
+            total_usage: Usage::default(),
+            active_run: None,
+        })
     }
 
     pub fn resume(cwd: &Path, selector: Option<&str>) -> Result<Self> {
@@ -109,14 +265,14 @@ impl Session {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
+        let directory = project_session_dir(base, &cwd);
         if let Some(selector) = selector {
             let direct = Path::new(selector);
             if direct.is_file() {
-                return Self::load(direct);
+                return Self::load_for_project(direct, &directory, &cwd);
             }
         }
 
-        let directory = project_session_dir(base, &cwd);
         let mut candidates = session_candidates(&directory)?;
         if let Some(selector) = selector.filter(|value| !value.eq_ignore_ascii_case("last")) {
             candidates.retain(|path| {
@@ -139,7 +295,55 @@ impl Session {
                     anyhow!("no previous session for {}", cwd.display())
                 }
             })?;
-        Self::load(&path)
+        Self::load_for_project(&path, &directory, &cwd)
+    }
+
+    pub fn list(cwd: &Path) -> Result<Vec<SessionSummary>> {
+        let base = default_session_base()?;
+        Self::list_in(&base, cwd)
+    }
+
+    pub fn list_in(base: &Path, cwd: &Path) -> Result<Vec<SessionSummary>> {
+        let cwd = cwd
+            .canonicalize()
+            .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
+        let directory = project_session_dir(base, &cwd);
+        let mut sessions = session_candidates(&directory)?
+            .into_iter()
+            .map(|path| {
+                let session = Self::load_readonly(&path)?;
+                if session.cwd != cwd {
+                    bail!(
+                        "session {} belongs to {}, not {}",
+                        session.id,
+                        session.cwd.display(),
+                        cwd.display()
+                    );
+                }
+                Ok(SessionSummary {
+                    id: session.id,
+                    created_at: session.created_at,
+                    provider: session.metadata.provider,
+                    model: session.metadata.model,
+                    api: session.metadata.api,
+                    reasoning_effort: session.metadata.reasoning_effort,
+                    web_search_mode: session.metadata.web_search_mode,
+                    message_count: session.messages.len(),
+                    total_usage: session.total_usage,
+                    has_pending_run: session.active_run.is_some(),
+                    path,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
+        Ok(sessions)
+    }
+
+    pub fn storage_directory(cwd: &Path) -> Result<PathBuf> {
+        let cwd = cwd
+            .canonicalize()
+            .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
+        Ok(project_session_dir(&default_session_base()?, &cwd))
     }
 
     pub fn delete(cwd: &Path, selector: &str) -> Result<Uuid> {
@@ -174,35 +378,57 @@ impl Session {
         let path = matches
             .pop()
             .ok_or_else(|| anyhow!("session match disappeared while resolving {selector:?}"))?;
-        let session = Self::load(&path)?;
+        let mut session = Self::load_writable(&path)?;
         if session.cwd != cwd {
             bail!(
                 "session {} belongs to a different working directory",
                 session.id
             );
         }
+        let id = session.id;
+        session.writer.take();
+        drop(session);
         fs::remove_file(&path)
             .with_context(|| format!("failed to delete session: {}", path.display()))?;
-        Ok(session.id)
+        Ok(id)
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
-        let file =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let mut lines = BufReader::new(file).lines();
-        let header = lines
+    fn load_readonly(path: &Path) -> Result<Self> {
+        Self::load_with_writer(path, None)
+    }
+
+    fn load_writable(path: &Path) -> Result<Self> {
+        let writer = open_session_writer(path)?;
+        Self::load_with_writer(path, Some(writer))
+    }
+
+    fn load_with_writer(path: &Path, mut writer: Option<File>) -> Result<Self> {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        if bytes.is_empty() {
+            bail!("session is empty: {}", path.display());
+        }
+        let utf8_len = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("session is not valid UTF-8: {}", path.display()));
+            }
+        };
+        let text = std::str::from_utf8(&bytes[..utf8_len])
+            .with_context(|| format!("session is not valid UTF-8: {}", path.display()))?;
+        let mut lines = text.split_inclusive('\n').enumerate();
+        let (_, header) = lines
             .next()
-            .transpose()
-            .with_context(|| format!("failed to read {}", path.display()))?
             .ok_or_else(|| anyhow!("session is empty: {}", path.display()))?;
-        let header: SessionRecord = serde_json::from_str(&header)
+        let header = header.trim_end_matches(['\r', '\n']);
+        let header: SessionRecord = serde_json::from_str(header)
             .with_context(|| format!("invalid session header: {}", path.display()))?;
         let SessionRecord::Session {
             version,
             id,
             cwd,
-            mut model,
-            mut reasoning_effort,
+            mut metadata,
             created_at,
         } = header
         else {
@@ -213,90 +439,614 @@ impl Session {
         }
 
         let mut messages = Vec::new();
-        for (index, line) in lines.enumerate() {
-            let line = line.with_context(|| {
-                format!("failed to read {} at line {}", path.display(), index + 2)
-            })?;
-            if line.trim().is_empty() {
+        let mut latest_compaction = None;
+        let mut total_usage = Usage::default();
+        let mut active_run: Option<ActiveRun> = None;
+        let mut valid_len = text.split_inclusive('\n').next().map_or(0, str::len);
+        let mut recovered_tail = utf8_len != bytes.len();
+        for (index, line) in lines {
+            let terminated = line.ends_with('\n');
+            let record_text = line.trim_end_matches(['\r', '\n']);
+            if record_text.trim().is_empty() {
+                valid_len = valid_len.saturating_add(line.len());
                 continue;
             }
-            let record: SessionRecord = serde_json::from_str(&line).with_context(|| {
-                format!("invalid session record at {}:{}", path.display(), index + 2)
-            })?;
+            let record: SessionRecord = match serde_json::from_str(record_text) {
+                Ok(record) => record,
+                Err(_) if !terminated => {
+                    recovered_tail = true;
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("invalid session record at {}:{}", path.display(), index + 1)
+                    });
+                }
+            };
+            valid_len = valid_len.saturating_add(line.len());
             match record {
                 SessionRecord::Message { message } => messages.push(message),
-                SessionRecord::ModelChanged { model: next_model } => model = next_model,
+                SessionRecord::RunStarted {
+                    run_id,
+                    message,
+                    created_at: _,
+                } => {
+                    if active_run.is_some() {
+                        bail!("overlapping runs at {}:{}", path.display(), index + 1);
+                    }
+                    if message.role != MessageRole::User {
+                        bail!(
+                            "run start is not a user message at {}:{}",
+                            path.display(),
+                            index + 1
+                        );
+                    }
+                    let message_start = messages.len();
+                    messages.push(message);
+                    active_run = Some(ActiveRun {
+                        id: run_id,
+                        message_start,
+                        completed_steps: 0,
+                        generation_attempts: 0,
+                        tools: BTreeMap::new(),
+                    });
+                }
+                SessionRecord::GenerationStarted {
+                    run_id,
+                    attempt,
+                    provider: _,
+                    model: _,
+                    api: _,
+                    created_at: _,
+                } => {
+                    let active = active_run.as_mut().ok_or_else(|| {
+                        anyhow!(
+                            "generation outside a run at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    if active.id != run_id || attempt != active.generation_attempts + 1 {
+                        bail!(
+                            "invalid generation sequence at {}:{}",
+                            path.display(),
+                            index + 1
+                        );
+                    }
+                    active.generation_attempts = attempt;
+                }
+                SessionRecord::AssistantCompleted {
+                    run_id,
+                    message,
+                    usage,
+                    estimated: _,
+                } => {
+                    let active = active_run.as_mut().ok_or_else(|| {
+                        anyhow!(
+                            "assistant completion outside a run at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    if active.id != run_id
+                        || active.generation_attempts == 0
+                        || message.role != MessageRole::Assistant
+                    {
+                        bail!(
+                            "invalid assistant completion at {}:{}",
+                            path.display(),
+                            index + 1
+                        );
+                    }
+                    active.completed_steps = active.completed_steps.saturating_add(1);
+                    active.generation_attempts = 0;
+                    add_usage(&mut total_usage, usage);
+                    messages.push(message);
+                }
+                SessionRecord::ToolStarted { intent } => {
+                    let active = active_run.as_mut().ok_or_else(|| {
+                        anyhow!(
+                            "tool intent outside a run at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    if active.id != intent.run_id || active.tools.contains_key(&intent.call.id) {
+                        bail!("invalid tool intent at {}:{}", path.display(), index + 1);
+                    }
+                    active.tools.insert(intent.call.id.clone(), intent);
+                }
+                SessionRecord::ToolCompleted {
+                    run_id,
+                    result_id,
+                    message,
+                } => {
+                    let active = active_run.as_mut().ok_or_else(|| {
+                        anyhow!(
+                            "tool result outside a run at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    let call_id = message.tool_call_id.as_deref().ok_or_else(|| {
+                        anyhow!(
+                            "tool result is missing its call id at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    let intent = active.tools.get(call_id).ok_or_else(|| {
+                        anyhow!(
+                            "tool result has no matching intent at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    if active.id != run_id
+                        || intent.result_id != result_id
+                        || message.role != MessageRole::Tool
+                    {
+                        bail!("invalid tool result at {}:{}", path.display(), index + 1);
+                    }
+                    active.tools.remove(call_id);
+                    messages.push(message);
+                }
+                SessionRecord::RunFinished {
+                    run_id,
+                    outcome: _,
+                    created_at: _,
+                } => {
+                    let active = active_run.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "run finish without a start at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    if active.id != run_id || !active.tools.is_empty() {
+                        bail!("invalid run finish at {}:{}", path.display(), index + 1);
+                    }
+                    active_run = None;
+                }
+                SessionRecord::ModelChanged {
+                    provider,
+                    model,
+                    api,
+                } => {
+                    metadata.provider = provider;
+                    metadata.model = model;
+                    metadata.api = api;
+                }
                 SessionRecord::ReasoningChanged {
                     reasoning_effort: next_effort,
-                } => reasoning_effort = next_effort,
+                } => metadata.reasoning_effort = next_effort,
+                SessionRecord::WebSearchChanged { web_search_mode } => {
+                    metadata.web_search_mode = web_search_mode;
+                }
+                SessionRecord::Compaction { checkpoint } => {
+                    if checkpoint.message_count != messages.len() {
+                        bail!(
+                            "invalid compaction message count at {}:{}: expected {}, found {}",
+                            path.display(),
+                            index + 1,
+                            messages.len(),
+                            checkpoint.message_count
+                        );
+                    }
+                    if checkpoint.first_kept_message_index > checkpoint.message_count {
+                        bail!(
+                            "invalid compaction boundary at {}:{}",
+                            path.display(),
+                            index + 1
+                        );
+                    }
+                    if let Some(usage) = checkpoint.usage {
+                        add_usage(&mut total_usage, usage);
+                    }
+                    latest_compaction = Some(checkpoint);
+                }
                 SessionRecord::Session { .. } => {
                     bail!(
                         "unexpected session header at {}:{}",
                         path.display(),
-                        index + 2
+                        index + 1
                     );
                 }
             }
         }
 
+        let missing_newline = valid_len > 0 && bytes.get(valid_len - 1) != Some(&b'\n');
+        if (recovered_tail || missing_newline)
+            && let Some(file) = writer.as_mut()
+        {
+            repair_session_tail(file, path, valid_len, missing_newline)?;
+        }
+
         Ok(Self {
             id,
             cwd,
-            model,
-            reasoning_effort,
+            metadata,
             created_at,
             path: Some(path.to_path_buf()),
+            writer,
             messages,
+            latest_compaction,
+            total_usage,
+            active_run,
         })
     }
 
+    fn load_for_project(path: &Path, directory: &Path, cwd: &Path) -> Result<Self> {
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve session path: {}", path.display()))?;
+        if !directory.is_dir() {
+            bail!(
+                "session path is outside the current project session directory: {}",
+                path.display()
+            );
+        }
+        let directory = directory.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve current project session directory: {}",
+                directory.display()
+            )
+        })?;
+        if path.parent() != Some(directory.as_path()) {
+            bail!(
+                "session path is outside the current project session directory: {}",
+                path.display()
+            );
+        }
+        let session = Self::load_writable(&path)?;
+        if session.cwd != cwd {
+            bail!(
+                "session {} belongs to {}, not the current working directory {}",
+                session.id,
+                session.cwd.display(),
+                cwd.display()
+            );
+        }
+        Ok(session)
+    }
+
     pub fn append(&mut self, message: ChatMessage) -> Result<()> {
-        if let Some(path) = &self.path {
-            append_record(
-                path,
-                &SessionRecord::Message {
-                    message: message.clone(),
-                },
-            )?;
+        self.persist_record(&SessionRecord::Message {
+            message: message.clone(),
+        })?;
+        self.messages.push(message);
+        Ok(())
+    }
+
+    pub fn append_compaction(
+        &mut self,
+        summary: String,
+        first_kept_message_index: usize,
+        tokens_before: u64,
+        usage: Option<Usage>,
+        read_files: Vec<String>,
+        modified_files: Vec<String>,
+    ) -> Result<CompactionCheckpoint> {
+        if first_kept_message_index > self.messages.len() {
+            bail!(
+                "compaction boundary {first_kept_message_index} exceeds the session message count {}",
+                self.messages.len()
+            );
+        }
+        let checkpoint = CompactionCheckpoint {
+            summary,
+            first_kept_message_index,
+            message_count: self.messages.len(),
+            tokens_before,
+            created_at: unix_timestamp(),
+            usage,
+            read_files,
+            modified_files,
+        };
+        self.persist_record(&SessionRecord::Compaction {
+            checkpoint: checkpoint.clone(),
+        })?;
+        if let Some(usage) = checkpoint.usage {
+            add_usage(&mut self.total_usage, usage);
+        }
+        self.latest_compaction = Some(checkpoint.clone());
+        Ok(checkpoint)
+    }
+
+    pub fn set_model(
+        &mut self,
+        provider: Option<&str>,
+        model: &str,
+        api: ApiProtocol,
+    ) -> Result<()> {
+        if self.metadata.provider.as_deref() == provider
+            && self.metadata.model == model
+            && self.metadata.api == api
+        {
+            return Ok(());
+        }
+        self.persist_record(&SessionRecord::ModelChanged {
+            provider: provider.map(ToString::to_string),
+            model: model.to_string(),
+            api,
+        })?;
+        self.metadata.provider = provider.map(ToString::to_string);
+        self.metadata.model = model.to_string();
+        self.metadata.api = api;
+        Ok(())
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
+        if self.metadata.reasoning_effort == effort {
+            return Ok(());
+        }
+        self.persist_record(&SessionRecord::ReasoningChanged {
+            reasoning_effort: effort,
+        })?;
+        self.metadata.reasoning_effort = effort;
+        Ok(())
+    }
+
+    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) -> Result<()> {
+        if self.metadata.web_search_mode == mode {
+            return Ok(());
+        }
+        self.persist_record(&SessionRecord::WebSearchChanged {
+            web_search_mode: mode,
+        })?;
+        self.metadata.web_search_mode = mode;
+        Ok(())
+    }
+
+    pub fn begin_run(&mut self, message: ChatMessage) -> Result<Uuid> {
+        if self.active_run.is_some() {
+            bail!("session already has an unfinished run");
+        }
+        if message.role != MessageRole::User {
+            bail!("a run must start with a user message");
+        }
+        let run_id = Uuid::now_v7();
+        let created_at = unix_timestamp();
+        self.persist_record(&SessionRecord::RunStarted {
+            run_id,
+            message: message.clone(),
+            created_at,
+        })?;
+        let message_start = self.messages.len();
+        self.messages.push(message);
+        self.active_run = Some(ActiveRun {
+            id: run_id,
+            message_start,
+            completed_steps: 0,
+            generation_attempts: 0,
+            tools: BTreeMap::new(),
+        });
+        Ok(run_id)
+    }
+
+    pub fn start_generation(
+        &mut self,
+        run_id: Uuid,
+        provider: Option<&str>,
+        model: &str,
+        api: ApiProtocol,
+    ) -> Result<usize> {
+        let active = self
+            .active_run
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot start a generation without an active run"))?;
+        if active.id != run_id {
+            bail!("generation belongs to a different run");
+        }
+        let attempt = active.generation_attempts.saturating_add(1);
+        self.persist_record(&SessionRecord::GenerationStarted {
+            run_id,
+            attempt,
+            provider: provider.map(ToString::to_string),
+            model: model.to_string(),
+            api,
+            created_at: unix_timestamp(),
+        })?;
+        if let Some(active) = self.active_run.as_mut() {
+            active.generation_attempts = attempt;
+        }
+        Ok(attempt)
+    }
+
+    pub fn complete_generation(
+        &mut self,
+        run_id: Uuid,
+        message: ChatMessage,
+        usage: Usage,
+        estimated: bool,
+    ) -> Result<()> {
+        let active = self
+            .active_run
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot complete a generation without an active run"))?;
+        if active.id != run_id || active.generation_attempts == 0 {
+            bail!("generation completion does not match the active run");
+        }
+        if message.role != MessageRole::Assistant {
+            bail!("generation completion must contain an assistant message");
+        }
+        self.persist_record(&SessionRecord::AssistantCompleted {
+            run_id,
+            message: message.clone(),
+            usage,
+            estimated,
+        })?;
+        if let Some(active) = self.active_run.as_mut() {
+            active.completed_steps = active.completed_steps.saturating_add(1);
+            active.generation_attempts = 0;
+        }
+        add_usage(&mut self.total_usage, usage);
+        self.messages.push(message);
+        Ok(())
+    }
+
+    pub fn start_tool(
+        &mut self,
+        run_id: Uuid,
+        call: ToolCall,
+        replay: ToolReplayPolicy,
+    ) -> Result<ToolIntent> {
+        let active = self
+            .active_run
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot start a tool without an active run"))?;
+        if active.id != run_id || active.tools.contains_key(&call.id) {
+            bail!("tool call does not match the active run");
+        }
+        let intent = ToolIntent {
+            run_id,
+            call,
+            result_id: Uuid::now_v7(),
+            replay,
+            created_at: unix_timestamp(),
+        };
+        self.persist_record(&SessionRecord::ToolStarted {
+            intent: intent.clone(),
+        })?;
+        if let Some(active) = self.active_run.as_mut() {
+            active.tools.insert(intent.call.id.clone(), intent.clone());
+        }
+        Ok(intent)
+    }
+
+    pub fn complete_tool(&mut self, intent: &ToolIntent, message: ChatMessage) -> Result<()> {
+        let active = self
+            .active_run
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot complete a tool without an active run"))?;
+        let current = active
+            .tools
+            .get(&intent.call.id)
+            .ok_or_else(|| anyhow!("tool call has no durable start record"))?;
+        if current != intent
+            || message.role != MessageRole::Tool
+            || message.tool_call_id.as_deref() != Some(intent.call.id.as_str())
+        {
+            bail!("tool result does not match its durable start record");
+        }
+        self.persist_record(&SessionRecord::ToolCompleted {
+            run_id: intent.run_id,
+            result_id: intent.result_id,
+            message: message.clone(),
+        })?;
+        if let Some(active) = self.active_run.as_mut() {
+            active.tools.remove(&intent.call.id);
         }
         self.messages.push(message);
         Ok(())
     }
 
-    pub fn set_model(&mut self, model: &str) -> Result<()> {
-        if self.model == model {
-            return Ok(());
+    pub fn finish_run(&mut self, run_id: Uuid, outcome: RunOutcome) -> Result<()> {
+        let active = self
+            .active_run
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot finish a run that is not active"))?;
+        if active.id != run_id {
+            bail!("run finish belongs to a different run");
         }
-        if let Some(path) = &self.path {
-            append_record(
-                path,
-                &SessionRecord::ModelChanged {
-                    model: model.to_string(),
-                },
-            )?;
+        if !active.tools.is_empty() {
+            bail!("cannot finish a run with unresolved tool calls");
         }
-        self.model = model.to_string();
+        self.persist_record(&SessionRecord::RunFinished {
+            run_id,
+            outcome,
+            created_at: unix_timestamp(),
+        })?;
+        self.active_run = None;
         Ok(())
     }
 
-    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
-        if self.reasoning_effort == effort {
-            return Ok(());
-        }
-        if let Some(path) = &self.path {
-            append_record(
-                path,
-                &SessionRecord::ReasoningChanged {
-                    reasoning_effort: effort,
-                },
-            )?;
-        }
-        self.reasoning_effort = effort;
-        Ok(())
+    #[must_use]
+    pub fn active_run_id(&self) -> Option<Uuid> {
+        self.active_run.as_ref().map(|run| run.id)
     }
 
-    pub fn fresh(&self, model: &str, reasoning_effort: ReasoningEffort) -> Result<Self> {
-        Self::create(&self.cwd, model, reasoning_effort, self.path.is_some())
+    #[must_use]
+    pub fn has_pending_run(&self) -> bool {
+        self.active_run.is_some()
+    }
+
+    #[must_use]
+    pub fn active_run_completed_steps(&self) -> usize {
+        self.active_run
+            .as_ref()
+            .map_or(0, |run| run.completed_steps)
+    }
+
+    #[must_use]
+    pub fn active_run_has_final_response(&self) -> bool {
+        let Some(active) = &self.active_run else {
+            return false;
+        };
+        self.messages
+            .get(active.message_start..)
+            .and_then(|messages| messages.last())
+            .is_some_and(|message| {
+                message.role == MessageRole::Assistant && message.tool_calls.is_empty()
+            })
+    }
+
+    pub fn pending_tool_calls(&self) -> Result<Vec<PendingToolCall>> {
+        let Some(active) = &self.active_run else {
+            return Ok(Vec::new());
+        };
+        let active_messages = self
+            .messages
+            .get(active.message_start..)
+            .ok_or_else(|| anyhow!("active run message boundary is invalid"))?;
+        let Some((assistant_index, assistant)) = active_messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| message.role == MessageRole::Assistant)
+        else {
+            if active.tools.is_empty() {
+                return Ok(Vec::new());
+            }
+            bail!("active run contains tool intents without an assistant message");
+        };
+        if assistant.tool_calls.is_empty() {
+            if active.tools.is_empty() {
+                return Ok(Vec::new());
+            }
+            bail!("active run contains tool intents after a final assistant response");
+        }
+        let completed = active_messages[assistant_index + 1..]
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        let pending = assistant
+            .tool_calls
+            .iter()
+            .filter(|call| !completed.contains(call.id.as_str()))
+            .map(|call| PendingToolCall {
+                call: call.clone(),
+                intent: active.tools.get(&call.id).cloned(),
+            })
+            .collect::<Vec<_>>();
+        if active
+            .tools
+            .keys()
+            .any(|call_id| !pending.iter().any(|pending| pending.call.id == *call_id))
+        {
+            bail!("active run contains an orphaned tool intent");
+        }
+        Ok(pending)
+    }
+
+    #[must_use]
+    pub const fn total_usage(&self) -> Usage {
+        self.total_usage
+    }
+
+    pub fn fresh(&self) -> Result<Self> {
+        Self::create(&self.cwd, self.metadata.clone(), self.path.is_some())
     }
 
     pub fn delete_current(&mut self) -> Result<Uuid> {
@@ -308,7 +1058,8 @@ impl Session {
         let path = self
             .path
             .as_ref()
-            .ok_or_else(|| anyhow!("this session is not persisted"))?;
+            .ok_or_else(|| anyhow!("this session is not persisted"))?
+            .clone();
         let expected_directory = project_session_dir(base, &self.cwd);
         let actual_directory = path
             .parent()
@@ -328,7 +1079,8 @@ impl Session {
         if actual_directory != expected_directory {
             bail!("refusing to delete a session outside the current project session directory");
         }
-        fs::remove_file(path)
+        self.writer.take();
+        fs::remove_file(&path)
             .with_context(|| format!("failed to delete session: {}", path.display()))?;
         self.path = None;
         Ok(self.id)
@@ -337,6 +1089,33 @@ impl Session {
     #[must_use]
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    #[must_use]
+    pub fn context_messages(&self) -> Vec<ChatMessage> {
+        let Some(compaction) = &self.latest_compaction else {
+            return self.messages.clone();
+        };
+        let first_kept = compaction.first_kept_message_index.min(self.messages.len());
+        let mut messages = Vec::with_capacity(self.messages.len() - first_kept + 1);
+        messages.push(ChatMessage::user(format!(
+            "The conversation history before this point was compacted into the following summary:\n\n<summary>\n{}\n</summary>",
+            compaction.summary
+        )));
+        messages.extend_from_slice(&self.messages[first_kept..]);
+        messages
+    }
+
+    #[must_use]
+    pub const fn latest_compaction(&self) -> Option<&CompactionCheckpoint> {
+        self.latest_compaction.as_ref()
+    }
+
+    #[must_use]
+    pub fn is_compacted_at_tip(&self) -> bool {
+        self.latest_compaction
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.message_count == self.messages.len())
     }
 
     #[must_use]
@@ -351,17 +1130,35 @@ impl Session {
 
     #[must_use]
     pub fn model(&self) -> &str {
-        &self.model
+        &self.metadata.model
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        self.metadata.provider.as_deref()
+    }
+
+    #[must_use]
+    pub const fn api(&self) -> ApiProtocol {
+        self.metadata.api
     }
 
     #[must_use]
     pub const fn reasoning_effort(&self) -> ReasoningEffort {
-        self.reasoning_effort
+        self.metadata.reasoning_effort
     }
 
     #[must_use]
-    pub fn created_at(&self) -> u64 {
-        self.created_at
+    pub const fn web_search_mode(&self) -> WebSearchMode {
+        self.metadata.web_search_mode
+    }
+
+    #[must_use]
+    pub fn model_selector(&self) -> String {
+        self.provider().map_or_else(
+            || self.model().to_string(),
+            |provider| format!("{provider}/{}", self.model()),
+        )
     }
 
     #[must_use]
@@ -369,46 +1166,100 @@ impl Session {
         self.path.as_deref()
     }
 
-    fn write_header(&self) -> Result<()> {
-        let path = self
-            .path
-            .as_ref()
-            .ok_or_else(|| anyhow!("cannot persist an in-memory session"))?;
-        let record = SessionRecord::Session {
-            version: SESSION_VERSION,
-            id: self.id,
-            cwd: self.cwd.clone(),
-            model: self.model.clone(),
-            reasoning_effort: self.reasoning_effort,
-            created_at: self.created_at,
+    fn persist_record(&mut self, record: &SessionRecord) -> Result<()> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
         };
-        let mut file = File::create(path)
-            .with_context(|| format!("failed to create session: {}", path.display()))?;
-        serde_json::to_writer(&mut file, &record)
-            .with_context(|| format!("failed to serialize session: {}", path.display()))?;
-        file.write_all(b"\n")
-            .with_context(|| format!("failed to write session: {}", path.display()))?;
-        file.sync_data()
-            .with_context(|| format!("failed to flush session: {}", path.display()))
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("persisted session does not hold its writer lock"))?;
+        append_record(writer, path, record)
     }
 }
 
-fn append_record(path: &Path, record: &SessionRecord) -> Result<()> {
-    let mut file = OpenOptions::new()
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to protect session directory: {}", path.display()))?;
+    Ok(())
+}
+
+fn create_session_file(path: &Path, header: &SessionRecord) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create session: {}", path.display()))?;
+    file.try_lock()
+        .map_err(|error| anyhow!("failed to lock new session {}: {error}", path.display()))?;
+    append_record(&mut file, path, header)?;
+    Ok(file)
+}
+
+fn open_session_writer(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open session: {}", path.display()))?;
-    serde_json::to_writer(&mut file, record)
+    file.try_lock().map_err(|error| {
+        anyhow!(
+            "session is already open by another MCode process: {} ({error})",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+fn append_record(file: &mut File, path: &Path, record: &SessionRecord) -> Result<()> {
+    let mut encoded = serde_json::to_vec(record)
         .with_context(|| format!("failed to serialize session: {}", path.display()))?;
-    file.write_all(b"\n")
+    encoded.push(b'\n');
+    file.write_all(&encoded)
         .with_context(|| format!("failed to write session: {}", path.display()))?;
     file.sync_data()
         .with_context(|| format!("failed to flush session: {}", path.display()))
 }
 
+fn repair_session_tail(
+    file: &mut File,
+    path: &Path,
+    valid_len: usize,
+    add_newline: bool,
+) -> Result<()> {
+    let valid_len = u64::try_from(valid_len).context("session is too large to recover")?;
+    file.set_len(valid_len).with_context(|| {
+        format!(
+            "failed to truncate damaged session tail: {}",
+            path.display()
+        )
+    })?;
+    file.sync_data()
+        .with_context(|| format!("failed to flush recovered session: {}", path.display()))?;
+    if add_newline {
+        file.write_all(b"\n")
+            .with_context(|| format!("failed to finish session recovery: {}", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("failed to flush recovered session: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn add_usage(total: &mut Usage, usage: Usage) {
+    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+    total.completion_tokens = total
+        .completion_tokens
+        .saturating_add(usage.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+}
+
 fn default_session_base() -> Result<PathBuf> {
-    dirs::home_dir()
-        .map(|home| home.join(".mcode/sessions"))
+    mcode_home_dir()
+        .map(|home| home.join("sessions"))
         .ok_or_else(|| anyhow!("could not determine home directory for session storage"))
 }
 
@@ -446,23 +1297,59 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+fn rollout_filename(created_at: u64, id: Uuid) -> Result<String> {
+    let seconds = i64::try_from(created_at).context("session timestamp is out of range")?;
+    let timestamp = DateTime::<Utc>::from_timestamp(seconds, 0)
+        .ok_or_else(|| anyhow!("session timestamp is out of range: {created_at}"))?;
+    Ok(format!(
+        "rollout-{}-{id}.jsonl",
+        timestamp.format("%Y-%m-%dT%H-%M-%S")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use super::*;
 
+    fn metadata(reasoning_effort: ReasoningEffort) -> SessionMetadata {
+        SessionMetadata::local("test-model", reasoning_effort)
+    }
+
+    #[test]
+    fn names_new_sessions_like_codex_rollouts() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+
+        let filename = session
+            .path()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap();
+        assert_eq!(session.id().get_version_num(), 7);
+        assert_eq!(
+            filename,
+            rollout_filename(session.created_at, session.id()).unwrap()
+        );
+        assert!(filename.starts_with("rollout-"));
+        assert!(filename.ends_with(&format!("-{}.jsonl", session.id())));
+        assert_eq!(
+            rollout_filename(0, Uuid::nil()).unwrap(),
+            "rollout-1970-01-01T00-00-00-00000000-0000-0000-0000-000000000000.jsonl"
+        );
+    }
+
     #[test]
     fn persists_and_resumes_latest_session() {
         let base = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let mut session = Session::create_in(
-            base.path(),
-            project.path(),
-            "test-model",
-            ReasoningEffort::Low,
-        )
-        .unwrap();
+        let mut session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+                .unwrap();
         let id = session.id();
         session.append(ChatMessage::user("hello")).unwrap();
         session
@@ -472,41 +1359,170 @@ mod tests {
                 Vec::new(),
             ))
             .unwrap();
-        session.set_model("next-model").unwrap();
+        session
+            .set_model(Some("fixture"), "next-model", ApiProtocol::Responses)
+            .unwrap();
         session.set_reasoning_effort(ReasoningEffort::High).unwrap();
+        session.set_web_search_mode(WebSearchMode::Live).unwrap();
 
+        drop(session);
         let loaded = Session::resume_in(base.path(), project.path(), None).unwrap();
         assert_eq!(loaded.id(), id);
         assert_eq!(loaded.model(), "next-model");
+        assert_eq!(loaded.provider(), Some("fixture"));
+        assert_eq!(loaded.api(), ApiProtocol::Responses);
         assert_eq!(loaded.reasoning_effort(), ReasoningEffort::High);
+        assert_eq!(loaded.web_search_mode(), WebSearchMode::Live);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.messages()[0], ChatMessage::user("hello"));
+    }
+
+    #[test]
+    fn persists_responses_items_in_v3_jsonl() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let mut session = Session::create_in(
+            base.path(),
+            project.path(),
+            SessionMetadata {
+                provider: Some("openai".to_string()),
+                model: "gpt-test".to_string(),
+                api: ApiProtocol::Responses,
+                reasoning_effort: ReasoningEffort::High,
+                web_search_mode: WebSearchMode::Cached,
+            },
+        )
+        .unwrap();
+        let reasoning = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_fixture",
+            "encrypted_content": "opaque-state",
+            "summary": []
+        });
+        session
+            .append(ChatMessage::assistant_with_response_items(
+                None,
+                None,
+                Vec::new(),
+                vec![reasoning.clone()],
+            ))
+            .unwrap();
+
+        let loaded = Session::load_readonly(session.path().unwrap()).unwrap();
+        assert_eq!(loaded.provider(), Some("openai"));
+        assert_eq!(loaded.api(), ApiProtocol::Responses);
+        assert_eq!(loaded.web_search_mode(), WebSearchMode::Cached);
+        assert_eq!(loaded.messages()[0].response_items, [reasoning]);
+        let header = fs::read_to_string(session.path().unwrap()).unwrap();
+        assert!(header.lines().next().unwrap().contains(r#""version":3"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protects_session_directories_and_files() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+        let path = session.path().unwrap();
+        let directory_mode = path
+            .parent()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode();
+        let file_mode = path.metadata().unwrap().permissions().mode();
+        assert_eq!(directory_mode & 0o777, 0o700);
+        assert_eq!(file_mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn persists_and_rebuilds_compacted_context_on_resume() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let mut session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+        session
+            .append(ChatMessage::user("summarized request"))
+            .unwrap();
+        session
+            .append(ChatMessage::assistant(
+                Some("summarized answer".into()),
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+        session.append(ChatMessage::user("kept request")).unwrap();
+        session
+            .append_compaction(
+                "## Goal\nKeep working".into(),
+                2,
+                42_000,
+                Some(Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 20,
+                    total_tokens: 120,
+                }),
+                vec!["src/lib.rs".into()],
+                vec!["src/main.rs".into()],
+            )
+            .unwrap();
+        session
+            .append(ChatMessage::assistant(
+                Some("after".into()),
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+        let path = session.path().unwrap().to_path_buf();
+
+        let loaded = Session::load_readonly(&path).unwrap();
+        let checkpoint = loaded.latest_compaction().unwrap();
+        assert_eq!(checkpoint.first_kept_message_index, 2);
+        assert_eq!(checkpoint.tokens_before, 42_000);
+        assert_eq!(checkpoint.usage.unwrap().total_tokens, 120);
+        let context = loaded.context_messages();
+        assert_eq!(context.len(), 3);
+        assert!(
+            context[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("## Goal\nKeep working")
+        );
+        assert_eq!(context[1], ChatMessage::user("kept request"));
+        assert_eq!(context[2].content.as_deref(), Some("after"));
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains(r#""type":"compaction""#));
+        assert!(contents.contains(r#""first_kept_message_index":2"#));
     }
 
     #[test]
     fn deletes_only_the_exact_project_session() {
         let base = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let first = Session::create_in(
-            base.path(),
-            project.path(),
-            "test-model",
-            ReasoningEffort::Low,
-        )
-        .unwrap();
-        let second = Session::create_in(
-            base.path(),
-            project.path(),
-            "test-model",
-            ReasoningEffort::Low,
-        )
-        .unwrap();
+        let first = Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+            .unwrap();
+        let second =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+                .unwrap();
         let first_path = first.path().unwrap().to_path_buf();
         let second_path = second.path().unwrap().to_path_buf();
 
+        let listed = Session::list_in(base.path(), project.path()).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|session| session.id == first.id()));
+        assert!(listed.iter().any(|session| session.id == second.id()));
+
+        let first_id = first.id();
+        drop(first);
         let deleted =
-            Session::delete_in(base.path(), project.path(), &first.id().to_string()).unwrap();
-        assert_eq!(deleted, first.id());
+            Session::delete_in(base.path(), project.path(), &first_id.to_string()).unwrap();
+        assert_eq!(deleted, first_id);
         assert!(!first_path.exists());
         assert!(second_path.exists());
     }
@@ -516,15 +1532,166 @@ mod tests {
         let base = tempdir().unwrap();
         let other_base = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let mut session = Session::create_in(
-            base.path(),
-            project.path(),
-            "test-model",
-            ReasoningEffort::Low,
-        )
-        .unwrap();
+        let mut session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+                .unwrap();
 
         assert!(session.delete_current_in(other_base.path()).is_err());
         assert!(session.path().unwrap().exists());
+    }
+
+    #[test]
+    fn direct_resume_rejects_a_session_from_another_project() {
+        let base = tempdir().unwrap();
+        let first_project = tempdir().unwrap();
+        let second_project = tempdir().unwrap();
+        let session = Session::create_in(
+            base.path(),
+            first_project.path(),
+            metadata(ReasoningEffort::Off),
+        )
+        .unwrap();
+
+        let error = Session::resume_in(
+            base.path(),
+            second_project.path(),
+            session.path().and_then(Path::to_str),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("outside the current project session directory"));
+    }
+
+    #[test]
+    fn resume_repairs_an_incomplete_jsonl_tail() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let mut session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+        session.append(ChatMessage::user("kept")).unwrap();
+        let path = session.path().unwrap().to_path_buf();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"type":"message","message":{"role":"user"#)
+            .unwrap();
+        drop(file);
+        drop(session);
+
+        let mut resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
+        assert_eq!(resumed.messages(), &[ChatMessage::user("kept")]);
+        resumed.append(ChatMessage::user("after recovery")).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.ends_with('\n'));
+        assert_eq!(Session::load_readonly(&path).unwrap().messages().len(), 2);
+    }
+
+    #[test]
+    fn resume_rejects_corruption_before_the_tail() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+        let path = session.path().unwrap();
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"not json\n").unwrap();
+        file.write_all(b"also not json").unwrap();
+        drop(file);
+        drop(session);
+
+        assert!(Session::resume_in(base.path(), project.path(), None).is_err());
+    }
+
+    #[test]
+    fn persists_run_usage_and_reconstructs_an_interrupted_tool_intent() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let mut session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+        let run_id = session
+            .begin_run(ChatMessage::user("change a file"))
+            .unwrap();
+        session
+            .start_generation(
+                run_id,
+                Some("fixture"),
+                "test-model",
+                ApiProtocol::ChatCompletions,
+            )
+            .unwrap();
+        let call = ToolCall {
+            id: "call_write".to_string(),
+            kind: "function".to_string(),
+            function: crate::protocol::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: r#"{"path":"out.txt","content":"done"}"#.to_string(),
+            },
+        };
+        session
+            .complete_generation(
+                run_id,
+                ChatMessage::assistant(None, None, vec![call.clone()]),
+                Usage {
+                    prompt_tokens: 80,
+                    completion_tokens: 20,
+                    total_tokens: 100,
+                },
+                false,
+            )
+            .unwrap();
+        let intent = session
+            .start_tool(run_id, call.clone(), ToolReplayPolicy::Never)
+            .unwrap();
+        let path = session.path().unwrap().to_path_buf();
+        drop(session);
+
+        let resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
+        assert_eq!(resumed.total_usage().total_tokens, 100);
+        assert_eq!(resumed.active_run_id(), Some(run_id));
+        let pending = resumed.pending_tool_calls().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].call, call);
+        assert_eq!(pending[0].intent.as_ref(), Some(&intent));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn enforces_one_writer_per_session() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+
+        let error = Session::resume_in(base.path(), project.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already open"));
+        drop(session);
+        assert!(Session::resume_in(base.path(), project.path(), None).is_ok());
+    }
+
+    #[test]
+    fn rejects_pre_release_v2_sessions_without_a_compatibility_path() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let session =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Off))
+                .unwrap();
+        let path = session.path().unwrap().to_path_buf();
+        drop(session);
+        let contents = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            contents.replacen(r#""version":3"#, r#""version":2"#, 1),
+        )
+        .unwrap();
+
+        let error = Session::resume_in(base.path(), project.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported session version 2; expected 3"));
     }
 }

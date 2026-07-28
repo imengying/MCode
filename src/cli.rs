@@ -10,7 +10,7 @@ use crate::config::ReasoningEffort;
     version,
     about = "MCode, a focused OpenAI-compatible coding agent",
     args_conflicts_with_subcommands = true,
-    after_help = "Examples:\n  mcode\n  mcode -i screenshot.png \"inspect this UI\"\n  mcode exec \"fix the failing tests\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode delete <SESSION_ID>"
+    after_help = "Examples:\n  mcode\n  mcode -i screenshot.png \"inspect this UI\"\n  mcode --search \"check the latest dependency release\"\n  mcode exec \"fix the failing tests\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode sessions\n  mcode doctor\n  mcode delete <SESSION_ID>"
 )]
 pub struct Cli {
     /// Optional image(s) to attach to the initial prompt.
@@ -49,6 +49,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "TOKENS")]
     pub context_window: Option<u64>,
 
+    /// Maximum number of input tokens accepted by the model.
+    #[arg(long, global = true, value_name = "TOKENS")]
+    pub max_input_tokens: Option<u64>,
+
     /// Run as if started in this directory.
     #[arg(
         short = 'C',
@@ -71,6 +75,18 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECONDS")]
     pub request_timeout: Option<u64>,
 
+    /// Enable live web search through the hosted Responses API.
+    #[arg(long, global = true)]
+    pub search: bool,
+
+    /// Run shell and MCP tools without confirmation, disabling the execution safeguard.
+    #[arg(
+        long = "dangerously-bypass-approvals",
+        visible_alias = "dangerously-bypass-approvals-and-sandbox",
+        global = true
+    )]
+    pub dangerously_bypass_approvals: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -90,6 +106,19 @@ pub enum Command {
 
     /// Permanently delete a saved session.
     Delete(DeleteArgs),
+
+    /// List saved sessions for the current working directory.
+    Sessions(OutputArgs),
+
+    /// Diagnose local configuration without making an API request.
+    Doctor(OutputArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct OutputArgs {
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -193,6 +222,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_sessions_and_doctor_output_modes() {
+        let sessions = Cli::parse_from(["mcode", "sessions", "--json"]);
+        assert!(matches!(
+            sessions.command,
+            Some(Command::Sessions(OutputArgs { json: true }))
+        ));
+        let doctor = Cli::parse_from(["mcode", "doctor"]);
+        assert!(matches!(
+            doctor.command,
+            Some(Command::Doctor(OutputArgs { json: false }))
+        ));
+    }
+
+    #[test]
     fn parses_codex_style_images_and_delete() {
         let cli = Cli::parse_from([
             "mcode",
@@ -210,5 +253,23 @@ mod tests {
             panic!("expected delete");
         };
         assert!(delete.force);
+    }
+
+    #[test]
+    fn parses_explicit_unsafe_approval_bypass() {
+        let cli = Cli::parse_from([
+            "mcode",
+            "exec",
+            "--dangerously-bypass-approvals",
+            "run tests",
+        ]);
+        assert!(cli.dangerously_bypass_approvals);
+    }
+
+    #[test]
+    fn parses_live_web_search_flag() {
+        let cli = Cli::parse_from(["mcode", "--search", "find", "current", "releases"]);
+        assert!(cli.search);
+        assert_eq!(cli.root_prompt().as_deref(), Some("find current releases"));
     }
 }

@@ -1,9 +1,14 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use mcode::agent::{Agent, RunStatus};
-use mcode::config::{AppConfig, ReasoningEffort};
+use mcode::approval::ApprovalGate;
+use mcode::config::{
+    ApiProtocol, AppConfig, CompactionSettings, ReasoningEffort, WebSearchMode, WebSearchSettings,
+};
 use mcode::event::AgentEvent;
-use mcode::session::Session;
+use mcode::protocol::{ChatMessage, FunctionCall, ToolCall, Usage};
+use mcode::session::{RunOutcome, Session, SessionMetadata, ToolReplayPolicy};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,34 +68,35 @@ async fn executes_a_tool_and_continues_the_model_turn() {
     let config = AppConfig {
         model: "test-model".to_string(),
         provider: None,
+        api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::High,
         reasoning_value: Some("high".to_string()),
         base_url: format!("http://{address}/v1"),
         api_key: Some("test-key".to_string()),
         context_window: 200_000,
+        max_input_tokens: 200_000,
         supports_reasoning_effort: true,
         supports_usage_in_streaming: true,
+        supports_strict_tools: false,
         cwd: project.path().canonicalize().unwrap(),
         max_tool_turns: 4,
         request_timeout_secs: 10,
+        compaction: CompactionSettings::default(),
+        web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
     };
-    let session = Session::create(
-        project.path(),
-        &config.model,
-        config.reasoning_effort,
-        false,
-    )
-    .unwrap();
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let approvals = ApprovalGate::default();
     let status = agent
         .run(
             "create result.txt",
             Vec::new(),
             &tx,
             &CancellationToken::new(),
+            &approvals,
         )
         .await
         .unwrap();
@@ -119,6 +125,13 @@ async fn executes_a_tool_and_continues_the_model_turn() {
     assert_eq!(requests[0]["model"], "test-model");
     assert_eq!(requests[0]["reasoning_effort"], "high");
     assert_eq!(requests[0]["stream_options"]["include_usage"], true);
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["function"].get("strict").is_none())
+    );
 
     let mut saw_tool = false;
     let mut text = String::new();
@@ -134,6 +147,396 @@ async fn executes_a_tool_and_continues_the_model_turn() {
     }
     assert!(saw_tool);
     assert_eq!(text, "Done.");
+}
+
+#[tokio::test]
+async fn responses_api_runs_local_tools_and_hosted_web_search() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_requests
+                .lock()
+                .await
+                .push(read_json_request(&mut stream).await);
+            let events = if index == 0 {
+                vec![
+                    json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "rs_reasoning",
+                            "encrypted_content": "encrypted-fixture-state",
+                            "summary": [{
+                                "type": "summary_text",
+                                "text": "I should inspect the requested file."
+                            }]
+                        }
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_read",
+                            "call_id": "call_read",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\",\"limit\":1}"
+                        }
+                    }),
+                    responses_completed("resp_tools", 80, 12),
+                ]
+            } else {
+                vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "web_search_call",
+                            "id": "ws_current",
+                            "status": "in_progress"
+                        }
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "web_search_call",
+                            "id": "ws_current",
+                            "status": "completed",
+                            "action": {"type": "search", "query": "current Rust release"}
+                        }
+                    }),
+                    json!({
+                        "type": "response.output_text.delta",
+                        "delta": "Rust is current."
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Rust is current.",
+                                "annotations": [{
+                                    "type": "url_citation",
+                                    "start_index": 0,
+                                    "end_index": 4,
+                                    "url": "https://www.rust-lang.org/",
+                                    "title": "Rust Programming Language"
+                                }]
+                            }]
+                        }
+                    }),
+                    responses_completed("resp_search", 120, 24),
+                ]
+            };
+            write_responses_sse(&mut stream, events).await;
+        }
+    });
+
+    let project = tempdir().unwrap();
+    std::fs::write(project.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(
+        project.path().join("AGENTS.md"),
+        "Always preserve the fixture sentinel.",
+    )
+    .unwrap();
+    let config = AppConfig {
+        model: "gpt-test".to_string(),
+        provider: None,
+        api: ApiProtocol::Responses,
+        reasoning_effort: ReasoningEffort::Low,
+        reasoning_value: Some("low".to_string()),
+        base_url: format!("http://{address}/v1"),
+        api_key: Some("test-key".to_string()),
+        context_window: 200_000,
+        max_input_tokens: 200_000,
+        supports_reasoning_effort: true,
+        supports_usage_in_streaming: true,
+        supports_strict_tools: true,
+        cwd: project.path().canonicalize().unwrap(),
+        max_tool_turns: 4,
+        request_timeout_secs: 10,
+        compaction: CompactionSettings::default(),
+        web_search: WebSearchSettings {
+            mode: WebSearchMode::Live,
+            ..WebSearchSettings::default()
+        },
+        model_profiles: Vec::new(),
+        mcp_servers: Vec::new(),
+    };
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "check the README and current Rust release",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    drop(tx);
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    let requests = requests.lock().await;
+    let web_tool = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["type"] == "web_search")
+        .unwrap();
+    assert_eq!(web_tool["external_web_access"], true);
+    assert!(web_tool.get("indexed_web_access").is_none());
+    let read_tool = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read_file")
+        .unwrap();
+    assert_eq!(read_tool["type"], "function");
+    assert!(read_tool.get("function").is_none());
+    assert_eq!(read_tool["strict"], true);
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool["type"] == "function")
+            .all(|tool| tool["strict"] == true)
+    );
+    assert_eq!(requests[0]["reasoning"]["effort"], "low");
+    assert_eq!(requests[0]["reasoning"]["summary"], "auto");
+    assert_eq!(
+        requests[0]["include"],
+        json!(["reasoning.encrypted_content"])
+    );
+    assert!(
+        requests[0]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("MCode")
+    );
+    assert!(
+        requests[0]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Always preserve the fixture sentinel.")
+    );
+    let second_input = requests[1]["input"].as_array().unwrap();
+    assert!(second_input.iter().any(|item| {
+        item["type"] == "reasoning"
+            && item["id"] == "rs_reasoning"
+            && item["encrypted_content"] == "encrypted-fixture-state"
+    }));
+    assert!(
+        second_input
+            .iter()
+            .any(|item| { item["type"] == "function_call" && item["call_id"] == "call_read" })
+    );
+    assert!(
+        second_input.iter().any(|item| {
+            item["type"] == "function_call_output" && item["call_id"] == "call_read"
+        })
+    );
+
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::WebSearchStarted { id } if id == "ws_current"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::WebSearchFinished { action, .. }
+            if action.description() == "current Rust release"
+    )));
+    let streamed = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(streamed.contains("Rust is current."));
+    assert!(streamed.contains("[Rust Programming Language](https://www.rust-lang.org/)"));
+    assert!(
+        agent
+            .messages()
+            .last()
+            .and_then(|message| message.content.as_deref())
+            .is_some_and(|content| content.contains("Sources:"))
+    );
+}
+
+#[tokio::test]
+async fn responses_compat_can_omit_strict_tool_markers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_json_request(&mut stream).await;
+        write_responses_sse(
+            &mut stream,
+            vec![
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "Compatible response."
+                }),
+                responses_completed("resp_compat", 20, 4),
+            ],
+        )
+        .await;
+        request
+    });
+
+    let project = tempdir().unwrap();
+    let mut config = basic_chat_config(project.path(), address);
+    config.api = ApiProtocol::Responses;
+    config.supports_strict_tools = false;
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "use a compatible Responses endpoint",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    let request = server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert!(
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool["type"] == "function")
+            .all(|tool| tool.get("strict").is_none())
+    );
+}
+
+#[tokio::test]
+async fn shell_tool_is_denied_without_frontend_approval() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_json_request(&mut stream).await;
+            server_requests.lock().await.push(request);
+            let event = if index == 0 {
+                json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_shell",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": "{\"command\":\"echo denied > should-not-exist.txt\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                json!({
+                    "choices": [{
+                        "delta": {"content": "The command was denied."},
+                        "finish_reason": "stop"
+                    }]
+                })
+            };
+            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let config = AppConfig {
+        model: "test-model".to_string(),
+        provider: None,
+        api: ApiProtocol::ChatCompletions,
+        reasoning_effort: ReasoningEffort::Off,
+        reasoning_value: None,
+        base_url: format!("http://{address}/v1"),
+        api_key: None,
+        context_window: 128_000,
+        max_input_tokens: 128_000,
+        supports_reasoning_effort: true,
+        supports_usage_in_streaming: true,
+        supports_strict_tools: false,
+        cwd: project.path().canonicalize().unwrap(),
+        max_tool_turns: 4,
+        request_timeout_secs: 10,
+        compaction: CompactionSettings::default(),
+        web_search: WebSearchSettings::default(),
+        model_profiles: Vec::new(),
+        mcp_servers: Vec::new(),
+    };
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "run the command",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    drop(tx);
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert!(!project.path().join("should-not-exist.txt").exists());
+    let requests = requests.lock().await;
+    let tool_message = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .unwrap()
+            .contains("requires user approval")
+    );
+
+    let mut requested = false;
+    let mut denied = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AgentEvent::ApprovalRequested { name, .. } if name == "shell" => requested = true,
+            AgentEvent::ApprovalResolved { name, approved, .. } if name == "shell" && !approved => {
+                denied = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(requested);
+    assert!(denied);
 }
 
 #[tokio::test]
@@ -161,34 +564,35 @@ async fn omits_request_fields_disabled_by_pi_compat() {
     let config = AppConfig {
         model: "compat-model".to_string(),
         provider: None,
+        api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::High,
         reasoning_value: Some("high".to_string()),
         base_url: format!("http://{address}/v1"),
         api_key: None,
         context_window: 128_000,
+        max_input_tokens: 128_000,
         supports_reasoning_effort: false,
         supports_usage_in_streaming: false,
+        supports_strict_tools: false,
         cwd: project.path().canonicalize().unwrap(),
         max_tool_turns: 1,
         request_timeout_secs: 10,
+        compaction: CompactionSettings::default(),
+        web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
     };
-    let session = Session::create(
-        project.path(),
-        &config.model,
-        config.reasoning_effort,
-        false,
-    )
-    .unwrap();
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
     let (tx, _rx) = mpsc::unbounded_channel();
+    let approvals = ApprovalGate::default();
     let status = agent
         .run(
             "test compatibility",
             Vec::new(),
             &tx,
             &CancellationToken::new(),
+            &approvals,
         )
         .await
         .unwrap();
@@ -197,7 +601,169 @@ async fn omits_request_fields_disabled_by_pi_compat() {
     assert_eq!(status, RunStatus::Completed);
     assert!(request.get("reasoning_effort").is_none());
     assert!(request.get("stream_options").is_none());
-    assert_eq!(user_agent, "codex_cli_rs/0.145.0");
+    assert_eq!(user_agent, format!("mcode/{}", env!("CARGO_PKG_VERSION")));
+}
+
+#[tokio::test]
+async fn retries_rate_limits_using_retry_after() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_requests
+                .lock()
+                .await
+                .push(read_json_request(&mut stream).await);
+            if attempt == 0 {
+                let body = r#"{"error":{"message":"rate limited"}}"#;
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 0\r\nX-Request-ID: req-retry\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            } else {
+                write_sse_text(&mut stream, "Retry worked.", None).await;
+            }
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "retry once",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[tokio::test]
+async fn retries_a_truncated_stream_without_persisting_partial_output() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_json_request(&mut stream).await;
+            if attempt == 0 {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"discard-me\"}}]}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            } else {
+                write_sse_text(&mut stream, "kept-after-retry", Some((30, 5))).await;
+            }
+        }
+    });
+
+    let base = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let session =
+        Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
+    let session_path = session.path().unwrap().to_path_buf();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "retry a dropped stream",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert_eq!(
+        agent
+            .messages()
+            .last()
+            .and_then(|message| message.content.as_deref()),
+        Some("kept-after-retry")
+    );
+    assert_eq!(agent.total_usage().total_tokens, 35);
+    let jsonl = std::fs::read_to_string(session_path).unwrap();
+    assert!(!jsonl.contains("discard-me"));
+    assert!(jsonl.contains("kept-after-retry"));
+    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
+        event,
+        AgentEvent::AssistantRetrying {
+            attempt: 2,
+            max_attempts: 2,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn rejects_truncated_chat_streams_with_request_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for attempt in 1..=2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_json_request(&mut stream).await;
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-ID: req-truncated-{attempt}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let error = agent
+        .run(
+            "return partial text",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    server.await.unwrap();
+
+    assert!(error.contains("before [DONE] or finish_reason"));
+    assert!(error.contains("req-truncated-2"));
+    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
+        event,
+        AgentEvent::AssistantRetrying {
+            attempt: 2,
+            max_attempts: 2,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -325,22 +891,545 @@ async fn exec_command_sends_image_content_parts() {
 }
 
 #[tokio::test]
+async fn auto_compaction_summarizes_old_turns_before_the_next_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_json_request(&mut stream).await;
+            server_requests.lock().await.push(request);
+            if index == 0 {
+                write_sse_text(
+                    &mut stream,
+                    "## Goal\nContinue the fixture task\n\n## Progress\n### Done\n- [x] Old work",
+                    Some((120, 30)),
+                )
+                .await;
+            } else {
+                write_sse_text(&mut stream, "Compaction worked.", Some((80, 5))).await;
+            }
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let config = compaction_test_config(project.path(), address, 4_000, 2_500, 60);
+    let mut session =
+        Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::user("old ".repeat(2_500)))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::assistant(
+            Some("old ".repeat(2_500)),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::user(
+            "recent question ".repeat(8),
+        ))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::assistant(
+            Some("recent answer ".repeat(8)),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "continue now",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    let checkpoint = agent.session().latest_compaction().unwrap();
+    assert_eq!(checkpoint.first_kept_message_index, 2);
+    assert_eq!(checkpoint.usage.unwrap().total_tokens, 150);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].get("tools").is_none());
+    assert_eq!(requests[0]["max_tokens"], 2_000);
+    assert!(
+        requests[0]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("old old old")
+    );
+    let regular_messages = requests[1]["messages"].as_array().unwrap();
+    assert!(regular_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Continue the fixture task"))
+    }));
+    assert!(regular_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("recent question"))
+    }));
+    assert!(!regular_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.len() > 5_000)
+    }));
+    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactionFinished {
+            reason: mcode::event::CompactionReason::Threshold,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn summarization_failure_falls_back_to_hard_context_trimming() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_json_request(&mut stream).await;
+            server_requests.lock().await.push(request);
+            if index == 0 {
+                write_http_error(&mut stream, 400, r#"{"error":"summary unavailable"}"#).await;
+            } else {
+                write_sse_text(&mut stream, "Fallback worked.", None).await;
+            }
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let config = compaction_test_config(project.path(), address, 4_000, 2_500, 60);
+    let mut session =
+        Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::user("old ".repeat(2_500)))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::assistant(
+            Some("old ".repeat(2_500)),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::user("recent request"))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::assistant(
+            Some("recent answer".into()),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "continue",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert!(agent.session().latest_compaction().is_none());
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    let regular_messages = requests[1]["messages"].as_array().unwrap();
+    assert!(!regular_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.len() > 5_000)
+    }));
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactionFailed {
+            reason: mcode::event::CompactionReason::Threshold,
+            ..
+        }
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ContextTrimmed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn context_overflow_compacts_and_retries_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_json_request(&mut stream).await;
+            server_requests.lock().await.push(request);
+            match index {
+                0 => {
+                    write_http_error(
+                        &mut stream,
+                        400,
+                        r#"{"error":{"message":"maximum context length exceeded"}}"#,
+                    )
+                    .await;
+                }
+                1 => {
+                    write_sse_text(&mut stream, "## Goal\nRecover from overflow", None).await;
+                }
+                _ => write_sse_text(&mut stream, "Recovered.", None).await,
+            }
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let config = compaction_test_config(project.path(), address, 10_000, 1_000, 60);
+    let mut session =
+        Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::user("old ".repeat(1_000)))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::assistant(
+            Some("old ".repeat(1_000)),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::user(
+            "recent question ".repeat(8),
+        ))
+        .unwrap();
+    session
+        .append(mcode::protocol::ChatMessage::assistant(
+            Some("recent answer ".repeat(8)),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "continue",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert!(agent.session().latest_compaction().is_some());
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].get("tools").is_some());
+    assert!(requests[1].get("tools").is_none());
+    assert!(
+        requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Recover from overflow"))
+            })
+    );
+    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactionFinished {
+            reason: mcode::event::CompactionReason::Overflow,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn resume_does_not_replay_a_dangerous_tool_with_an_unknown_result() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_json_request(&mut stream).await;
+        write_sse_text(&mut stream, "Recovered without replay.", Some((20, 5))).await;
+        request
+    });
+
+    let base = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let mut session =
+        Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
+    let run_id = session
+        .begin_run(ChatMessage::user("create interrupted.txt"))
+        .unwrap();
+    session
+        .start_generation(run_id, None, "test-model", ApiProtocol::ChatCompletions)
+        .unwrap();
+    let call = tool_call(
+        "call_interrupted_write",
+        "write_file",
+        r#"{"path":"interrupted.txt","content":"must not be written"}"#,
+    );
+    session
+        .complete_generation(
+            run_id,
+            ChatMessage::assistant(None, None, vec![call.clone()]),
+            Usage {
+                prompt_tokens: 40,
+                completion_tokens: 10,
+                total_tokens: 50,
+            },
+            false,
+        )
+        .unwrap();
+    session
+        .start_tool(run_id, call, ToolReplayPolicy::Never)
+        .unwrap();
+    drop(session);
+
+    let resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
+    let mut agent = Agent::new(&config, resumed).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .resume_pending(&tx, &CancellationToken::new(), &ApprovalGate::default())
+        .await
+        .unwrap();
+    let request = server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert!(!project.path().join("interrupted.txt").exists());
+    let tool_result = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert!(
+        tool_result["content"]
+            .as_str()
+            .unwrap()
+            .contains("may have run before MCode was interrupted")
+    );
+    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolFinished {
+            name,
+            is_error: true,
+            ..
+        } if name == "write_file"
+    )));
+}
+
+#[tokio::test]
+async fn resume_replays_a_safe_read_file_tool() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_json_request(&mut stream).await;
+        write_sse_text(&mut stream, "Read replay completed.", Some((18, 4))).await;
+        request
+    });
+
+    let base = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    std::fs::write(project.path().join("fixture.txt"), "before interruption\n").unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let mut session =
+        Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
+    let run_id = session
+        .begin_run(ChatMessage::user("read fixture.txt"))
+        .unwrap();
+    session
+        .start_generation(run_id, None, "test-model", ApiProtocol::ChatCompletions)
+        .unwrap();
+    let call = tool_call(
+        "call_interrupted_read",
+        "read_file",
+        r#"{"path":"fixture.txt","offset":null,"limit":null}"#,
+    );
+    session
+        .complete_generation(
+            run_id,
+            ChatMessage::assistant(None, None, vec![call.clone()]),
+            Usage {
+                prompt_tokens: 30,
+                completion_tokens: 8,
+                total_tokens: 38,
+            },
+            false,
+        )
+        .unwrap();
+    session
+        .start_tool(run_id, call, ToolReplayPolicy::Safe)
+        .unwrap();
+    drop(session);
+    std::fs::write(
+        project.path().join("fixture.txt"),
+        "content observed during replay\n",
+    )
+    .unwrap();
+
+    let resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
+    let mut agent = Agent::new(&config, resumed).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .resume_pending(&tx, &CancellationToken::new(), &ApprovalGate::default())
+        .await
+        .unwrap();
+    let request = server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    let tool_result = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert!(
+        tool_result["content"]
+            .as_str()
+            .unwrap()
+            .contains("content observed during replay")
+    );
+    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolFinished {
+            name,
+            is_error: false,
+            ..
+        } if name == "read_file"
+    )));
+}
+
+#[tokio::test]
+async fn resumed_agent_keeps_accumulating_durable_generation_usage() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_json_request(&mut stream).await;
+        write_sse_text(&mut stream, "Second response.", Some((30, 5))).await;
+    });
+
+    let base = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let mut session =
+        Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
+    let run_id = session
+        .begin_run(ChatMessage::user("first request"))
+        .unwrap();
+    session
+        .start_generation(run_id, None, "test-model", ApiProtocol::ChatCompletions)
+        .unwrap();
+    session
+        .complete_generation(
+            run_id,
+            ChatMessage::assistant(Some("First response.".to_string()), None, Vec::new()),
+            Usage {
+                prompt_tokens: 80,
+                completion_tokens: 20,
+                total_tokens: 100,
+            },
+            false,
+        )
+        .unwrap();
+    session.finish_run(run_id, RunOutcome::Completed).unwrap();
+    drop(session);
+
+    let resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
+    let mut agent = Agent::new(&config, resumed).await.unwrap();
+    assert_eq!(agent.total_usage().total_tokens, 100);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "second request",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert_eq!(agent.total_usage().total_tokens, 135);
+    drop(agent);
+    let reloaded = Session::resume_in(base.path(), project.path(), None).unwrap();
+    assert_eq!(reloaded.total_usage().total_tokens, 135);
+}
+
+#[tokio::test]
 async fn delete_command_removes_only_the_selected_project_session() {
     let home = tempdir().unwrap();
     let project = tempdir().unwrap();
     let base = home.path().join(".mcode/sessions");
-    let selected =
-        Session::create_in(&base, project.path(), "test-model", ReasoningEffort::Off).unwrap();
-    let remaining =
-        Session::create_in(&base, project.path(), "test-model", ReasoningEffort::Off).unwrap();
+    let selected = Session::create_in(
+        &base,
+        project.path(),
+        SessionMetadata::local("test-model", ReasoningEffort::Off),
+    )
+    .unwrap();
+    let remaining = Session::create_in(
+        &base,
+        project.path(),
+        SessionMetadata::local("test-model", ReasoningEffort::Off),
+    )
+    .unwrap();
     let selected_path = selected.path().unwrap().to_path_buf();
     let remaining_path = remaining.path().unwrap().to_path_buf();
+    let selected_id = selected.id();
+
+    let listed = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
+        .arg("sessions")
+        .arg("--json")
+        .env("MCODE_HOME", home.path().join(".mcode"))
+        .current_dir(project.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    drop(selected);
 
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
         .arg("delete")
-        .arg(selected.id().to_string())
+        .arg(selected_id.to_string())
         .arg("--force")
-        .env("HOME", home.path())
+        .env("MCODE_HOME", home.path().join(".mcode"))
         .current_dir(project.path())
         .output()
         .await
@@ -353,11 +1442,194 @@ async fn delete_command_removes_only_the_selected_project_session() {
     );
     assert!(!selected_path.exists());
     assert!(remaining_path.exists());
-    assert!(String::from_utf8_lossy(&output.stdout).contains(&selected.id().to_string()));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&selected_id.to_string()));
+}
+
+#[tokio::test]
+async fn doctor_reports_configuration_without_network_access() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
+        .arg("doctor")
+        .arg("--json")
+        .arg("--model")
+        .arg("fixture-model")
+        .arg("--base-url")
+        .arg("http://127.0.0.1:9/v1")
+        .env("MCODE_HOME", home.path().join(".mcode"))
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_MODEL")
+        .current_dir(project.path())
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let checks: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = checks.as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| { check["name"] == "endpoint" && check["status"] == "ok" })
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|check| { check["name"] == "api_key" && check["status"] == "warning" })
+    );
+}
+
+fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        kind: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    }
 }
 
 async fn read_json_request(stream: &mut TcpStream) -> Value {
     read_http_request(stream).await.0
+}
+
+fn drain_events(receiver: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+fn compaction_test_config(
+    project: &std::path::Path,
+    address: std::net::SocketAddr,
+    context_window: u64,
+    reserve_tokens: u64,
+    keep_recent_tokens: u64,
+) -> AppConfig {
+    AppConfig {
+        model: "test-model".to_string(),
+        provider: None,
+        api: ApiProtocol::ChatCompletions,
+        reasoning_effort: ReasoningEffort::Off,
+        reasoning_value: None,
+        base_url: format!("http://{address}/v1"),
+        api_key: None,
+        context_window,
+        max_input_tokens: context_window,
+        supports_reasoning_effort: true,
+        supports_usage_in_streaming: true,
+        supports_strict_tools: false,
+        cwd: project.canonicalize().unwrap(),
+        max_tool_turns: 4,
+        request_timeout_secs: 10,
+        compaction: CompactionSettings {
+            enabled: true,
+            reserve_tokens,
+            keep_recent_tokens,
+        },
+        web_search: WebSearchSettings::default(),
+        model_profiles: Vec::new(),
+        mcp_servers: Vec::new(),
+    }
+}
+
+fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -> AppConfig {
+    AppConfig {
+        model: "test-model".to_string(),
+        provider: None,
+        api: ApiProtocol::ChatCompletions,
+        reasoning_effort: ReasoningEffort::Off,
+        reasoning_value: None,
+        base_url: format!("http://{address}/v1"),
+        api_key: None,
+        context_window: 128_000,
+        max_input_tokens: 128_000,
+        supports_reasoning_effort: true,
+        supports_usage_in_streaming: true,
+        supports_strict_tools: false,
+        cwd: project.canonicalize().unwrap(),
+        max_tool_turns: 4,
+        request_timeout_secs: 10,
+        compaction: CompactionSettings::default(),
+        web_search: WebSearchSettings::default(),
+        model_profiles: Vec::new(),
+        mcp_servers: Vec::new(),
+    }
+}
+
+async fn write_sse_text(stream: &mut TcpStream, content: &str, usage: Option<(u64, u64)>) {
+    let event = json!({
+        "choices": [{
+            "delta": {"content": content},
+            "finish_reason": "stop"
+        }]
+    });
+    let mut body = format!("data: {event}\n\n");
+    if let Some((prompt_tokens, completion_tokens)) = usage {
+        let usage = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        });
+        let _ = write!(body, "data: {usage}\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+fn responses_completed(id: &str, input_tokens: u64, output_tokens: u64) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": id,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens
+            }
+        }
+    })
+}
+
+async fn write_responses_sse(stream: &mut TcpStream, events: Vec<Value>) {
+    let mut body = String::new();
+    for event in events {
+        let kind = event["type"].as_str().unwrap();
+        let _ = write!(body, "event: {kind}\ndata: {event}\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+async fn write_http_error(stream: &mut TcpStream, status: u16, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> (Value, String) {
