@@ -307,6 +307,13 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
             .as_array()
             .unwrap()
             .iter()
+            .any(|tool| { tool["type"] == "function" && tool["name"] == "fetch_content" })
+    );
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
             .filter(|tool| tool["type"] == "function")
             .all(|tool| tool["strict"] == true)
     );
@@ -371,6 +378,50 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
             .and_then(|message| message.content.as_deref())
             .is_some_and(|content| content.contains("Sources:"))
     );
+}
+
+#[tokio::test]
+async fn chat_completions_exposes_local_web_access_tools() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_json_request(&mut stream).await;
+        write_sse_text(&mut stream, "Search tools are available.", None).await;
+        request
+    });
+
+    let project = tempdir().unwrap();
+    let mut config = basic_chat_config(project.path(), address);
+    config.web_search.mode = WebSearchMode::Live;
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "find the current Rust release",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    let request = server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    let tools = request["tools"].as_array().unwrap();
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "web_search")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "fetch_content")
+    );
+    assert!(!tools.iter().any(|tool| tool["type"] == "web_search"));
 }
 
 #[tokio::test]

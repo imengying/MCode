@@ -450,7 +450,7 @@ fn handle_key(
                 state.delete_confirmation = DeleteConfirmation::None;
             }
             match name {
-                "quit" | "exit" => return UiAction::Quit,
+                "exit" => return UiAction::Quit,
                 "clear" => {
                     state.messages.clear();
                     state.follow_tail = true;
@@ -517,7 +517,7 @@ fn handle_key(
                     state.push_notice(notice);
                 }
                 "help" => state.push_notice(
-                    "Commands: /model [ID], /reasoning [LEVEL], /search [MODE], /compact [INSTRUCTIONS], /image [PATH|clear], /status, /new, /delete, /clear, /help, /quit",
+                    "Commands: /model [ID], /reasoning [LEVEL], /search [MODE], /compact [INSTRUCTIONS], /image [PATH|clear], /status, /new, /delete, /clear, /help, /exit",
                 ),
                 _ => state.push_error(format!("Unknown command: /{name}")),
             }
@@ -1842,6 +1842,41 @@ mod tests {
             action,
             UiAction::SetWebSearch(WebSearchMode::Live)
         ));
+    }
+
+    #[test]
+    fn slash_exit_is_the_only_exit_command() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.editor.insert_str("/exit");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::Quit
+        ));
+
+        state.editor.insert_str("/quit");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("Unknown command: /quit")
+        );
     }
 
     #[test]

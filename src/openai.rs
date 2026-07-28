@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::config::{ApiProtocol, WebSearchContextSize, WebSearchMode, WebSearchSettings};
+use crate::config::{ApiProtocol, WebSearchMode, WebSearchSettings};
 use crate::event::AgentEvent;
 use crate::protocol::{
     ChatMessage, FunctionCall, MessageRole, ToolCall, ToolDefinition, Usage, WebSearchAction,
@@ -110,7 +110,6 @@ impl OpenAiClient {
         web_search: WebSearchSettings,
         timeout: Duration,
     ) -> Result<Self> {
-        validate_web_search_protocol(config.api, web_search.mode)?;
         let endpoint = api_endpoint_url(&config.base_url, config.api)?;
         let http = build_http_client(&endpoint)?;
         Ok(Self {
@@ -144,7 +143,6 @@ impl OpenAiClient {
     }
 
     pub(crate) fn reconfigure(&mut self, config: OpenAiModelConfig) -> Result<()> {
-        validate_web_search_protocol(config.api, self.web_search.mode)?;
         let endpoint = api_endpoint_url(&config.base_url, config.api)?;
         self.http = build_http_client(&endpoint)?;
         self.endpoint = endpoint;
@@ -166,10 +164,8 @@ impl OpenAiClient {
         self.reasoning_effort = reasoning_effort;
     }
 
-    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) -> Result<()> {
-        validate_web_search_protocol(self.api, mode)?;
+    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) {
         self.web_search.mode = mode;
-        Ok(())
     }
 
     #[must_use]
@@ -545,30 +541,12 @@ enum ResponsesTool {
         external_web_access: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         filters: Option<ResponsesWebSearchFilters>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        user_location: Option<ResponsesWebSearchLocation>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        search_context_size: Option<WebSearchContextSize>,
     },
 }
 
 #[derive(Debug, Serialize)]
 struct ResponsesWebSearchFilters {
     allowed_domains: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesWebSearchLocation {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    country: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    region: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    city: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timezone: Option<String>,
 }
 
 fn responses_input(messages: &[ChatMessage]) -> Result<(String, Vec<serde_json::Value>)> {
@@ -664,24 +642,12 @@ fn responses_tools(
         WebSearchMode::Cached => false,
         WebSearchMode::Live => true,
     };
-    let filters = (!settings.allowed_domains.is_empty()).then(|| ResponsesWebSearchFilters {
-        allowed_domains: settings.allowed_domains.clone(),
-    });
-    let user_location = settings
-        .location
-        .as_ref()
-        .map(|location| ResponsesWebSearchLocation {
-            kind: "approximate",
-            country: location.country.clone(),
-            region: location.region.clone(),
-            city: location.city.clone(),
-            timezone: location.timezone.clone(),
-        });
+    let allowed_domains = settings.allowed_domains.clone();
+    let filters =
+        (!allowed_domains.is_empty()).then_some(ResponsesWebSearchFilters { allowed_domains });
     tools.push(ResponsesTool::WebSearch {
         external_web_access,
         filters,
-        user_location,
-        search_context_size: settings.context_size,
     });
     tools
 }
@@ -1305,15 +1271,6 @@ fn endpoint_url(base_url: &str, path: &str) -> Result<Url> {
     Ok(Url::parse(&endpoint)?)
 }
 
-fn validate_web_search_protocol(api: ApiProtocol, mode: WebSearchMode) -> Result<()> {
-    if mode.is_enabled() && api != ApiProtocol::Responses {
-        return Err(OpenAiError::Protocol(format!(
-            "web search mode {mode} requires an openai-responses model"
-        )));
-    }
-    Ok(())
-}
-
 fn truncate_error_body(body: &str) -> String {
     const MAX_CHARS: usize = 8_000;
     let mut chars = body.chars();
@@ -1519,22 +1476,14 @@ mod tests {
     fn responses_tools_follow_codex_web_search_modes() {
         let mut settings = WebSearchSettings {
             mode: WebSearchMode::Cached,
-            context_size: Some(WebSearchContextSize::High),
             allowed_domains: vec!["openai.com".to_string()],
-            location: Some(crate::config::WebSearchLocation {
-                country: Some("CN".to_string()),
-                timezone: Some("Asia/Shanghai".to_string()),
-                ..crate::config::WebSearchLocation::default()
-            }),
+            ..WebSearchSettings::default()
         };
         let cached = serde_json::to_value(responses_tools(&[], Some(&settings))).unwrap();
         assert_eq!(cached[0]["type"], "web_search");
         assert_eq!(cached[0]["external_web_access"], false);
         assert!(cached[0].get("indexed_web_access").is_none());
         assert_eq!(cached[0]["filters"]["allowed_domains"][0], "openai.com");
-        assert_eq!(cached[0]["user_location"]["type"], "approximate");
-        assert_eq!(cached[0]["user_location"]["country"], "CN");
-        assert_eq!(cached[0]["search_context_size"], "high");
 
         settings.mode = WebSearchMode::Disabled;
         assert!(responses_tools(&[], Some(&settings)).is_empty());

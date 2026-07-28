@@ -90,7 +90,13 @@ impl Agent {
             config.web_search.clone(),
             Duration::from_secs(config.request_timeout_secs),
         )?;
-        let tools = ToolRegistry::with_mcp(&config.cwd, &config.mcp_servers).await?;
+        let tools = ToolRegistry::with_mcp(
+            &config.cwd,
+            &config.mcp_servers,
+            config.web_search.clone(),
+            config.api,
+        )
+        .await?;
         let system_prompt = build_system_prompt(&config.cwd)?;
         let total_usage = session.total_usage();
         let mut agent = Self {
@@ -746,6 +752,7 @@ impl Agent {
                     .then(|| self.reasoning_effort.as_str().to_string()),
             );
         }
+        self.tools.set_api(self.client.api());
         let provider = self.provider.clone();
         let model = self.client.model().to_string();
         self.session
@@ -757,8 +764,9 @@ impl Agent {
     }
 
     pub fn set_web_search_mode(&mut self, mode: WebSearchMode) -> Result<()> {
-        self.client.set_web_search_mode(mode)?;
         self.session.set_web_search_mode(mode)?;
+        self.client.set_web_search_mode(mode);
+        self.tools.set_web_search_mode(mode);
         Ok(())
     }
 

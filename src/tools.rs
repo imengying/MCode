@@ -16,9 +16,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStderr, Command};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::McpServerConfig;
+use crate::config::{ApiProtocol, McpServerConfig, WebSearchMode, WebSearchSettings};
 use crate::protocol::{FunctionDefinition, ToolCall, ToolDefinition};
 use crate::session::ToolReplayPolicy;
+use crate::web_access::WebAccess;
 
 const MAX_TOOL_OUTPUT_CHARS: usize = 60_000;
 const MCP_CALL_TIMEOUT: Duration = Duration::from_mins(2);
@@ -27,6 +28,8 @@ const MAX_MCP_STDERR_BYTES: usize = 16_000;
 pub struct ToolRegistry {
     root: PathBuf,
     definitions: Vec<ToolDefinition>,
+    api: ApiProtocol,
+    web_access: WebAccess,
     mcp_servers: Vec<McpService>,
     mcp_routes: BTreeMap<String, McpToolRoute>,
     mcp_startup_failures: Vec<McpStartupFailure>,
@@ -70,21 +73,43 @@ impl ToolExecution {
 
 impl ToolRegistry {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        Self::with_web_access(
+            root,
+            WebSearchSettings::default(),
+            ApiProtocol::ChatCompletions,
+        )
+    }
+
+    fn with_web_access(
+        root: impl AsRef<Path>,
+        web_search: WebSearchSettings,
+        api: ApiProtocol,
+    ) -> Result<Self> {
         let root = root
             .as_ref()
             .canonicalize()
             .with_context(|| format!("invalid tool root: {}", root.as_ref().display()))?;
+        let web_access = WebAccess::new(web_search)?;
+        let mut definitions = Self::builtin_definitions();
+        definitions.extend(web_access.definitions(api));
         Ok(Self {
             root,
-            definitions: Self::builtin_definitions(),
+            definitions,
+            api,
+            web_access,
             mcp_servers: Vec::new(),
             mcp_routes: BTreeMap::new(),
             mcp_startup_failures: Vec::new(),
         })
     }
 
-    pub async fn with_mcp(root: impl AsRef<Path>, servers: &[McpServerConfig]) -> Result<Self> {
-        let mut registry = Self::new(root)?;
+    pub async fn with_mcp(
+        root: impl AsRef<Path>,
+        servers: &[McpServerConfig],
+        web_search: WebSearchSettings,
+        api: ApiProtocol,
+    ) -> Result<Self> {
+        let mut registry = Self::with_web_access(root, web_search, api)?;
         for server in servers {
             let result = async {
                 let service = connect_mcp_server(server, &registry.root).await?;
@@ -119,6 +144,19 @@ impl ToolRegistry {
     #[must_use]
     pub fn mcp_startup_failures(&self) -> &[McpStartupFailure] {
         &self.mcp_startup_failures
+    }
+
+    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) {
+        self.web_access.set_mode(mode);
+        self.refresh_web_access_definitions();
+    }
+
+    pub fn set_api(&mut self, api: ApiProtocol) {
+        if self.api == api {
+            return;
+        }
+        self.api = api;
+        self.refresh_web_access_definitions();
     }
 
     #[must_use]
@@ -216,6 +254,21 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolExecution {
+        if is_web_access_tool(&call.function.name)
+            && self
+                .definitions
+                .iter()
+                .any(|definition| definition.function.name == call.function.name)
+        {
+            return match self
+                .web_access
+                .execute(&call.function.name, &call.function.arguments, cancel)
+                .await
+            {
+                Ok(output) => ToolExecution::success(truncate_output(&output)),
+                Err(error) => ToolExecution::error(error),
+            };
+        }
         if let Some(route) = self.mcp_routes.get(&call.function.name) {
             return self
                 .execute_mcp(route, &call.function.arguments, cancel)
@@ -291,6 +344,18 @@ impl ToolRegistry {
         }
         self.mcp_servers.push(service);
         Ok(())
+    }
+
+    fn refresh_web_access_definitions(&mut self) {
+        self.definitions
+            .retain(|definition| !is_web_access_tool(&definition.function.name));
+        let insert_at = self
+            .definitions
+            .iter()
+            .position(|definition| self.mcp_routes.contains_key(&definition.function.name))
+            .unwrap_or(self.definitions.len());
+        self.definitions
+            .splice(insert_at..insert_at, self.web_access.definitions(self.api));
     }
 
     async fn execute_mcp(
@@ -613,6 +678,10 @@ fn unique_mcp_tool_name(server: &str, tool: &str, used: &BTreeSet<String>) -> St
     unreachable!("the collision counter is unbounded")
 }
 
+fn is_web_access_tool(name: &str) -> bool {
+    matches!(name, "web_search" | "fetch_content")
+}
+
 fn sanitize_tool_component(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -836,6 +905,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refreshes_web_tools_for_search_mode_and_api() {
+        let temp = tempdir().unwrap();
+        let mut registry = ToolRegistry::new(temp.path()).unwrap();
+        let names = |registry: &ToolRegistry| {
+            registry
+                .definitions()
+                .iter()
+                .map(|definition| definition.function.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(!names(&registry).iter().any(|name| name == "web_search"));
+        assert!(!names(&registry).iter().any(|name| name == "fetch_content"));
+
+        registry.set_web_search_mode(WebSearchMode::Live);
+        assert!(names(&registry).iter().any(|name| name == "web_search"));
+        assert!(names(&registry).iter().any(|name| name == "fetch_content"));
+
+        registry.set_api(ApiProtocol::Responses);
+        assert!(!names(&registry).iter().any(|name| name == "web_search"));
+        assert!(names(&registry).iter().any(|name| name == "fetch_content"));
+
+        registry.set_web_search_mode(WebSearchMode::Disabled);
+        assert!(!names(&registry).iter().any(|name| name == "fetch_content"));
+    }
+
     #[tokio::test]
     async fn writes_reads_and_edits_files() {
         let temp = tempdir().unwrap();
@@ -1004,9 +1100,14 @@ done
             args: vec![script.to_string_lossy().into_owned()],
             env: BTreeMap::new(),
         };
-        let registry = ToolRegistry::with_mcp(temp.path(), &[broken_server, server])
-            .await
-            .unwrap();
+        let registry = ToolRegistry::with_mcp(
+            temp.path(),
+            &[broken_server, server],
+            WebSearchSettings::default(),
+            ApiProtocol::ChatCompletions,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(registry.mcp_server_count(), 1);
         assert_eq!(registry.mcp_startup_failures().len(), 1);

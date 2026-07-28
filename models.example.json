@@ -22,6 +22,106 @@
         }
       ]
     },
+    "xai": {
+      "baseUrl": "https://api.x.ai/v1",
+      "api": "openai-completions",
+      "apiKey": "$XAI_API_KEY",
+      "compat": {
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": false,
+        "supportsStrictTools": false
+      },
+      "models": [
+        {
+          "id": "grok-4.3",
+          "name": "Grok 4.3",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxInputTokens": 1000000,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          }
+        }
+      ]
+    },
+    "deepseek": {
+      "baseUrl": "https://api.deepseek.com",
+      "api": "openai-completions",
+      "apiKey": "$DEEPSEEK_API_KEY",
+      "compat": {
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": false,
+        "supportsStrictTools": false
+      },
+      "models": [
+        {
+          "id": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxInputTokens": 1000000,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          }
+        }
+      ]
+    },
+    "kimi": {
+      "baseUrl": "https://api.moonshot.cn/v1",
+      "api": "openai-completions",
+      "apiKey": "$MOONSHOT_API_KEY",
+      "compat": {
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": false,
+        "supportsStrictTools": false
+      },
+      "models": [
+        {
+          "id": "kimi-k3",
+          "name": "Kimi K3",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxInputTokens": 1000000,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          }
+        }
+      ]
+    },
+    "glm": {
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4/",
+      "api": "openai-completions",
+      "apiKey": "$ZHIPUAI_API_KEY",
+      "compat": {
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": false,
+        "supportsStrictTools": false
+      },
+      "models": [
+        {
+          "id": "glm-5.2",
+          "name": "GLM-5.2",
+          "reasoning": false,
+          "contextWindow": 1000000,
+          "maxInputTokens": 1000000
+        }
+      ]
+    },
     "openai-compatible": {
       "baseUrl": "https://api.example.com/v1",
       "api": "openai-completions",

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -134,29 +134,25 @@ impl fmt::Display for WebSearchMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum WebSearchContextSize {
-    Low,
-    Medium,
-    High,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebSearchLocation {
-    pub country: Option<String>,
-    pub region: Option<String>,
-    pub city: Option<String>,
-    pub timezone: Option<String>,
+pub enum WebSearchProvider {
+    #[default]
+    Auto,
+    Exa,
+    Brave,
+    Searxng,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WebSearchSettings {
     pub mode: WebSearchMode,
-    pub context_size: Option<WebSearchContextSize>,
+    pub provider: WebSearchProvider,
     pub allowed_domains: Vec<String>,
-    pub location: Option<WebSearchLocation>,
+    pub exa_api_key: Option<String>,
+    pub brave_api_key: Option<String>,
+    pub searxng_base_url: Option<String>,
+    pub trust_env_proxy: bool,
 }
 
 #[derive(Clone)]
@@ -317,9 +313,12 @@ struct CompactionSettingsFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WebSearchSettingsFile {
-    context_size: Option<WebSearchContextSize>,
+    provider: Option<WebSearchProvider>,
     allowed_domains: Option<Vec<String>>,
-    location: Option<WebSearchLocation>,
+    exa_api_key: Option<String>,
+    brave_api_key: Option<String>,
+    searxng_base_url: Option<String>,
+    trust_env_proxy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -355,14 +354,23 @@ impl SettingsFile {
         if other.web_search.is_some() {
             self.web_search = other.web_search;
         }
-        if other.web_search_config.context_size.is_some() {
-            self.web_search_config.context_size = other.web_search_config.context_size;
+        if other.web_search_config.provider.is_some() {
+            self.web_search_config.provider = other.web_search_config.provider;
         }
         if other.web_search_config.allowed_domains.is_some() {
             self.web_search_config.allowed_domains = other.web_search_config.allowed_domains;
         }
-        if other.web_search_config.location.is_some() {
-            self.web_search_config.location = other.web_search_config.location;
+        if other.web_search_config.exa_api_key.is_some() {
+            self.web_search_config.exa_api_key = other.web_search_config.exa_api_key;
+        }
+        if other.web_search_config.brave_api_key.is_some() {
+            self.web_search_config.brave_api_key = other.web_search_config.brave_api_key;
+        }
+        if other.web_search_config.searxng_base_url.is_some() {
+            self.web_search_config.searxng_base_url = other.web_search_config.searxng_base_url;
+        }
+        if other.web_search_config.trust_env_proxy.is_some() {
+            self.web_search_config.trust_env_proxy = other.web_search_config.trust_env_proxy;
         }
         self.mcp_servers.extend(other.mcp_servers);
     }
@@ -494,16 +502,7 @@ impl AppConfig {
             .map(|profile| profile.provider.clone())
             .or_else(|| settings.provider.clone());
         let configured_web_search = overrides.web_search.or(settings.web_search);
-        let api = selected_profile.map_or_else(
-            || {
-                if configured_web_search.is_some_and(WebSearchMode::is_enabled) {
-                    ApiProtocol::Responses
-                } else {
-                    ApiProtocol::ChatCompletions
-                }
-            },
-            |profile| profile.api,
-        );
+        let api = selected_profile.map_or(ApiProtocol::ChatCompletions, |profile| profile.api);
 
         let environment_reasoning = env_reasoning("OPENAI_REASONING_EFFORT").transpose()?;
         let requested_reasoning_effort = overrides
@@ -528,9 +527,7 @@ impl AppConfig {
         let api_key = if overrides.api_key_env.is_some() {
             forced_api_key
         } else {
-            selected_profile
-                .and_then(|profile| profile.api_key.clone())
-                .or(fallback_api_key)
+            selected_profile.map_or(fallback_api_key, |profile| profile.api_key.clone())
         };
         let context_window = context_window_override
             .or_else(|| selected_profile.map(|profile| profile.context_window))
@@ -561,16 +558,27 @@ impl AppConfig {
                 .unwrap_or(defaults.keep_recent_tokens),
         };
         let web_search = WebSearchSettings {
-            mode: configured_web_search.unwrap_or(match api {
-                ApiProtocol::ChatCompletions => WebSearchMode::Disabled,
-                ApiProtocol::Responses => WebSearchMode::Cached,
-            }),
-            context_size: settings.web_search_config.context_size,
-            allowed_domains: settings
+            mode: configured_web_search.unwrap_or_default(),
+            provider: settings.web_search_config.provider.unwrap_or_default(),
+            allowed_domains: normalize_allowed_web_search_domains(
+                settings
+                    .web_search_config
+                    .allowed_domains
+                    .unwrap_or_default(),
+            )?,
+            exa_api_key: resolve_web_search_secret(
+                settings.web_search_config.exa_api_key.as_deref(),
+                "EXA_API_KEY",
+            ),
+            brave_api_key: resolve_web_search_secret(
+                settings.web_search_config.brave_api_key.as_deref(),
+                "BRAVE_API_KEY",
+            ),
+            searxng_base_url: settings
                 .web_search_config
-                .allowed_domains
-                .unwrap_or_default(),
-            location: settings.web_search_config.location,
+                .searxng_base_url
+                .or_else(|| env_non_empty("SEARXNG_BASE_URL")),
+            trust_env_proxy: settings.web_search_config.trust_env_proxy.unwrap_or(false),
         };
         let mcp_servers = build_mcp_servers(&settings.mcp_servers)?;
 
@@ -597,7 +605,7 @@ impl AppConfig {
         if compaction.keep_recent_tokens == 0 {
             bail!("compaction.keepRecentTokens must be at least 1");
         }
-        validate_web_search(api, &web_search)?;
+        validate_web_search(&web_search)?;
 
         Ok(Self {
             model: selected_model,
@@ -626,7 +634,6 @@ impl AppConfig {
         let profile =
             find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?.cloned();
         if let Some(profile) = profile {
-            validate_web_search(profile.api, &self.web_search)?;
             self.reasoning_effort = profile.clamp_reasoning_effort(self.reasoning_effort);
             self.reasoning_value = profile.reasoning_value(self.reasoning_effort)?;
             self.model = profile.id;
@@ -733,22 +740,82 @@ fn build_mcp_servers(servers: &BTreeMap<String, McpServerFile>) -> Result<Vec<Mc
     Ok(configured)
 }
 
-fn validate_web_search(api: ApiProtocol, settings: &WebSearchSettings) -> Result<()> {
-    if settings.mode.is_enabled() && api != ApiProtocol::Responses {
-        bail!(
-            "web search mode {} requires an openai-responses model",
-            settings.mode
-        );
+fn validate_web_search(settings: &WebSearchSettings) -> Result<()> {
+    normalize_allowed_web_search_domains(settings.allowed_domains.clone())?;
+    if settings.provider == WebSearchProvider::Brave && settings.brave_api_key.is_none() {
+        bail!("webSearchConfig.provider is brave but BRAVE_API_KEY is not configured");
     }
-    if settings.allowed_domains.len() > 100 {
-        bail!("webSearchConfig.allowedDomains cannot contain more than 100 domains");
+    if settings.provider == WebSearchProvider::Searxng {
+        let base_url = settings.searxng_base_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "webSearchConfig.provider is searxng but searxngBaseUrl is not configured"
+            )
+        })?;
+        validate_http_base_url(base_url, "webSearchConfig.searxngBaseUrl")?;
+    } else if let Some(base_url) = settings.searxng_base_url.as_deref() {
+        validate_http_base_url(base_url, "webSearchConfig.searxngBaseUrl")?;
     }
-    for domain in &settings.allowed_domains {
-        if domain.trim().is_empty() || domain.contains("://") {
-            bail!(
-                "invalid web search domain {domain:?}; use a hostname without http:// or https://"
-            );
+    Ok(())
+}
+
+fn normalize_allowed_web_search_domains(domains: Vec<String>) -> Result<Vec<String>> {
+    normalize_web_search_domains(domains, false)
+}
+
+pub(crate) fn normalize_web_search_domain_filters(domains: Vec<String>) -> Result<Vec<String>> {
+    normalize_web_search_domains(domains, true)
+}
+
+fn normalize_web_search_domains(
+    domains: Vec<String>,
+    allow_exclusions: bool,
+) -> Result<Vec<String>> {
+    if domains.len() > 20 {
+        bail!("web search domain filters cannot contain more than 20 domains");
+    }
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let domain = domain.trim();
+        let (excluded, hostname) = domain
+            .strip_prefix('-')
+            .map_or((false, domain), |hostname| (true, hostname));
+        if excluded && !allow_exclusions {
+            bail!("invalid allowed domain {domain:?}; exclusions are only valid in tool filters");
         }
+        let url::Host::Domain(hostname) = url::Host::parse(hostname).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid web search domain {domain:?}; use a hostname without a URL scheme"
+            )
+        })?
+        else {
+            bail!("invalid web search domain {domain:?}; use a DNS hostname");
+        };
+        let normalized_domain = if excluded {
+            format!("-{hostname}")
+        } else {
+            hostname
+        };
+        if seen.insert(normalized_domain.clone()) {
+            normalized.push(normalized_domain);
+        }
+    }
+    Ok(normalized)
+}
+
+fn resolve_web_search_secret(configured: Option<&str>, environment: &str) -> Option<String> {
+    configured
+        .map_or_else(|| env_non_empty(environment), resolve_static_config_value)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn validate_http_base_url(value: &str, field: &str) -> Result<()> {
+    let url = url::Url::parse(value).with_context(|| format!("invalid {field}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("{field} must be an HTTP or HTTPS URL with a hostname");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("{field} must not contain credentials");
     }
     Ok(())
 }
@@ -838,12 +905,9 @@ fn build_model_profiles(
                     )
                 })?;
             let api_key = forced_api_key.map_or_else(
-                || {
-                    provider
-                        .api_key
-                        .as_deref()
-                        .and_then(resolve_static_config_value)
-                        .or_else(|| fallback_api_key.cloned())
+                || match provider.api_key.as_deref() {
+                    Some(value) => resolve_static_config_value(value),
+                    None => fallback_api_key.cloned(),
                 },
                 |value| (*value).clone(),
             );
@@ -1098,35 +1162,96 @@ mod tests {
     }
 
     #[test]
-    fn parses_responses_model_and_codex_web_search_settings() {
+    fn example_configs_cover_supported_compatible_providers() {
+        let models: ModelsFile = serde_json::from_str(include_str!("../models.example.json"))
+            .expect("models.example.json should be valid");
+        let profiles = build_model_profiles(models, None, None, None, None, None).unwrap();
+        let qualified = profiles
+            .iter()
+            .map(ModelProfile::qualified_id)
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "xai/grok-4.3",
+            "deepseek/deepseek-v4-pro",
+            "kimi/kimi-k3",
+            "glm/glm-5.2",
+        ] {
+            assert!(qualified.contains(expected), "missing {expected}");
+        }
+
+        let settings: SettingsFile = serde_json::from_str(include_str!("../settings.example.json"))
+            .expect("settings.example.json should be valid");
+        assert_eq!(settings.provider.as_deref(), Some("openai-compatible"));
+        assert_eq!(
+            settings.web_search_config.provider,
+            Some(WebSearchProvider::Auto)
+        );
+    }
+
+    #[test]
+    fn provider_keys_do_not_fall_back_when_an_explicit_secret_is_missing() {
+        let models: ModelsFile = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "explicit": {
+                        "baseUrl": "https://explicit.test/v1",
+                        "api": "openai-completions",
+                        "apiKey": "$MCODE_TEST_EXPLICIT_KEY_THAT_DOES_NOT_EXIST",
+                        "models": [{"id": "one"}]
+                    },
+                    "implicit": {
+                        "baseUrl": "https://implicit.test/v1",
+                        "api": "openai-completions",
+                        "models": [{"id": "two"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let fallback = "openai-fallback".to_string();
+        let profiles =
+            build_model_profiles(models, None, None, Some(&fallback), None, None).unwrap();
+        let explicit = profiles
+            .iter()
+            .find(|profile| profile.provider == "explicit")
+            .unwrap();
+        let implicit = profiles
+            .iter()
+            .find(|profile| profile.provider == "implicit")
+            .unwrap();
+
+        assert!(explicit.api_key.is_none());
+        assert_eq!(implicit.api_key.as_deref(), Some("openai-fallback"));
+    }
+
+    #[test]
+    fn parses_responses_model_and_hybrid_web_search_settings() {
         let settings: SettingsFile = serde_json::from_str(
             r#"{
                 "webSearch": "live",
                 "webSearchConfig": {
-                    "contextSize": "high",
+                    "provider": "searxng",
                     "allowedDomains": ["openai.com", "rust-lang.org"],
-                    "location": {"country": "CN", "timezone": "Asia/Shanghai"}
+                    "searxngBaseUrl": "https://search.example.com/",
+                    "trustEnvProxy": true
                 }
             }"#,
         )
         .unwrap();
         assert_eq!(settings.web_search, Some(WebSearchMode::Live));
         assert_eq!(
-            settings.web_search_config.context_size,
-            Some(WebSearchContextSize::High)
+            settings.web_search_config.provider,
+            Some(WebSearchProvider::Searxng)
         );
         assert_eq!(
             settings.web_search_config.allowed_domains.as_deref(),
             Some(["openai.com".to_string(), "rust-lang.org".to_string()].as_slice())
         );
         assert_eq!(
-            settings
-                .web_search_config
-                .location
-                .as_ref()
-                .and_then(|location| location.timezone.as_deref()),
-            Some("Asia/Shanghai")
+            settings.web_search_config.searxng_base_url.as_deref(),
+            Some("https://search.example.com/")
         );
+        assert_eq!(settings.web_search_config.trust_env_proxy, Some(true));
 
         let models: ModelsFile = serde_json::from_str(
             r#"{
@@ -1150,15 +1275,41 @@ mod tests {
 
         let search = WebSearchSettings {
             mode: WebSearchMode::Live,
-            context_size: settings.web_search_config.context_size,
+            provider: settings.web_search_config.provider.unwrap(),
             allowed_domains: settings
                 .web_search_config
                 .allowed_domains
                 .unwrap_or_default(),
-            location: settings.web_search_config.location,
+            searxng_base_url: settings.web_search_config.searxng_base_url,
+            trust_env_proxy: settings
+                .web_search_config
+                .trust_env_proxy
+                .unwrap_or_default(),
+            ..WebSearchSettings::default()
         };
-        validate_web_search(ApiProtocol::Responses, &search).unwrap();
-        assert!(validate_web_search(ApiProtocol::ChatCompletions, &search).is_err());
+        validate_web_search(&search).unwrap();
+    }
+
+    #[test]
+    fn normalizes_and_validates_web_search_domains() {
+        assert_eq!(
+            normalize_allowed_web_search_domains(vec![
+                " Example.COM ".to_string(),
+                "example.com".to_string(),
+            ])
+            .unwrap(),
+            vec!["example.com".to_string()]
+        );
+        assert_eq!(
+            normalize_web_search_domain_filters(vec!["-Docs.Example.com".to_string()]).unwrap(),
+            vec!["-docs.example.com".to_string()]
+        );
+        assert!(normalize_allowed_web_search_domains(vec!["-example.com".to_string()]).is_err());
+        assert!(
+            normalize_allowed_web_search_domains(vec!["https://example.com".to_string()]).is_err()
+        );
+        assert!(normalize_allowed_web_search_domains(vec!["127.0.0.1".to_string()]).is_err());
+        assert!(normalize_allowed_web_search_domains(vec!["example.com".to_string(); 21]).is_err());
     }
 
     #[test]

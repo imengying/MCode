@@ -29,18 +29,6 @@ jobs:
             target: aarch64-unknown-linux-musl
             archive: mcode-aarch64-unknown-linux-musl.tar.gz
             binary: mcode
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive: mcode-x86_64-apple-darwin.tar.gz
-            binary: mcode
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            archive: mcode-aarch64-apple-darwin.tar.gz
-            binary: mcode
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: mcode-x86_64-pc-windows-msvc.zip
-            binary: mcode.exe
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -62,20 +50,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package Unix archive
-        if: runner.os != 'Windows'
+      - name: Package archive
         run: |
           mkdir -p dist/package
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} README.md LICENSE dist/package/
           tar -C dist/package -czf dist/${{ matrix.archive }} ${{ matrix.binary }} README.md LICENSE
-
-      - name: Package Windows archive
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist\package | Out-Null
-          Copy-Item target\${{ matrix.target }}\release\${{ matrix.binary }}, README.md, LICENSE dist\package\
-          Compress-Archive -Path dist\package\* -DestinationPath dist\${{ matrix.archive }}
 
       - name: Upload archive
         uses: actions/upload-artifact@v7

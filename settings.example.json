@@ -4,12 +4,9 @@
   "defaultThinkingLevel": "high",
   "webSearch": "disabled",
   "webSearchConfig": {
-    "contextSize": "medium",
+    "provider": "auto",
     "allowedDomains": [],
-    "location": {
-      "country": "CN",
-      "timezone": "Asia/Shanghai"
-    }
+    "trustEnvProxy": false
   },
   "compaction": {
     "enabled": true,

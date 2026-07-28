@@ -75,7 +75,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECONDS")]
     pub request_timeout: Option<u64>,
 
-    /// Enable live web search through the hosted Responses API.
+    /// Enable live web search for the selected API and provider.
     #[arg(long, global = true)]
     pub search: bool,
 
