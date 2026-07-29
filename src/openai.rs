@@ -16,7 +16,6 @@ use crate::protocol::{
     ChatMessage, FunctionCall, MessageRole, ToolCall, ToolDefinition, Usage, WebSearchAction,
 };
 
-const MCODE_USER_AGENT: &str = concat!("mcode/", env!("CARGO_PKG_VERSION"));
 const MAX_REQUEST_ATTEMPTS: usize = 4;
 const MAX_STREAM_ATTEMPTS: usize = 2;
 
@@ -968,7 +967,7 @@ fn is_loopback_host(host: &str) -> bool {
 fn build_http_client(endpoint: &Url) -> std::result::Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(20))
-        .user_agent(MCODE_USER_AGENT);
+        .user_agent(format!("mcode/{}", crate::VERSION));
     if endpoint.host_str().is_some_and(is_loopback_host) {
         builder = builder.no_proxy();
     }

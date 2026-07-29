@@ -191,4 +191,4 @@ MCODE_REAL_API_MODEL=gpt-5.6-terra \
 
 GitHub Actions 在 Linux 上执行格式、Clippy、RustSec、测试和 release 构建。`v*` tag 只触发
 Release workflow，发布 Linux musl x86_64/ARM64 二进制归档，并用 tag 之间的 commit 生成更新
-日志；源码归档由 GitHub 自动提供。
+日志；发布二进制的版本取自 tag，源码归档由 GitHub 自动提供。

@@ -189,7 +189,7 @@ fn run_doctor(config: &AppConfig, json: bool) -> Result<()> {
     checks.push(serde_json::json!({
         "status": "ok",
         "name": "version",
-        "detail": format!("mcode {}", env!("CARGO_PKG_VERSION")),
+        "detail": format!("mcode {}", mcode::VERSION),
     }));
     checks.push(serde_json::json!({
         "status": "ok",

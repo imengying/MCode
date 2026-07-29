@@ -14,7 +14,6 @@ use url::Url;
 use uuid::Uuid;
 
 const RELEASE_API_URL: &str = "https://api.github.com/repos/imengying/MCode/releases/latest";
-const USER_AGENT: &str = concat!("mcode/", env!("CARGO_PKG_VERSION"));
 const MAX_RELEASE_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
@@ -34,13 +33,13 @@ struct GitHubAsset {
 
 pub async fn run() -> Result<()> {
     let (target, asset_name) = release_platform()?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
+    let current_version = Version::parse(crate::VERSION)
         .context("the installed MCode version is not valid semantic versioning")?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_mins(5))
         .https_only(true)
-        .user_agent(USER_AGENT)
+        .user_agent(format!("mcode/{}", crate::VERSION))
         .build()
         .context("failed to create the update client")?;
 

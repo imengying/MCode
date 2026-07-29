@@ -7,7 +7,7 @@ use crate::config::ReasoningEffort;
 #[derive(Debug, Parser)]
 #[command(
     name = "mcode",
-    version,
+    version = crate::VERSION,
     about = "MCode, a focused OpenAI-compatible coding agent",
     args_conflicts_with_subcommands = true,
     after_help = "Examples:\n  mcode\n  mcode -i screenshot.png \"inspect this UI\"\n  mcode --search \"check the latest dependency release\"\n  mcode exec \"fix the failing tests\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode sessions\n  mcode doctor\n  mcode update\n  mcode delete <SESSION_ID>"
@@ -171,9 +171,14 @@ pub fn join_prompt(parts: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::*;
+
+    #[test]
+    fn reports_the_build_version() {
+        assert_eq!(Cli::command().get_version(), Some(crate::VERSION));
+    }
 
     #[test]
     fn parses_codex_style_exec() {

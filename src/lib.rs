@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+pub const VERSION: &str = match option_env!("MCODE_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 pub mod agent;
 pub mod approval;
 pub mod cli;
