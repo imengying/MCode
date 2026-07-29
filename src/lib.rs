@@ -11,6 +11,7 @@ pub mod cli;
 pub mod compaction;
 pub mod config;
 pub mod event;
+mod highlight;
 pub mod openai;
 pub mod protocol;
 pub mod session;

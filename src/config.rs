@@ -270,7 +270,6 @@ pub struct AppConfig {
     pub supports_usage_in_streaming: bool,
     pub supports_strict_tools: bool,
     pub cwd: PathBuf,
-    pub max_tool_turns: usize,
     pub request_timeout_secs: u64,
     pub compaction: CompactionSettings,
     pub web_search: WebSearchSettings,
@@ -295,7 +294,6 @@ pub struct ConfigOverrides {
     pub context_window: Option<u64>,
     pub max_input_tokens: Option<u64>,
     pub cwd: Option<PathBuf>,
-    pub max_tool_turns: Option<usize>,
     pub request_timeout_secs: Option<u64>,
     pub web_search: Option<WebSearchMode>,
 }
@@ -550,7 +548,6 @@ impl AppConfig {
             || api == ApiProtocol::Responses && is_official_openai_url(&base_url),
             |profile| profile.compat.strict_tools,
         );
-        let max_tool_turns = overrides.max_tool_turns.unwrap_or(32);
         let request_timeout_secs = overrides.request_timeout_secs.unwrap_or(300);
         let defaults = CompactionSettings::default();
         let compaction = CompactionSettings {
@@ -600,9 +597,6 @@ impl AppConfig {
                 "max input tokens must be between 1 and the {context_window}-token context window"
             );
         }
-        if max_tool_turns == 0 {
-            bail!("max tool turns must be at least 1");
-        }
         if request_timeout_secs == 0 {
             bail!("request timeout must be at least 1 second");
         }
@@ -628,7 +622,6 @@ impl AppConfig {
             supports_usage_in_streaming,
             supports_strict_tools,
             cwd,
-            max_tool_turns,
             request_timeout_secs,
             compaction,
             web_search,

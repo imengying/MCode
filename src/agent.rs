@@ -45,7 +45,6 @@ pub struct Agent {
     tools: ToolRegistry,
     session: Session,
     system_prompt: Option<String>,
-    max_tool_turns: usize,
     total_usage: Usage,
     approved_tools: BTreeSet<String>,
     last_context_dropped: usize,
@@ -128,7 +127,6 @@ impl Agent {
             tools,
             session,
             system_prompt,
-            max_tool_turns: config.max_tool_turns,
             total_usage,
             approved_tools: BTreeSet::new(),
             last_context_dropped: 0,
@@ -214,11 +212,10 @@ impl Agent {
         let definitions = self.tools.definitions().to_vec();
         let mut overflow_recovery_attempted = false;
 
-        while self.session.active_run_completed_steps() < self.max_tool_turns {
+        loop {
             if cancel.is_cancelled() {
                 return Ok(RunStatus::Cancelled);
             }
-
             let (turn, context) = loop {
                 let _ = self
                     .maybe_auto_compact(CompactionReason::Threshold, events, cancel)
@@ -325,11 +322,6 @@ impl Agent {
                 return Ok(RunStatus::Cancelled);
             }
         }
-
-        Err(anyhow!(
-            "agent exceeded the maximum of {} tool turns",
-            self.max_tool_turns
-        ))
     }
 
     async fn execute_tool_calls(
@@ -1137,7 +1129,6 @@ mod tests {
             supports_usage_in_streaming: true,
             supports_strict_tools: false,
             cwd: project.path().canonicalize().unwrap(),
-            max_tool_turns: 4,
             request_timeout_secs: 10,
             compaction: CompactionSettings::default(),
             web_search: crate::config::WebSearchSettings::default(),

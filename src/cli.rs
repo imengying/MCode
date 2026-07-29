@@ -73,10 +73,6 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_session: bool,
 
-    /// 单次请求允许的最大模型/工具循环次数。
-    #[arg(long, global = true, value_name = "N")]
-    pub max_tool_turns: Option<usize>,
-
     /// 供应商请求超时时间（秒）。
     #[arg(long, global = true, value_name = "秒")]
     pub request_timeout: Option<u64>,

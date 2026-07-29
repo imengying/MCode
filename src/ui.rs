@@ -6,22 +6,24 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType as CrosstermClearType, disable_raw_mode, enable_raw_mode,
 };
 use pulldown_cmark::{
-    Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions, Parser, Tag, TagEnd,
+    CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions, Parser, Tag,
+    TagEnd,
 };
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
+use ratatui::backend::{Backend, ClearType as BackendClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell;
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::{Frame, Terminal};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
@@ -31,6 +33,7 @@ use crate::agent::{Agent, ModelChoice};
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
 use crate::config::{ApiProtocol, ReasoningEffort, WebSearchMode};
 use crate::event::{AgentEvent, CompactionReason};
+use crate::highlight::highlight_code;
 use crate::protocol::{
     ChatMessage, ImageAttachment, MAX_IMAGE_BYTES, MessageRole, Usage, sanitize_terminal_text,
 };
@@ -39,6 +42,7 @@ const APPROVAL_HEIGHT: u16 = 6;
 const DELETE_CONFIRMATION_HEIGHT: u16 = 5;
 const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
+const INLINE_VIEWPORT_HEIGHT: u16 = 10;
 const INPUT_PREFIX_WIDTH: u16 = 2;
 const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
@@ -47,6 +51,18 @@ const PREVIEW_LINE_CHARS: usize = 240;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const THEME_BASE: Color = Color::Rgb(30, 30, 46);
+const THEME_MANTLE: Color = Color::Rgb(24, 24, 37);
+const THEME_SURFACE: Color = Color::Rgb(49, 50, 68);
+const THEME_TEXT: Color = Color::Rgb(205, 214, 244);
+const THEME_SUBTEXT: Color = Color::Rgb(186, 194, 222);
+const THEME_MUTED: Color = Color::Rgb(108, 112, 134);
+const THEME_BLUE: Color = Color::Rgb(137, 180, 250);
+const THEME_GREEN: Color = Color::Rgb(166, 227, 161);
+const THEME_YELLOW: Color = Color::Rgb(249, 226, 175);
+const THEME_RED: Color = Color::Rgb(243, 139, 168);
+const THEME_MAUVE: Color = Color::Rgb(203, 166, 247);
+const THEME_TEAL: Color = Color::Rgb(148, 226, 213);
 const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
@@ -74,6 +90,16 @@ pub fn run_interactive(
     let endpoint = agent.endpoint().to_string();
     let cwd = agent.session().cwd().to_path_buf();
     let has_pending_run = agent.has_pending_run();
+    let pending_tool_ids = if has_pending_run {
+        agent
+            .session()
+            .pending_tool_calls()?
+            .into_iter()
+            .map(|pending| pending.call.id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut state = UiState::new(model, endpoint, cwd);
     state.pending_images = initial_images;
     state.sync_from_agent(&agent);
@@ -93,8 +119,14 @@ pub fn run_interactive(
     };
 
     let screen = ScreenGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).context("初始化终端失败")?;
+    let backend = UiBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+        },
+    )
+    .context("初始化终端失败")?;
     terminal.clear().context("清空终端失败")?;
 
     if let Some(checkpoint) = historical_compaction {
@@ -107,6 +139,7 @@ pub fn run_interactive(
     for message in historical_messages {
         state.push_history(message);
     }
+    state.hold_pending_tools(&pending_tool_ids);
     let mut active_cancel = None;
     if has_pending_run {
         if let Some(prompt) = initial_prompt.filter(|prompt| !prompt.trim().is_empty()) {
@@ -135,9 +168,12 @@ pub fn run_interactive(
 
     let mut deleted_session = None;
     let mut pending_approval: Option<ApprovalRequest> = None;
-    let mut last_frame = Instant::now();
+    let now = Instant::now();
+    let mut last_frame = now.checked_sub(FRAME_INTERVAL).unwrap_or(now);
+    let mut needs_draw = true;
     'ui: loop {
         while let Ok(agent_event) = event_rx.try_recv() {
+            needs_draw = true;
             state.apply_agent_event(agent_event);
             if !state.running {
                 active_cancel = None;
@@ -150,22 +186,30 @@ pub fn run_interactive(
         if pending_approval.is_none()
             && let Ok(request) = approval_rx.try_recv()
         {
+            needs_draw = true;
             state.set_pending_approval(&request);
             pending_approval = Some(request);
         }
 
-        if last_frame.elapsed() >= FRAME_INTERVAL {
+        let history_inserted = flush_finalized_history(&mut terminal, &mut state)?;
+        needs_draw |= history_inserted;
+        if needs_draw && (history_inserted || last_frame.elapsed() >= FRAME_INTERVAL) {
             terminal
                 .draw(|frame| render(frame, &mut state))
                 .context("绘制终端界面失败")?;
             last_frame = Instant::now();
+            needs_draw = false;
         }
 
         if !event::poll(Duration::from_millis(20)).context("轮询终端事件失败")? {
             continue;
         }
         match event::read().context("读取终端事件失败")? {
+            Event::Key(key)
+                if key.kind != KeyEventKind::Release
+                    && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) => {}
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                needs_draw = true;
                 match handle_key(key, &mut state, active_cancel.as_ref()) {
                     UiAction::None => {}
                     UiAction::Quit => break,
@@ -230,6 +274,7 @@ pub fn run_interactive(
                             Ok(()) => {
                                 state.reset_session();
                                 state.sync_from_agent(&agent);
+                                clear_terminal_history(&mut terminal)?;
                                 state.push_notice("已新建会话。");
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
@@ -246,6 +291,10 @@ pub fn run_interactive(
                         },
                         Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
+                    UiAction::Clear => {
+                        state.clear_view();
+                        clear_terminal_history(&mut terminal)?;
+                    }
                     UiAction::PasteClipboard => paste_from_clipboard(&mut state),
                     UiAction::ResolveApproval(decision) => {
                         if let Some(request) = pending_approval.take() {
@@ -259,23 +308,145 @@ pub fn run_interactive(
                 if state.pending_approval.is_none()
                     && state.delete_confirmation == DeleteConfirmation::None =>
             {
+                needs_draw = true;
                 paste_text_or_image(&mut state, &text);
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => state.scroll_lines_up(3),
-                MouseEventKind::ScrollDown => state.scroll_lines_down(3),
-                _ => {}
-            },
+            Event::Resize(..) => needs_draw = true,
             _ => {}
         }
     }
 
+    terminal.clear().context("清理终端输入区失败")?;
     drop(terminal);
     drop(screen);
     if let Some(id) = deleted_session {
         println!("已删除会话 {id}。");
     }
     Ok(())
+}
+
+// Some PTYs do not answer cursor-position queries; retain Ratatui's last position as a fallback.
+struct UiBackend {
+    inner: CrosstermBackend<io::Stdout>,
+    cursor: Option<Position>,
+}
+
+impl UiBackend {
+    fn new(stdout: io::Stdout) -> Self {
+        Self {
+            inner: CrosstermBackend::new(stdout),
+            cursor: None,
+        }
+    }
+}
+
+impl Backend for UiBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, count: u16) -> io::Result<()> {
+        self.inner.append_lines(count)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        if let Some(cursor) = self.cursor {
+            return Ok(cursor);
+        }
+        let cursor = self.inner.get_cursor_position().unwrap_or(Position::ORIGIN);
+        self.cursor = Some(cursor);
+        Ok(cursor)
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        self.inner.set_cursor_position(position)?;
+        self.cursor = Some(position);
+        Ok(())
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: BackendClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+}
+
+type UiTerminal = Terminal<UiBackend>;
+
+fn flush_finalized_history(terminal: &mut UiTerminal, state: &mut UiState) -> Result<bool> {
+    let width = terminal.size().context("读取终端尺寸失败")?.width;
+    if width < 24 {
+        return Ok(false);
+    }
+
+    let messages = state.take_finalized_messages();
+    if messages.is_empty() {
+        return Ok(false);
+    }
+
+    for message in messages {
+        insert_history_lines(terminal, conversation_lines_for_messages(&[message]), width)?;
+    }
+    Ok(true)
+}
+
+fn insert_history_lines(
+    terminal: &mut UiTerminal,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(Style::default().fg(THEME_TEXT).bg(THEME_BASE))
+        .wrap(Wrap { trim: false });
+    let height =
+        u16::try_from(paragraph.line_count(width)).context("单条终端消息超过可显示的最大高度")?;
+    terminal
+        .insert_before(height, |buffer| {
+            let area = buffer.area;
+            paragraph.render(area, buffer);
+        })
+        .context("写入终端历史失败")
+}
+
+fn clear_terminal_history(terminal: &mut UiTerminal) -> Result<()> {
+    execute!(
+        io::stdout(),
+        Clear(CrosstermClearType::Purge),
+        Clear(CrosstermClearType::All)
+    )
+    .context("清空终端历史失败")?;
+    terminal.clear().context("重置终端视口失败")
 }
 
 fn start_resume(
@@ -368,6 +539,7 @@ enum UiAction {
     Compact(String),
     NewSession,
     DeleteSession,
+    Clear,
     PasteClipboard,
     ResolveApproval(ApprovalDecision),
 }
@@ -671,14 +843,6 @@ fn handle_key(
                 return UiAction::None;
             }
             KeyCode::Char('v') => return UiAction::PasteClipboard,
-            KeyCode::Home => {
-                state.scroll_lines_up(usize::MAX);
-                return UiAction::None;
-            }
-            KeyCode::End => {
-                state.scroll_lines_down(usize::MAX);
-                return UiAction::None;
-            }
             _ => {}
         }
     }
@@ -761,8 +925,6 @@ fn handle_key(
         KeyCode::End => state.editor.move_end(),
         KeyCode::Up => state.previous_input(),
         KeyCode::Down => state.next_input(),
-        KeyCode::PageUp => state.scroll_up(),
-        KeyCode::PageDown => state.scroll_down(),
         _ => {}
     }
     UiAction::None
@@ -791,11 +953,7 @@ fn submit_editor(state: &mut UiState) -> UiAction {
     }
     match name {
         "exit" => UiAction::Quit,
-        "clear" => {
-            state.messages.clear();
-            state.follow_tail = true;
-            UiAction::None
-        }
+        "clear" => UiAction::Clear,
         "new" => UiAction::NewSession,
         "compact" => UiAction::Compact(argument.to_string()),
         "delete" if argument.is_empty() => {
@@ -1267,10 +1425,6 @@ struct UiState {
     context_window: u64,
     max_input_tokens: u64,
     usage_estimated: bool,
-    scroll: usize,
-    max_scroll: usize,
-    viewport_height: usize,
-    follow_tail: bool,
     delete_confirmation: DeleteConfirmation,
     pending_images: Vec<ImageAttachment>,
     slash_selection: usize,
@@ -1311,10 +1465,6 @@ impl UiState {
             context_window: 128_000,
             max_input_tokens: 128_000,
             usage_estimated: false,
-            scroll: 0,
-            max_scroll: 0,
-            viewport_height: 1,
-            follow_tail: true,
             delete_confirmation: DeleteConfirmation::None,
             pending_images: Vec::new(),
             slash_selection: 0,
@@ -1430,7 +1580,6 @@ impl UiState {
                 }
             }
         }
-        self.follow_tail = true;
         self.delete_confirmation = DeleteConfirmation::None;
     }
 
@@ -1445,7 +1594,6 @@ impl UiState {
             tool_id: None,
             running: false,
         });
-        self.follow_tail = true;
     }
 
     fn take_pending_images(&mut self) -> Vec<ImageAttachment> {
@@ -1462,7 +1610,6 @@ impl UiState {
             tool_id: None,
             running: false,
         });
-        self.follow_tail = true;
     }
 
     fn push_error(&mut self, content: impl AsRef<str>) {
@@ -1475,7 +1622,6 @@ impl UiState {
             tool_id: None,
             running: false,
         });
-        self.follow_tail = true;
     }
 
     fn set_pending_approval(&mut self, request: &ApprovalRequest) {
@@ -1497,17 +1643,54 @@ impl UiState {
 
     fn reset_session(&mut self) {
         self.messages.clear();
+        self.current_assistant = None;
+        self.generation_start = None;
         self.usage = Usage::default();
         self.context_tokens = 0;
         self.usage_estimated = false;
         self.status = "就绪".to_string();
-        self.follow_tail = true;
         self.delete_confirmation = DeleteConfirmation::None;
         self.pending_images.clear();
         self.pending_approval = None;
         self.input_history.clear();
         self.detach_input_history();
         self.reset_reasoning_summary();
+    }
+
+    fn clear_view(&mut self) {
+        self.messages.clear();
+        self.current_assistant = None;
+        self.generation_start = None;
+        self.delete_confirmation = DeleteConfirmation::None;
+        self.reset_reasoning_summary();
+    }
+
+    fn take_finalized_messages(&mut self) -> Vec<ViewMessage> {
+        let count = self
+            .messages
+            .iter()
+            .position(|message| message.running)
+            .unwrap_or(self.messages.len());
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let finalized = self.messages.drain(..count).collect();
+        self.current_assistant = shift_message_index(self.current_assistant, count);
+        self.generation_start = shift_message_index(self.generation_start, count);
+        finalized
+    }
+
+    fn hold_pending_tools(&mut self, tool_ids: &[String]) {
+        for message in &mut self.messages {
+            if message
+                .tool_id
+                .as_ref()
+                .is_some_and(|id| tool_ids.contains(id))
+            {
+                message.running = true;
+            }
+        }
     }
 
     fn start_reasoning_summary(&mut self) {
@@ -1723,7 +1906,6 @@ impl UiState {
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent) {
-        let follow_tail = self.follow_tail;
         match event {
             AgentEvent::RunStarted | AgentEvent::RunResumed => {
                 self.status = "处理中".to_string();
@@ -1821,7 +2003,7 @@ impl UiState {
                     } else {
                         format!("已拒绝：{name}")
                     };
-                    message.running = false;
+                    message.running = true;
                     if !approved {
                         message.role = ViewRole::Error;
                     }
@@ -2004,7 +2186,6 @@ impl UiState {
                 });
             }
         }
-        self.follow_tail = follow_tail;
     }
 
     fn finish_run(&mut self, status: &str) {
@@ -2059,39 +2240,22 @@ impl UiState {
         }
         self.current_assistant = None;
     }
+}
 
-    fn scroll_up(&mut self) {
-        let amount = self.viewport_height.saturating_sub(2).max(1);
-        self.scroll_lines_up(amount);
-    }
-
-    fn scroll_down(&mut self) {
-        let amount = self.viewport_height.saturating_sub(2).max(1);
-        self.scroll_lines_down(amount);
-    }
-
-    fn scroll_lines_up(&mut self, amount: usize) {
-        self.follow_tail = false;
-        self.scroll = self.scroll.saturating_sub(amount.max(1));
-    }
-
-    fn scroll_lines_down(&mut self, amount: usize) {
-        self.scroll = self
-            .scroll
-            .saturating_add(amount.max(1))
-            .min(self.max_scroll);
-        if self.scroll >= self.max_scroll {
-            self.follow_tail = true;
-        }
-    }
+fn shift_message_index(index: Option<usize>, removed: usize) -> Option<usize> {
+    index.and_then(|index| index.checked_sub(removed))
 }
 
 fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     let area = frame.area();
-    if area.width < 24 || area.height < 11 {
+    frame.render_widget(
+        Block::default().style(Style::default().fg(THEME_TEXT).bg(THEME_BASE)),
+        area,
+    );
+    if area.width < 24 || area.height < INLINE_VIEWPORT_HEIGHT {
         frame.render_widget(
             Paragraph::new("终端窗口过小")
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(THEME_RED))
                 .block(Block::default().borders(Borders::ALL)),
             area,
         );
@@ -2149,116 +2313,26 @@ fn render_reasoning_activity(frame: &mut Frame<'_>, state: &UiState, area: Rect)
     let available = usize::from(area.width).saturating_sub(2);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("• ", Style::default().fg(Color::Rgb(245, 190, 78))),
+            Span::styled("• ", Style::default().fg(THEME_YELLOW)),
             Span::styled(
                 truncate_width(&activity, available.saturating_add(1)),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(THEME_SUBTEXT),
             ),
         ])),
         area,
     );
 }
 
-fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
-    if state.messages.is_empty()
-        && !state.running
-        && state.pending_approval.is_none()
-        && state.delete_confirmation == DeleteConfirmation::None
-    {
-        state.viewport_height = usize::from(area.height.max(1));
-        state.max_scroll = 0;
-        state.scroll = 0;
-        state.follow_tail = true;
-        render_welcome(frame, state, area);
+fn render_conversation(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    if state.messages.is_empty() {
         return;
     }
     let lines = conversation_lines(state);
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total_height = paragraph.line_count(area.width);
-    state.viewport_height = usize::from(area.height.max(1));
-    state.max_scroll = total_height
-        .saturating_sub(state.viewport_height)
-        .min(usize::from(u16::MAX));
-    if state.follow_tail {
-        state.scroll = state.max_scroll;
-    } else {
-        state.scroll = state.scroll.min(state.max_scroll);
-    }
-    let scroll = u16::try_from(state.scroll).unwrap_or(u16::MAX);
+    let scroll =
+        u16::try_from(total_height.saturating_sub(usize::from(area.height))).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), area);
-}
-
-fn render_welcome(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
-    let width = area.width.min(68);
-    let height = area.height.min(7);
-    let welcome_area = Rect::new(
-        area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y
-            .saturating_add(area.height.saturating_sub(height) / 3),
-        width,
-        height,
-    );
-    let inner_width = usize::from(width.saturating_sub(2));
-    let model = format!(
-        "{}（{} 上下文） · effort {}",
-        state.qualified_model(),
-        format_tokens(state.max_input_tokens),
-        state.reasoning_effort
-    );
-    let cwd = friendly_project_path(&state.cwd);
-    let lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            "欢迎回来！",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::default(),
-        Line::from(Span::styled(
-            truncate_width(&model, inner_width.saturating_add(1)),
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(Span::styled(
-            truncate_width(&cwd, inner_width.saturating_add(1)),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(vec![
-                    Span::styled(
-                        " MCode",
-                        Style::default()
-                            .fg(Color::Rgb(103, 232, 163))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" v{} ", env!("CARGO_PKG_VERSION")),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]))
-                .border_style(Style::default().fg(Color::Rgb(103, 232, 163))),
-        ),
-        welcome_area,
-    );
-}
-
-fn friendly_project_path(path: &std::path::Path) -> String {
-    let display = dirs::home_dir()
-        .and_then(|home| {
-            path.strip_prefix(home).ok().map(|relative| {
-                if relative.as_os_str().is_empty() {
-                    "~".to_string()
-                } else {
-                    format!("~/{}", relative.display())
-                }
-            })
-        })
-        .unwrap_or_else(|| path.display().to_string());
-    sanitize_terminal_text(&display)
 }
 
 fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
@@ -2300,32 +2374,28 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
                     .saturating_add(2),
             );
             let command_style = if is_selected {
-                Style::default()
-                    .fg(Color::Rgb(126, 200, 255))
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(THEME_SUBTEXT)
             };
             Line::from(vec![
                 Span::styled(
                     marker,
-                    Style::default()
-                        .fg(Color::Rgb(126, 200, 255))
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(label, command_style),
                 Span::raw(padding),
                 Span::styled(
                     suggestion.description.clone(),
                     Style::default().fg(if is_selected {
-                        Color::Gray
+                        THEME_SUBTEXT
                     } else {
-                        Color::DarkGray
+                        THEME_MUTED
                     }),
                 ),
             ])
             .style(if is_selected {
-                Style::default().bg(Color::Rgb(31, 35, 41))
+                Style::default().bg(THEME_SURFACE)
             } else {
                 Style::default()
             })
@@ -2350,10 +2420,10 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             Line::from(Span::styled(
                 format!("是否允许运行 {}？", approval.name),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(THEME_YELLOW)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(details, Style::default().fg(Color::Gray))),
+            Line::from(Span::styled(details, Style::default().fg(THEME_SUBTEXT))),
             approval_option_line(
                 ApprovalChoice::ApproveOnce,
                 approval.selection,
@@ -2367,11 +2437,11 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             approval_option_line(ApprovalChoice::Deny, approval.selection, "3. 拒绝"),
             Line::from(Span::styled(
                 "  ↑/↓ 选择 · Enter 确认 · Esc 取消任务",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME_MUTED),
             )),
         ];
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(Color::Rgb(24, 27, 32))),
+            Paragraph::new(lines).style(Style::default().bg(THEME_MANTLE)),
             area,
         );
         return;
@@ -2380,17 +2450,17 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     if let DeleteConfirmation::Selecting(selection) = state.delete_confirmation {
         let yes_style = if selection == DeleteChoice::Yes {
             Style::default()
-                .fg(Color::Red)
+                .fg(THEME_RED)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(THEME_MUTED)
         };
         let no_style = if selection == DeleteChoice::No {
             Style::default()
-                .fg(Color::Green)
+                .fg(THEME_GREEN)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(THEME_MUTED)
         };
         let yes_marker = if selection == DeleteChoice::Yes {
             ">"
@@ -2406,7 +2476,7 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             Line::from(Span::styled(
                 "删除当前对话？此操作无法撤销。",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(THEME_YELLOW)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
@@ -2416,7 +2486,7 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             Line::from(Span::styled(format!("{no_marker} No   返回"), no_style)),
             Line::from(Span::styled(
                 "使用方向键选择，按 Enter 确认",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME_MUTED),
             )),
         ];
         frame.render_widget(Paragraph::new(lines), area);
@@ -2436,9 +2506,9 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     }
 
     let prompt_color = if state.running {
-        Color::Yellow
+        THEME_YELLOW
     } else {
-        Color::Rgb(126, 200, 255)
+        THEME_BLUE
     };
     let prefix_width = INPUT_PREFIX_WIDTH.min(editor_area.width);
     let prefix_area = Rect::new(
@@ -2502,18 +2572,18 @@ fn render_pending_images(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             Span::styled(
                 "  + ",
                 Style::default()
-                    .fg(Color::Rgb(103, 232, 163))
+                    .fg(THEME_GREEN)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 label,
                 Style::default()
-                    .fg(Color::Rgb(103, 232, 163))
+                    .fg(THEME_GREEN)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 truncate_width(&suffix, available.saturating_add(1)),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(THEME_SUBTEXT),
             ),
         ])),
         area,
@@ -2523,7 +2593,7 @@ fn render_pending_images(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
 fn render_footer(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     frame.render_widget(
         Paragraph::new(footer_line(state, usize::from(area.width)))
-            .style(Style::default().bg(Color::Rgb(24, 27, 32))),
+            .style(Style::default().bg(THEME_MANTLE)),
         area,
     );
 }
@@ -2535,18 +2605,14 @@ fn approval_option_line(
 ) -> Line<'static> {
     let is_selected = choice == selected;
     let style = if is_selected {
-        Style::default()
-            .fg(Color::Rgb(126, 200, 255))
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(THEME_SUBTEXT)
     };
     Line::from(vec![
         Span::styled(
             if is_selected { "› " } else { "  " },
-            Style::default()
-                .fg(Color::Rgb(126, 200, 255))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(label, style),
     ])
@@ -2627,7 +2693,7 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
         Span::styled(
             context_label,
             Style::default()
-                .fg(Color::Gray)
+                .fg(THEME_SUBTEXT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -2641,25 +2707,20 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
         ),
     ];
     if let Some(usage) = usage {
-        spans.push(Span::styled(usage, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(usage, Style::default().fg(THEME_MUTED)));
     }
     spans.push(Span::raw(" ".repeat(padding)));
     if !model.is_empty() {
         spans.push(Span::styled(
             model,
-            Style::default()
-                .fg(Color::Rgb(126, 200, 255))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
         ));
         if show_effort {
-            spans.push(Span::styled(
-                " | effort ",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(" | effort ", Style::default().fg(THEME_MUTED)));
             spans.push(Span::styled(
                 effort,
                 Style::default()
-                    .fg(Color::Rgb(245, 190, 78))
+                    .fg(THEME_YELLOW)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -2670,15 +2731,15 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
 
 fn context_usage_color(tokens: u64, limit: u64) -> Color {
     if limit == 0 {
-        return Color::Gray;
+        return THEME_SUBTEXT;
     }
     let percent = u128::from(tokens).saturating_mul(100) / u128::from(limit);
     if percent >= 90 {
-        Color::LightRed
+        THEME_RED
     } else if percent >= 70 {
-        Color::Yellow
+        THEME_YELLOW
     } else {
-        Color::Rgb(103, 232, 163)
+        THEME_GREEN
     }
 }
 
@@ -2806,8 +2867,12 @@ fn split_reasoning_summary_parts(parts: &[String]) -> (String, String) {
 }
 
 fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
+    conversation_lines_for_messages(&state.messages)
+}
+
+fn conversation_lines_for_messages(messages: &[ViewMessage]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for message in &state.messages {
+    for message in messages {
         if message.role == ViewRole::Assistant {
             if message.reasoning.is_empty() && message.content.is_empty() {
                 continue;
@@ -2822,7 +2887,7 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                 append_markdown_lines(
                     &mut lines,
                     &message.content,
-                    Style::default().fg(Color::White),
+                    Style::default().fg(THEME_TEXT),
                 );
             }
             lines.push(Line::default());
@@ -2842,9 +2907,9 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
         }
 
         let (label_color, content_style) = match message.role {
-            ViewRole::Tool => (Color::Rgb(245, 190, 78), Style::default().fg(Color::Gray)),
-            ViewRole::Notice => (Color::Cyan, Style::default().fg(Color::Gray)),
-            ViewRole::Error => (Color::Red, Style::default().fg(Color::LightRed)),
+            ViewRole::Tool => (THEME_YELLOW, Style::default().fg(THEME_SUBTEXT)),
+            ViewRole::Notice => (THEME_TEAL, Style::default().fg(THEME_SUBTEXT)),
+            ViewRole::Error => (THEME_RED, Style::default().fg(THEME_RED)),
             ViewRole::User | ViewRole::Assistant => unreachable!(),
         };
         let running = if message.running { "  运行中" } else { "" };
@@ -2855,7 +2920,7 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                     .fg(label_color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(running, Style::default().fg(Color::DarkGray)),
+            Span::styled(running, Style::default().fg(THEME_MUTED)),
         ]));
         append_markdown_lines(&mut lines, &message.content, content_style);
         lines.push(Line::default());
@@ -2870,12 +2935,12 @@ fn append_reasoning_summary(lines: &mut Vec<Line<'static>>, reasoning: &str) {
         .enumerate()
     {
         for span in &mut line.spans {
-            span.style = span.style.fg(Color::Gray).add_modifier(Modifier::ITALIC);
+            span.style = span.style.fg(THEME_SUBTEXT).add_modifier(Modifier::ITALIC);
         }
         let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
         spans.push(Span::styled(
             if index == 0 { "• " } else { "  " },
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME_MUTED),
         ));
         spans.extend(line.spans);
         lines.push(Line::from(spans));
@@ -2888,16 +2953,14 @@ fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
     lines.push(Line::from(vec![
         Span::styled(
             "› ",
-            Style::default()
-                .fg(Color::Rgb(126, 200, 255))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(first.to_string(), Style::default().fg(Color::White)),
+        Span::styled(first.to_string(), Style::default().fg(THEME_TEXT)),
     ]));
     for line in content_lines {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(line.to_string(), Style::default().fg(Color::White)),
+            Span::styled(line.to_string(), Style::default().fg(THEME_TEXT)),
         ]));
     }
 }
@@ -2905,11 +2968,11 @@ fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
 fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
     let failed = message.role == ViewRole::Error;
     let color = if failed {
-        Color::LightRed
+        THEME_RED
     } else if message.running {
-        Color::Rgb(245, 190, 78)
+        THEME_YELLOW
     } else {
-        Color::Rgb(103, 232, 163)
+        THEME_GREEN
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -2932,14 +2995,25 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
         } else {
             "  ↳ "
         };
-        append_preview_lines(
-            lines,
-            arguments,
-            TOOL_ARGUMENT_PREVIEW_LINES,
-            first_prefix,
-            "    ",
-            Style::default().fg(Color::Gray),
-        );
+        if message.title == "shell" {
+            append_code_preview_lines(
+                lines,
+                arguments,
+                "bash",
+                TOOL_ARGUMENT_PREVIEW_LINES,
+                first_prefix,
+                "    ",
+            );
+        } else {
+            append_preview_lines(
+                lines,
+                arguments,
+                TOOL_ARGUMENT_PREVIEW_LINES,
+                first_prefix,
+                "    ",
+                Style::default().fg(THEME_SUBTEXT),
+            );
+        }
     }
     if !message.content.is_empty() {
         append_preview_lines(
@@ -2949,9 +3023,9 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
             "  └ ",
             "    ",
             if failed {
-                Style::default().fg(Color::LightRed)
+                Style::default().fg(THEME_RED)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(THEME_MUTED)
             },
         );
     }
@@ -3009,7 +3083,7 @@ fn append_preview_lines(
             continuation_prefix
         };
         lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(prefix.to_string(), Style::default().fg(THEME_MUTED)),
             Span::styled(truncate_preview_line(line), style),
         ]));
     }
@@ -3017,12 +3091,57 @@ fn append_preview_lines(
         lines.push(Line::from(vec![
             Span::styled(
                 continuation_prefix.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME_MUTED),
             ),
             Span::styled(
                 "…",
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(THEME_MUTED)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+}
+
+fn append_code_preview_lines(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    language: &str,
+    limit: usize,
+    first_prefix: &str,
+    continuation_prefix: &str,
+) {
+    let content_lines = content.lines().collect::<Vec<_>>();
+    let preview = content_lines
+        .iter()
+        .take(limit)
+        .map(|line| truncate_preview_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (index, highlighted) in highlight_code(&preview, language).into_iter().enumerate() {
+        let prefix = if index == 0 {
+            first_prefix
+        } else {
+            continuation_prefix
+        };
+        let mut spans = Vec::with_capacity(highlighted.spans.len().saturating_add(1));
+        spans.push(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(THEME_MUTED),
+        ));
+        spans.extend(highlighted.spans);
+        lines.push(Line::from(spans));
+    }
+    if content_lines.len() > limit {
+        lines.push(Line::from(vec![
+            Span::styled(
+                continuation_prefix.to_string(),
+                Style::default().fg(THEME_MUTED),
+            ),
+            Span::styled(
+                "…",
+                Style::default()
+                    .fg(THEME_MUTED)
                     .add_modifier(Modifier::ITALIC),
             ),
         ]));
@@ -3080,6 +3199,8 @@ struct MarkdownRenderer {
     emphasis_depth: usize,
     strikethrough_depth: usize,
     code_block: bool,
+    code_block_language: Option<String>,
+    code_block_buffer: String,
     quote_depth: usize,
     lists: Vec<MarkdownList>,
     item_continuations: Vec<String>,
@@ -3098,6 +3219,8 @@ impl MarkdownRenderer {
             emphasis_depth: 0,
             strikethrough_depth: 0,
             code_block: false,
+            code_block_language: None,
+            code_block_buffer: String::new(),
             quote_depth: 0,
             lists: Vec::new(),
             item_continuations: Vec::new(),
@@ -3121,17 +3244,17 @@ impl MarkdownRenderer {
         match event {
             MarkdownEvent::Start(tag) => self.start_tag(tag),
             MarkdownEvent::End(tag) => self.end_tag(tag),
+            MarkdownEvent::Text(text) if self.code_block && self.code_block_language.is_some() => {
+                self.code_block_buffer.push_str(&text);
+            }
             MarkdownEvent::Text(text)
             | MarkdownEvent::Html(text)
             | MarkdownEvent::InlineHtml(text) => {
                 self.push_text(&text, self.current_style());
             }
-            MarkdownEvent::Code(code) => self.push_text(
-                &code,
-                Style::default()
-                    .fg(Color::Rgb(215, 220, 230))
-                    .bg(Color::Rgb(31, 35, 41)),
-            ),
+            MarkdownEvent::Code(code) => {
+                self.push_text(&code, Style::default().fg(THEME_TEAL));
+            }
             MarkdownEvent::InlineMath(math) => {
                 self.push_text(&format!("${math}$"), self.current_style());
             }
@@ -3146,10 +3269,7 @@ impl MarkdownRenderer {
             MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => self.flush_line(false),
             MarkdownEvent::Rule => {
                 self.flush_line(false);
-                self.push_text(
-                    "────────────────────────",
-                    Style::default().fg(Color::DarkGray),
-                );
+                self.push_text("────────────────────────", Style::default().fg(THEME_MUTED));
                 self.flush_line(false);
             }
             MarkdownEvent::TaskListMarker(checked) => {
@@ -3169,9 +3289,18 @@ impl MarkdownRenderer {
                 self.flush_line(false);
                 self.quote_depth = self.quote_depth.saturating_add(1);
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.flush_line(false);
                 self.code_block = true;
+                self.code_block_language = match kind {
+                    CodeBlockKind::Fenced(info) => info
+                        .split([',', ' ', '\t'])
+                        .next()
+                        .filter(|language| !language.is_empty())
+                        .map(ToString::to_string),
+                    CodeBlockKind::Indented => None,
+                };
+                self.code_block_buffer.clear();
             }
             Tag::List(start) => {
                 self.flush_line(false);
@@ -3211,7 +3340,7 @@ impl MarkdownRenderer {
             }
             Tag::TableCell => {
                 if !self.current.is_empty() {
-                    self.push_text(" | ", Style::default().fg(Color::DarkGray));
+                    self.push_text(" | ", Style::default().fg(THEME_MUTED));
                 }
             }
             Tag::Emphasis => self.emphasis_depth = self.emphasis_depth.saturating_add(1),
@@ -3220,7 +3349,7 @@ impl MarkdownRenderer {
             }
             Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
             Tag::Image { dest_url, .. } => {
-                self.push_text("图片：", Style::default().fg(Color::DarkGray));
+                self.push_text("图片：", Style::default().fg(THEME_MUTED));
                 self.links.push(dest_url.into_string());
             }
             Tag::HtmlBlock
@@ -3247,6 +3376,17 @@ impl MarkdownRenderer {
             }
             TagEnd::CodeBlock => {
                 self.flush_line(false);
+                if let Some(language) = self.code_block_language.take() {
+                    let code = std::mem::take(&mut self.code_block_buffer);
+                    for mut line in highlight_code(&code, &language) {
+                        for span in &mut line.spans {
+                            if span.style.fg.is_none() {
+                                span.style = span.style.fg(THEME_TEXT);
+                            }
+                        }
+                        self.push_styled_line(line);
+                    }
+                }
                 self.code_block = false;
             }
             TagEnd::List(_) => {
@@ -3278,7 +3418,7 @@ impl MarkdownRenderer {
                     self.push_text(
                         &format!(" ({destination})"),
                         Style::default()
-                            .fg(Color::Rgb(126, 200, 255))
+                            .fg(THEME_BLUE)
                             .add_modifier(Modifier::UNDERLINED),
                     );
                 }
@@ -3296,18 +3436,16 @@ impl MarkdownRenderer {
 
     fn current_style(&self) -> Style {
         let mut style = if self.code_block {
-            Style::default()
-                .fg(Color::Rgb(215, 220, 230))
-                .bg(Color::Rgb(31, 35, 41))
+            Style::default().fg(THEME_TEXT)
         } else {
             self.base
         };
         if let Some(level) = self.heading {
             style = style
                 .fg(match level {
-                    HeadingLevel::H1 => Color::Rgb(103, 232, 163),
-                    HeadingLevel::H2 => Color::Rgb(126, 200, 255),
-                    _ => Color::White,
+                    HeadingLevel::H1 => THEME_MAUVE,
+                    HeadingLevel::H2 => THEME_BLUE,
+                    _ => THEME_TEXT,
                 })
                 .add_modifier(Modifier::BOLD);
         }
@@ -3321,9 +3459,7 @@ impl MarkdownRenderer {
             style = style.add_modifier(Modifier::CROSSED_OUT);
         }
         if !self.links.is_empty() {
-            style = style
-                .fg(Color::Rgb(126, 200, 255))
-                .add_modifier(Modifier::UNDERLINED);
+            style = style.fg(THEME_BLUE).add_modifier(Modifier::UNDERLINED);
         }
         style
     }
@@ -3340,6 +3476,16 @@ impl MarkdownRenderer {
         }
     }
 
+    fn push_styled_line(&mut self, mut line: Line<'static>) {
+        self.ensure_prefix();
+        self.current.append(&mut line.spans);
+        if self.current.is_empty() {
+            self.lines.push(Line::default());
+        } else {
+            self.flush_line(false);
+        }
+    }
+
     fn ensure_prefix(&mut self) {
         if !self.current.is_empty() {
             return;
@@ -3347,7 +3493,7 @@ impl MarkdownRenderer {
         if self.quote_depth > 0 {
             self.current.push(Span::styled(
                 "│ ".repeat(self.quote_depth),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME_MUTED),
             ));
         }
         let prefix = self
@@ -3356,7 +3502,7 @@ impl MarkdownRenderer {
             .or_else(|| self.item_continuations.last().cloned());
         if let Some(prefix) = prefix {
             self.current
-                .push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+                .push(Span::styled(prefix, Style::default().fg(THEME_MUTED)));
         }
     }
 
@@ -3404,28 +3550,18 @@ struct ScreenGuard;
 impl ScreenGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("启用终端原始模式失败")?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture,
-            Hide
-        )
-        .context("进入终端备用屏幕失败")?;
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste, Hide) {
+            let _ = disable_raw_mode();
+            return Err(error).context("配置终端模式失败");
+        }
         Ok(Self)
     }
 }
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), Show, DisableBracketedPaste);
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            Show,
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
     }
 }
 
@@ -3506,7 +3642,7 @@ mod tests {
     fn renders_commonmark_as_terminal_styles() {
         let content = "# Heading\n\n**bold** and *italic* with `code` and [docs](https://example.com).\n\n- one\n- two\n\n> quote\n\n```rust\nlet value = 1;\n```";
         let mut lines = Vec::new();
-        append_markdown_lines(&mut lines, content, Style::default().fg(Color::White));
+        append_markdown_lines(&mut lines, content, Style::default().fg(THEME_TEXT));
         let rendered = lines
             .iter()
             .map(Line::to_string)
@@ -3537,7 +3673,20 @@ mod tests {
             .clone()
             .find(|span| span.content.as_ref() == "code")
             .unwrap();
-        assert_eq!(code.style.bg, Some(Color::Rgb(31, 35, 41)));
+        assert_eq!(code.style.fg, Some(THEME_TEAL));
+        assert_eq!(code.style.bg, None);
+
+        let rust_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("let value = 1;"))
+            .unwrap();
+        let mut rust_colors = rust_line
+            .spans
+            .iter()
+            .filter_map(|span| span.style.fg)
+            .collect::<Vec<_>>();
+        rust_colors.dedup();
+        assert!(rust_colors.len() > 1);
     }
 
     #[test]
@@ -3847,45 +3996,68 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_up_stays_detached_while_streaming_output_arrives() {
+    fn finalized_history_keeps_live_messages_in_the_viewport() {
         let mut state = UiState::new(
             "model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
             std::path::PathBuf::from("."),
         );
+        state.push_user("检查项目".to_string(), &[]);
         state.apply_agent_event(AgentEvent::AssistantStarted);
         state.apply_agent_event(AgentEvent::TextDelta {
-            text: "输出行\n".repeat(80),
+            text: "正在处理".to_string(),
         });
-        let backend = TestBackend::new(50, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        assert!(state.max_scroll > 0);
-        assert_eq!(state.scroll, state.max_scroll);
+        let finalized = state.take_finalized_messages();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].role, ViewRole::User);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.current_assistant, Some(0));
+        assert_eq!(state.generation_start, Some(0));
 
-        handle_key(
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            &mut state,
-            None,
-        );
-        let scroll = state.scroll;
-        assert!(!state.follow_tail);
-        assert!(scroll < state.max_scroll);
-
-        state.apply_agent_event(AgentEvent::TextDelta {
-            text: "后续流式输出\n".repeat(10),
+        state.apply_agent_event(AgentEvent::ToolStarted {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"cargo check"}"#.to_string(),
         });
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        assert!(!state.follow_tail);
-        assert_eq!(state.scroll, scroll);
+        let finalized = state.take_finalized_messages();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].role, ViewRole::Assistant);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].role, ViewRole::Tool);
+        assert!(state.messages[0].running);
+        assert_eq!(state.current_assistant, None);
+        assert_eq!(state.generation_start, None);
 
-        handle_key(
-            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
-            &mut state,
-            None,
+        let mut resumed_state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
         );
-        assert!(state.follow_tail);
-        assert_eq!(state.scroll, state.max_scroll);
+        resumed_state.push_notice("已恢复的历史");
+        resumed_state.messages.push(ViewMessage {
+            role: ViewRole::Tool,
+            title: "shell".to_string(),
+            content: String::new(),
+            reasoning: String::new(),
+            tool_arguments: Some("cargo check".to_string()),
+            tool_id: Some("tool-1".to_string()),
+            running: false,
+        });
+
+        resumed_state.hold_pending_tools(&["tool-1".to_string()]);
+        let finalized = resumed_state.take_finalized_messages();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(resumed_state.messages.len(), 1);
+        assert!(resumed_state.messages[0].running);
+
+        resumed_state.apply_agent_event(AgentEvent::ToolFinished {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            output: "完成".to_string(),
+            is_error: false,
+        });
+        assert_eq!(resumed_state.take_finalized_messages().len(), 1);
+        assert!(resumed_state.messages.is_empty());
     }
 
     #[test]

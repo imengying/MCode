@@ -44,7 +44,6 @@ async fn run() -> Result<()> {
         context_window: cli.context_window,
         max_input_tokens: cli.max_input_tokens,
         cwd: cli.cwd.clone(),
-        max_tool_turns: cli.max_tool_turns,
         request_timeout_secs: cli.request_timeout,
         web_search: cli.search.then_some(WebSearchMode::Live),
     };
