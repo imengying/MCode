@@ -368,7 +368,7 @@ enum UiAction {
 #[derive(Debug, Clone, Copy)]
 struct SlashCommand {
     name: &'static str,
-    argument: &'static str,
+    accepts_argument: bool,
     description: &'static str,
 }
 
@@ -382,62 +382,62 @@ struct SlashSuggestion {
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
-        argument: "[提供商/模型]",
+        accepts_argument: true,
         description: "查看或切换模型",
     },
     SlashCommand {
         name: "effort",
-        argument: "[级别]",
+        accepts_argument: true,
         description: "查看或设置 effort",
     },
     SlashCommand {
         name: "thinking",
-        argument: "[show|hide|toggle]",
+        accepts_argument: true,
         description: "显示或隐藏思考过程",
     },
     SlashCommand {
         name: "search",
-        argument: "[模式]",
+        accepts_argument: true,
         description: "查看或设置网页搜索模式",
     },
     SlashCommand {
         name: "compact",
-        argument: "[说明]",
+        accepts_argument: true,
         description: "压缩当前上下文",
     },
     SlashCommand {
         name: "image",
-        argument: "[路径|clear]",
+        accepts_argument: true,
         description: "管理下一条提示词的图片",
     },
     SlashCommand {
         name: "status",
-        argument: "",
+        accepts_argument: false,
         description: "显示会话状态",
     },
     SlashCommand {
         name: "new",
-        argument: "",
+        accepts_argument: false,
         description: "新建会话",
     },
     SlashCommand {
         name: "delete",
-        argument: "",
+        accepts_argument: false,
         description: "删除当前会话",
     },
     SlashCommand {
         name: "clear",
-        argument: "",
+        accepts_argument: false,
         description: "清空对话视图",
     },
     SlashCommand {
         name: "help",
-        argument: "",
+        accepts_argument: false,
         description: "显示命令帮助",
     },
     SlashCommand {
         name: "exit",
-        argument: "",
+        accepts_argument: false,
         description: "退出 MCode",
     },
 ];
@@ -465,14 +465,9 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
             .iter()
             .filter(|command| command.name.starts_with(&query))
             .map(|command| {
-                let label = if command.argument.is_empty() {
-                    format!("/{}", command.name)
-                } else {
-                    format!("/{} {}", command.name, command.argument)
-                };
-                let trailing_space = if command.argument.is_empty() { "" } else { " " };
+                let trailing_space = if command.accepts_argument { " " } else { "" };
                 SlashSuggestion {
-                    label,
+                    label: format!("/{}", command.name),
                     replacement: format!("/{}{trailing_space}", command.name),
                     description: command.description.to_string(),
                 }
@@ -2582,10 +2577,12 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         let compact = rendered.replace(' ', "");
-        assert!(compact.contains("/model[提供商/模型]"));
+        assert!(compact.contains("/model"));
         assert!(compact.contains("查看或切换模型"));
-        assert!(compact.contains("/effort[级别]"));
-        assert!(rendered.contains("/thinking [show|hide|toggle]"));
+        assert!(compact.contains("/effort"));
+        assert!(rendered.contains("/thinking"));
+        assert!(!rendered.contains("[提供商/模型]"));
+        assert!(!rendered.contains("[show|hide|toggle]"));
 
         let mut filtered = UiState::new(
             "model".to_string(),

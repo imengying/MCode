@@ -32,7 +32,7 @@ struct GitHubAsset {
 }
 
 pub async fn run() -> Result<()> {
-    let (target, asset_name) = release_platform()?;
+    let (platform, asset_name) = release_platform()?;
     let current_version =
         Version::parse(crate::VERSION).context("已安装的 MCode 版本不是有效的语义化版本")?;
     let client = Client::builder()
@@ -75,7 +75,7 @@ pub async fn run() -> Result<()> {
         .find(|asset| asset.name == asset_name)
         .with_context(|| format!("Release {} 不包含 {asset_name}", release.tag_name))?;
     let download_url = validated_download_url(&asset.browser_download_url)?;
-    println!("正在下载适用于 {target} 的 MCode {latest_version}...");
+    println!("正在下载适用于 {platform} 的 MCode {latest_version}...");
     let compressed = download_limited(
         client.get(download_url),
         MAX_ARCHIVE_BYTES,
@@ -92,8 +92,8 @@ pub async fn run() -> Result<()> {
 
 fn release_platform() -> Result<(&'static str, &'static str)> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Ok(("x86_64-unknown-linux-musl", "MCode-amd64.tar.gz")),
-        ("linux", "aarch64") => Ok(("aarch64-unknown-linux-musl", "MCode-arm64.tar.gz")),
+        ("linux", "x86_64") => Ok(("linux-amd64", "MCode-amd64.tar.gz")),
+        ("linux", "aarch64") => Ok(("linux-arm64", "MCode-arm64.tar.gz")),
         (os, arch) => bail!("mcode update 不支持 {os}/{arch}"),
     }
 }
@@ -254,14 +254,15 @@ mod tests {
     }
 
     #[test]
-    fn uses_the_published_archive_name() {
-        let (_, asset_name) = release_platform().unwrap();
-        let expected = match std::env::consts::ARCH {
-            "x86_64" => "MCode-amd64.tar.gz",
-            "aarch64" => "MCode-arm64.tar.gz",
+    fn uses_the_published_platform_and_archive_names() {
+        let (platform, asset_name) = release_platform().unwrap();
+        let (expected_platform, expected_asset_name) = match std::env::consts::ARCH {
+            "x86_64" => ("linux-amd64", "MCode-amd64.tar.gz"),
+            "aarch64" => ("linux-arm64", "MCode-arm64.tar.gz"),
             architecture => panic!("unsupported test architecture: {architecture}"),
         };
-        assert_eq!(asset_name, expected);
+        assert_eq!(platform, expected_platform);
+        assert_eq!(asset_name, expected_asset_name);
     }
 
     #[test]
