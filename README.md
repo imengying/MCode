@@ -142,6 +142,7 @@ TUI 命令：
 |---|---|
 | `/model [provider/model]` | 查看或切换模型 |
 | `/reasoning [LEVEL]` | 查看或切换思考强度 |
+| `/thinking [show\|hide]` | 展开或折叠已完成的思考过程 |
 | `/search [disabled\|cached\|live]` | 查看或切换网页搜索 |
 | `/compact [INSTRUCTIONS]` | 手动压缩上下文 |
 | `/image [PATH\|clear]` | 管理下一条消息的图片 |
@@ -151,6 +152,8 @@ TUI 命令：
 | `/clear` | 清屏 |
 | `/help` | 显示帮助 |
 | `/exit` | 退出 |
+
+思考过程在生成时展开，完成后自动折叠；使用 `/thinking show` 可查看全文。
 
 Enter 提交，Shift+Enter 或 Alt+Enter 换行，Escape 取消当前任务。审批提示中 `y` 允许一次，
 `a` 在当前会话允许同名工具，`n` 拒绝。

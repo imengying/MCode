@@ -29,7 +29,12 @@ use crate::config::{ApiProtocol, ReasoningEffort, WebSearchMode};
 use crate::event::{AgentEvent, CompactionReason};
 use crate::protocol::{ChatMessage, ImageAttachment, MessageRole, Usage, sanitize_terminal_text};
 
-const INPUT_HEIGHT: u16 = 5;
+const APPROVAL_HEIGHT: u16 = 5;
+const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
+const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
+const INPUT_PREFIX_WIDTH: u16 = 2;
+const MAX_INPUT_HEIGHT: u16 = 5;
+const MAX_SLASH_SUGGESTIONS: u16 = 8;
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn run_interactive(
@@ -249,7 +254,8 @@ pub fn run_interactive(
                 }
             }
             Event::Paste(text) if state.pending_approval.is_none() => {
-                state.editor.insert_str(&text);
+                state.editor.insert_paste(&text);
+                state.slash_selection = 0;
             }
             Event::Resize(_, _) => state.follow_tail = true,
             _ => {}
@@ -358,6 +364,109 @@ enum UiAction {
     ResolveApproval(ApprovalDecision),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SlashCommand {
+    name: &'static str,
+    argument: &'static str,
+    description: &'static str,
+}
+
+const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "model",
+        argument: "[provider/model]",
+        description: "view or switch model",
+    },
+    SlashCommand {
+        name: "reasoning",
+        argument: "[level]",
+        description: "view or set reasoning effort",
+    },
+    SlashCommand {
+        name: "thinking",
+        argument: "[show|hide|toggle]",
+        description: "show or fold completed thinking",
+    },
+    SlashCommand {
+        name: "search",
+        argument: "[mode]",
+        description: "view or set web search mode",
+    },
+    SlashCommand {
+        name: "compact",
+        argument: "[instructions]",
+        description: "compact the current context",
+    },
+    SlashCommand {
+        name: "image",
+        argument: "[path|clear]",
+        description: "manage prompt images",
+    },
+    SlashCommand {
+        name: "status",
+        argument: "",
+        description: "show session status",
+    },
+    SlashCommand {
+        name: "new",
+        argument: "",
+        description: "start a new session",
+    },
+    SlashCommand {
+        name: "delete",
+        argument: "[confirm]",
+        description: "delete the current session",
+    },
+    SlashCommand {
+        name: "clear",
+        argument: "",
+        description: "clear the conversation view",
+    },
+    SlashCommand {
+        name: "help",
+        argument: "",
+        description: "show command help",
+    },
+    SlashCommand {
+        name: "exit",
+        argument: "",
+        description: "exit MCode",
+    },
+];
+
+fn slash_query(text: &str) -> Option<&str> {
+    let query = text.strip_prefix('/')?;
+    (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
+fn slash_suggestions(text: &str) -> Vec<&'static SlashCommand> {
+    let Some(query) = slash_query(text) else {
+        return Vec::new();
+    };
+    let query = query.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(&query))
+        .collect()
+}
+
+fn complete_slash_command(state: &mut UiState) -> bool {
+    let suggestions = slash_suggestions(&state.editor.text());
+    let Some(command) = suggestions.get(
+        state
+            .slash_selection
+            .min(suggestions.len().saturating_sub(1)),
+    ) else {
+        return false;
+    };
+    let trailing_space = if command.argument.is_empty() { "" } else { " " };
+    state
+        .editor
+        .set_text(&format!("/{}{trailing_space}", command.name));
+    state.slash_selection = 0;
+    true
+}
+
 fn handle_key(
     key: KeyEvent,
     state: &mut UiState,
@@ -417,6 +526,37 @@ fn handle_key(
         }
     }
 
+    let suggestions = slash_suggestions(&state.editor.text());
+    if !suggestions.is_empty() && key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Up => {
+                state.slash_selection = if state.slash_selection == 0 {
+                    suggestions.len() - 1
+                } else {
+                    state.slash_selection - 1
+                };
+                return UiAction::None;
+            }
+            KeyCode::Down => {
+                state.slash_selection = (state.slash_selection + 1) % suggestions.len();
+                return UiAction::None;
+            }
+            KeyCode::Tab => {
+                complete_slash_command(state);
+                return UiAction::None;
+            }
+            KeyCode::Enter
+                if slash_query(&state.editor.text()).is_some_and(|query| {
+                    !SLASH_COMMANDS.iter().any(|command| command.name == query)
+                }) =>
+            {
+                complete_slash_command(state);
+                return UiAction::None;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Esc if state.running => {
             if let Some(cancel) = active_cancel {
@@ -431,6 +571,7 @@ fn handle_key(
             state.editor.insert('\n');
         }
         KeyCode::Enter if !state.running => {
+            state.slash_selection = 0;
             let prompt = state.editor.take();
             if prompt.trim().is_empty() {
                 return UiAction::None;
@@ -486,11 +627,11 @@ fn handle_key(
                     state.push_notice(notice);
                 }
                 "model" => return UiAction::SelectModel(argument.to_string()),
-                "reasoning" | "thinking" if argument.is_empty() => {
+                "reasoning" if argument.is_empty() => {
                     let notice = state.reasoning_list_notice();
                     state.push_notice(notice);
                 }
-                "reasoning" | "thinking" => {
+                "reasoning" => {
                     if let Some(effort) = parse_reasoning_effort(argument) {
                         return UiAction::SetReasoning(effort);
                     }
@@ -498,6 +639,12 @@ fn handle_key(
                         "Unknown reasoning level {argument:?}. Use off, minimal, low, medium, high, xhigh, or max."
                     ));
                 }
+                "thinking" => match argument.to_ascii_lowercase().as_str() {
+                    "" | "toggle" => state.toggle_completed_thinking(),
+                    "show" => state.set_completed_thinking_visible(true),
+                    "hide" => state.set_completed_thinking_visible(false),
+                    _ => state.push_error("Use /thinking, /thinking show, or /thinking hide."),
+                },
                 "search" if argument.is_empty() => {
                     state.push_notice(format!(
                         "Web search: {}\nSelect with /search <disabled|cached|live>.",
@@ -517,7 +664,7 @@ fn handle_key(
                     state.push_notice(notice);
                 }
                 "help" => state.push_notice(
-                    "Commands: /model [ID], /reasoning [LEVEL], /search [MODE], /compact [INSTRUCTIONS], /image [PATH|clear], /status, /new, /delete, /clear, /help, /exit",
+                    "Commands: /model [ID], /reasoning [LEVEL], /thinking [show|hide], /search [MODE], /compact [INSTRUCTIONS], /image [PATH|clear], /status, /new, /delete, /clear, /help, /exit",
                 ),
                 _ => state.push_error(format!("Unknown command: /{name}")),
             }
@@ -528,9 +675,16 @@ fn handle_key(
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
             state.editor.insert(character);
+            state.slash_selection = 0;
         }
-        KeyCode::Backspace => state.editor.backspace(),
-        KeyCode::Delete => state.editor.delete(),
+        KeyCode::Backspace => {
+            state.editor.backspace();
+            state.slash_selection = 0;
+        }
+        KeyCode::Delete => {
+            state.editor.delete();
+            state.slash_selection = 0;
+        }
         KeyCode::Left => state.editor.move_left(),
         KeyCode::Right => state.editor.move_right(),
         KeyCode::Home => state.editor.move_home(),
@@ -554,15 +708,22 @@ fn parse_web_search_mode(value: &str) -> Option<WebSearchMode> {
         .find(|mode| mode.as_str().eq_ignore_ascii_case(value))
 }
 
+#[derive(Debug)]
+enum EditorItem {
+    Character(char),
+    Paste { content: String, label: String },
+}
+
 #[derive(Debug, Default)]
 struct Editor {
-    chars: Vec<char>,
+    items: Vec<EditorItem>,
     cursor: usize,
 }
 
 impl Editor {
     fn insert(&mut self, character: char) {
-        self.chars.insert(self.cursor, character);
+        self.items
+            .insert(self.cursor, EditorItem::Character(character));
         self.cursor += 1;
     }
 
@@ -572,16 +733,40 @@ impl Editor {
         }
     }
 
+    fn insert_paste(&mut self, text: &str) {
+        let character_count = text.chars().count();
+        let line_count = text.bytes().filter(|byte| byte == &b'\n').count() + 1;
+        if character_count < COLLAPSED_PASTE_CHAR_THRESHOLD
+            && line_count < COLLAPSED_PASTE_LINE_THRESHOLD
+        {
+            self.insert_str(text);
+            return;
+        }
+        self.items.insert(
+            self.cursor,
+            EditorItem::Paste {
+                content: text.to_string(),
+                label: format!("[Pasted Content {character_count} chars]"),
+            },
+        );
+        self.cursor += 1;
+    }
+
+    fn set_text(&mut self, text: &str) {
+        self.items = text.chars().map(EditorItem::Character).collect();
+        self.cursor = self.items.len();
+    }
+
     fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            self.chars.remove(self.cursor);
+            self.items.remove(self.cursor);
         }
     }
 
     fn delete(&mut self) {
-        if self.cursor < self.chars.len() {
-            self.chars.remove(self.cursor);
+        if self.cursor < self.items.len() {
+            self.items.remove(self.cursor);
         }
     }
 
@@ -590,45 +775,59 @@ impl Editor {
     }
 
     fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.chars.len());
+        self.cursor = (self.cursor + 1).min(self.items.len());
     }
 
     fn move_home(&mut self) {
-        self.cursor = self.chars[..self.cursor]
+        self.cursor = self.items[..self.cursor]
             .iter()
-            .rposition(|character| character == &'\n')
+            .rposition(|item| matches!(item, EditorItem::Character('\n')))
             .map_or(0, |index| index + 1);
     }
 
     fn move_end(&mut self) {
-        self.cursor = self.chars[self.cursor..]
+        self.cursor = self.items[self.cursor..]
             .iter()
-            .position(|character| character == &'\n')
-            .map_or(self.chars.len(), |index| self.cursor + index);
+            .position(|item| matches!(item, EditorItem::Character('\n')))
+            .map_or(self.items.len(), |index| self.cursor + index);
     }
 
     fn is_empty(&self) -> bool {
-        self.chars.is_empty()
+        self.items.is_empty()
     }
 
     fn text(&self) -> String {
-        self.chars.iter().collect()
+        let mut text = String::new();
+        for item in &self.items {
+            match item {
+                EditorItem::Character(character) => text.push(*character),
+                EditorItem::Paste { label, .. } => text.push_str(label),
+            }
+        }
+        text
     }
 
     fn take(&mut self) -> String {
         self.cursor = 0;
-        self.chars.drain(..).collect()
+        let mut text = String::new();
+        for item in self.items.drain(..) {
+            match item {
+                EditorItem::Character(character) => text.push(character),
+                EditorItem::Paste { content, .. } => text.push_str(&content),
+            }
+        }
+        text
     }
 
-    fn cursor_layout(&self, width: u16, visible_height: u16) -> (u16, u16, u16) {
+    fn position_at(&self, end: usize, width: u16) -> (usize, usize) {
         let width = usize::from(width.max(1));
         let mut row = 0usize;
         let mut column = 0usize;
-        for character in self.chars.iter().take(self.cursor) {
-            if character == &'\n' {
+        let mut advance = |character: char| {
+            if character == '\n' {
                 row += 1;
                 column = 0;
-                continue;
+                return;
             }
             let character_width = character.width().unwrap_or(0).max(1);
             if column + character_width > width {
@@ -640,7 +839,27 @@ impl Editor {
                 row += 1;
                 column = 0;
             }
+        };
+        for item in self.items.iter().take(end) {
+            match item {
+                EditorItem::Character(character) => advance(*character),
+                EditorItem::Paste { label, .. } => {
+                    for character in label.chars() {
+                        advance(character);
+                    }
+                }
+            }
         }
+        (row, column)
+    }
+
+    fn rendered_height(&self, width: u16) -> u16 {
+        let (row, _) = self.position_at(self.items.len(), width);
+        u16::try_from(row.saturating_add(1)).unwrap_or(u16::MAX)
+    }
+
+    fn cursor_layout(&self, width: u16, visible_height: u16) -> (u16, u16, u16) {
+        let (row, column) = self.position_at(self.cursor, width);
         let visible_height = usize::from(visible_height.max(1));
         let scroll = row.saturating_sub(visible_height - 1);
         (
@@ -665,6 +884,13 @@ enum DeleteConfirmation {
     #[default]
     None,
     Pending,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CompletedThinkingDisplay {
+    #[default]
+    Folded,
+    Expanded,
 }
 
 #[derive(Debug)]
@@ -712,6 +938,8 @@ struct UiState {
     follow_tail: bool,
     delete_confirmation: DeleteConfirmation,
     pending_images: Vec<ImageAttachment>,
+    slash_selection: usize,
+    completed_thinking_display: CompletedThinkingDisplay,
     mcp_server_count: usize,
     mcp_tool_count: usize,
     pending_approval: Option<ApprovalView>,
@@ -747,6 +975,8 @@ impl UiState {
             follow_tail: true,
             delete_confirmation: DeleteConfirmation::None,
             pending_images: Vec::new(),
+            slash_selection: 0,
+            completed_thinking_display: CompletedThinkingDisplay::Folded,
             mcp_server_count: 0,
             mcp_tool_count: 0,
             pending_approval: None,
@@ -943,6 +1173,25 @@ impl UiState {
         }
         lines.push("Select with /reasoning <level>.".to_string());
         lines.join("\n")
+    }
+
+    fn toggle_completed_thinking(&mut self) {
+        let visible = self.completed_thinking_display == CompletedThinkingDisplay::Folded;
+        self.set_completed_thinking_visible(visible);
+    }
+
+    fn set_completed_thinking_visible(&mut self, visible: bool) {
+        self.completed_thinking_display = if visible {
+            CompletedThinkingDisplay::Expanded
+        } else {
+            CompletedThinkingDisplay::Folded
+        };
+        self.follow_tail = true;
+        self.push_notice(if visible {
+            "Completed thinking is expanded."
+        } else {
+            "Completed thinking is folded."
+        });
     }
 
     fn status_notice(&self) -> String {
@@ -1298,19 +1547,42 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         return;
     }
 
+    let input_height = if state.pending_approval.is_some() {
+        APPROVAL_HEIGHT
+    } else {
+        state
+            .editor
+            .rendered_height(area.width.saturating_sub(INPUT_PREFIX_WIDTH))
+            .clamp(1, MAX_INPUT_HEIGHT)
+    };
+    let suggestion_count = if state.pending_approval.is_some() {
+        0
+    } else {
+        slash_suggestions(&state.editor.text()).len()
+    };
+    let reserved_height = 1_u16
+        .saturating_add(3)
+        .saturating_add(input_height)
+        .saturating_add(2);
+    let suggestion_height = u16::try_from(suggestion_count)
+        .unwrap_or(u16::MAX)
+        .min(MAX_SLASH_SUGGESTIONS)
+        .min(area.height.saturating_sub(reserved_height));
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(INPUT_HEIGHT),
+            Constraint::Length(suggestion_height),
+            Constraint::Length(input_height),
             Constraint::Length(2),
         ])
         .split(area);
     render_header(frame, state, areas[0]);
     render_conversation(frame, state, areas[1]);
-    render_input(frame, state, areas[2]);
-    render_footer(frame, state, areas[3]);
+    render_slash_suggestions(frame, state, areas[2]);
+    render_input(frame, state, areas[3]);
+    render_footer(frame, state, areas[4]);
 }
 
 fn render_header(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
@@ -1365,6 +1637,58 @@ fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
     );
 }
 
+fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let suggestions = slash_suggestions(&state.editor.text());
+    if suggestions.is_empty() {
+        return;
+    }
+    let selected = state
+        .slash_selection
+        .min(suggestions.len().saturating_sub(1));
+    let visible = usize::from(area.height);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(suggestions.len().saturating_sub(visible));
+    let lines = suggestions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, command)| {
+            let marker = if index == selected { "> " } else { "  " };
+            let label = if command.argument.is_empty() {
+                format!("/{}", command.name)
+            } else {
+                format!("/{} {}", command.name, command.argument)
+            };
+            let padding = " ".repeat(30_usize.saturating_sub(label.len()));
+            let command_style = if index == selected {
+                Style::default()
+                    .fg(Color::Rgb(126, 200, 255))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(Color::Rgb(126, 200, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(label, command_style),
+                Span::raw(padding),
+                Span::styled(command.description, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     if let Some(approval) = &state.pending_approval {
         let block = Block::default()
@@ -1398,41 +1722,44 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         return;
     }
 
-    let border_color = if state.running {
+    let prompt_color = if state.running {
         Color::Yellow
     } else {
         Color::Rgb(126, 200, 255)
     };
-    let title = if state.pending_images.is_empty() {
-        " prompt ".to_string()
-    } else {
-        format!(" prompt | {} image(s) ", state.pending_images.len())
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
+    let prefix_width = INPUT_PREFIX_WIDTH.min(area.width);
+    let prefix_area = Rect::new(area.x, area.y, prefix_width, 1.min(area.height));
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "> ",
             Style::default()
-                .fg(border_color)
+                .fg(prompt_color)
                 .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    let (cursor_x, cursor_y, scroll) = state.editor.cursor_layout(inner.width, inner.height);
+        )),
+        prefix_area,
+    );
+    let input_area = Rect::new(
+        area.x.saturating_add(prefix_width),
+        area.y,
+        area.width.saturating_sub(prefix_width),
+        area.height,
+    );
+    let (cursor_x, cursor_y, scroll) = state
+        .editor
+        .cursor_layout(input_area.width, input_area.height);
     frame.render_widget(
         Paragraph::new(state.editor.text())
-            .block(block)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
-        area,
+        input_area,
     );
     frame.set_cursor_position(Position::new(
-        inner
+        input_area
             .x
-            .saturating_add(cursor_x.min(inner.width.saturating_sub(1))),
-        inner
+            .saturating_add(cursor_x.min(input_area.width.saturating_sub(1))),
+        input_area
             .y
-            .saturating_add(cursor_y.min(inner.height.saturating_sub(1))),
+            .saturating_add(cursor_y.min(input_area.height.saturating_sub(1))),
     ));
 }
 
@@ -1526,27 +1853,60 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
     for message in &state.messages {
         if message.role == ViewRole::Assistant {
             if !message.reasoning.is_empty() {
-                let running = if message.running && message.content.is_empty() {
-                    "  reasoning"
+                let reasoning_in_progress = message.running && message.content.is_empty();
+                let show_reasoning = reasoning_in_progress
+                    || state.completed_thinking_display == CompletedThinkingDisplay::Expanded;
+                if show_reasoning {
+                    let running = if reasoning_in_progress {
+                        "  reasoning"
+                    } else {
+                        ""
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "thinking",
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(running, Style::default().fg(Color::DarkGray)),
+                    ]));
+                    for line in message.reasoning.lines() {
+                        lines.push(Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
                 } else {
-                    ""
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "thinking",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(running, Style::default().fg(Color::DarkGray)),
-                ]));
-                for line in message.reasoning.lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                    let line_count = message
+                        .reasoning
+                        .bytes()
+                        .filter(|byte| byte == &b'\n')
+                        .count()
+                        + 1;
+                    let character_count = message.reasoning.chars().count();
+                    let line_unit = if line_count == 1 { "line" } else { "lines" };
+                    let character_unit = if character_count == 1 {
+                        "char"
+                    } else {
+                        "chars"
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "thinking",
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(
+                                "  collapsed, {line_count} {line_unit}, {character_count} {character_unit}"
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
                 }
                 if !message.content.is_empty() {
                     lines.push(Line::default());
@@ -1695,6 +2055,16 @@ mod tests {
 
     use super::*;
 
+    fn rendered_terminal(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
     #[test]
     fn editor_handles_unicode_and_lines() {
         let mut editor = Editor::default();
@@ -1706,6 +2076,85 @@ mod tests {
         editor.move_left();
         editor.backspace();
         assert_eq!(editor.text(), "ab中z");
+    }
+
+    #[test]
+    fn editor_collapses_large_pastes_and_restores_them_on_submit() {
+        let pasted = "x".repeat(COLLAPSED_PASTE_CHAR_THRESHOLD);
+        let mut editor = Editor::default();
+        editor.insert_str("before ");
+        editor.insert_paste(&pasted);
+        editor.insert_str(" after");
+
+        assert_eq!(
+            editor.text(),
+            format!("before [Pasted Content {COLLAPSED_PASTE_CHAR_THRESHOLD} chars] after")
+        );
+        assert_eq!(editor.take(), format!("before {pasted} after"));
+    }
+
+    #[test]
+    fn editor_keeps_short_pastes_editable_and_deletes_collapsed_pastes_as_one_item() {
+        let mut editor = Editor::default();
+        editor.insert_paste("short\npaste");
+        assert_eq!(editor.text(), "short\npaste");
+
+        let pasted = (0..COLLAPSED_PASTE_LINE_THRESHOLD)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.insert_paste(&pasted);
+        assert!(editor.text().contains("[Pasted Content "));
+        editor.backspace();
+        assert_eq!(editor.text(), "short\npaste");
+    }
+
+    #[test]
+    fn submitting_a_collapsed_paste_sends_its_full_contents() {
+        let pasted = "full pasted content\n".repeat(COLLAPSED_PASTE_LINE_THRESHOLD);
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.editor.insert_paste(&pasted);
+        assert!(state.editor.text().starts_with("[Pasted Content "));
+
+        let action = handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert!(matches!(
+            action,
+            UiAction::Submit { prompt, images } if prompt == pasted && images.is_empty()
+        ));
+    }
+
+    #[test]
+    fn renders_collapsed_paste_without_exposing_its_contents() {
+        let pasted = format!(
+            "private-start{}",
+            "x".repeat(COLLAPSED_PASTE_CHAR_THRESHOLD)
+        );
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.editor.insert_paste(&pasted);
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("[Pasted Content "));
+        assert!(!rendered.contains("private-start"));
     }
 
     #[test]
@@ -1754,7 +2203,9 @@ mod tests {
         assert!(rendered.contains("web search"));
         assert!(rendered.contains("current release"));
         assert!(rendered.contains("The current release is available."));
-        assert!(rendered.contains("prompt"));
+        assert!(rendered.contains('>'));
+        assert!(!rendered.contains("prompt"));
+        assert!(!rendered.contains('┌'));
         assert!(rendered.contains("/tmp/project"));
         assert!(rendered.contains("reasoning off"));
         assert!(rendered.contains("in 0 out 0"));
@@ -1782,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_reasoning_as_a_separate_block() {
+    fn expands_active_thinking_and_folds_it_when_the_answer_starts() {
         let mut state = UiState::new(
             "reasoning-model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
@@ -1791,13 +2242,91 @@ mod tests {
         state.reasoning_effort = ReasoningEffort::High;
         state.apply_agent_event(AgentEvent::AssistantStarted);
         state.apply_agent_event(AgentEvent::ReasoningDelta {
-            text: "Inspecting the request.".to_string(),
+            text: "Inspecting the request.\nChecking the implementation.".to_string(),
         });
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rendered = rendered_terminal(&terminal);
+        assert!(rendered.contains("thinking  reasoning"));
+        assert!(rendered.contains("Inspecting the request."));
+        assert!(!rendered.contains("collapsed"));
+
         state.apply_agent_event(AgentEvent::TextDelta {
             text: "Final response.".to_string(),
         });
 
         let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rendered = rendered_terminal(&terminal);
+        assert!(rendered.contains("thinking"));
+        assert!(rendered.contains("collapsed, 2 lines"));
+        assert!(!rendered.contains("Inspecting the request."));
+        assert!(rendered.contains("assistant"));
+        assert!(rendered.contains("Final response."));
+        assert!(rendered.contains("reasoning high"));
+    }
+
+    #[test]
+    fn thinking_command_expands_and_refolds_completed_reasoning() {
+        let mut state = UiState::new(
+            "reasoning-model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.messages.push(ViewMessage {
+            role: ViewRole::Assistant,
+            title: "assistant".to_string(),
+            content: "Done.".to_string(),
+            reasoning: "Hidden reasoning.".to_string(),
+            tool_id: None,
+            running: false,
+        });
+
+        state.editor.insert_str("/thinking show");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert_eq!(
+            state.completed_thinking_display,
+            CompletedThinkingDisplay::Expanded
+        );
+        let lines = conversation_lines(&state);
+        let rendered = lines.iter().map(Line::to_string).collect::<String>();
+        assert!(rendered.contains("Hidden reasoning."));
+
+        state.editor.insert_str("/thinking hide");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(
+            state.completed_thinking_display,
+            CompletedThinkingDisplay::Folded
+        );
+        let lines = conversation_lines(&state);
+        let rendered = lines.iter().map(Line::to_string).collect::<String>();
+        assert!(rendered.contains("collapsed"));
+        assert!(!rendered.contains("Hidden reasoning."));
+    }
+
+    #[test]
+    fn renders_and_filters_slash_command_suggestions() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.editor.insert('/');
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rendered = terminal
@@ -1807,11 +2336,67 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("thinking"));
-        assert!(rendered.contains("Inspecting the request."));
-        assert!(rendered.contains("assistant"));
-        assert!(rendered.contains("Final response."));
-        assert!(rendered.contains("reasoning high"));
+        assert!(rendered.contains("/model [provider/model]"));
+        assert!(rendered.contains("view or switch model"));
+        assert!(rendered.contains("/thinking [show|hide|toggle]"));
+
+        let mut filtered = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        filtered.editor.insert_str("/ex");
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut filtered)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("/exit"));
+        assert!(!rendered.contains("/model"));
+    }
+
+    #[test]
+    fn navigates_and_completes_slash_command_suggestions() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.editor.insert('/');
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert_eq!(state.editor.text(), "/reasoning ");
+        assert!(slash_suggestions(&state.editor.text()).is_empty());
+
+        state.editor.set_text("/sta");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert_eq!(state.editor.text(), "/status");
     }
 
     #[test]
