@@ -26,12 +26,18 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/imengying/MCode/main/install.sh | sh
 ```
 
-安装脚本会识别架构并校验 `SHA256SUMS`。自定义版本或目录：
+安装脚本会自动识别架构。自定义版本或目录：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/imengying/MCode/main/install.sh | \
   MCODE_VERSION=0.1.0 MCODE_INSTALL_DIR="$HOME/bin" sh
+```
+
+显式升级到最新正式版：
+
+```bash
+mcode update
 ```
 
 若 zsh 尚未包含默认安装目录：
@@ -120,6 +126,7 @@ mcode resume
 mcode resume <SESSION_ID>
 mcode sessions --json
 mcode doctor --json
+mcode update
 mcode delete <SESSION_ID> --force
 ```
 
@@ -182,5 +189,6 @@ MCODE_REAL_API_MODEL=gpt-5.6-terra \
   cargo test --test real_api -- --ignored --nocapture
 ```
 
-GitHub Actions 在 Linux 上执行格式、Clippy、RustSec、测试和 release 构建。`v*` tag 发布 Linux
-musl x86_64/ARM64、确定性源码包和 `SHA256SUMS`。
+GitHub Actions 在 Linux 上执行格式、Clippy、RustSec、测试和 release 构建。`v*` tag 只触发
+Release workflow，发布 Linux musl x86_64/ARM64 二进制归档，并用 tag 之间的 commit 生成更新
+日志；源码归档由 GitHub 自动提供。

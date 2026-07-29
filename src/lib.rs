@@ -11,4 +11,5 @@ pub mod protocol;
 pub mod session;
 pub mod tools;
 pub mod ui;
+pub mod update;
 pub mod web_access;

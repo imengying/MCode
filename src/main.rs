@@ -28,6 +28,9 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(&cli.command, Some(Command::Update)) {
+        return mcode::update::run().await;
+    }
     let root_prompt = cli.root_prompt();
     let model_was_overridden =
         cli.model.is_some() || env::var("OPENAI_MODEL").is_ok_and(|value| !value.trim().is_empty());
@@ -114,6 +117,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::Sessions(args)) => list_sessions(&config, args.json),
         Some(Command::Doctor(args)) => run_doctor(&config, args.json),
+        Some(Command::Update) => unreachable!("update is handled before configuration loading"),
         None if io::stdin().is_terminal() && io::stdout().is_terminal() => {
             prepare_mcp_servers(&mut config, bypass_approvals, true);
             let session =

@@ -10,7 +10,7 @@ use crate::config::ReasoningEffort;
     version,
     about = "MCode, a focused OpenAI-compatible coding agent",
     args_conflicts_with_subcommands = true,
-    after_help = "Examples:\n  mcode\n  mcode -i screenshot.png \"inspect this UI\"\n  mcode --search \"check the latest dependency release\"\n  mcode exec \"fix the failing tests\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode sessions\n  mcode doctor\n  mcode delete <SESSION_ID>"
+    after_help = "Examples:\n  mcode\n  mcode -i screenshot.png \"inspect this UI\"\n  mcode --search \"check the latest dependency release\"\n  mcode exec \"fix the failing tests\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode sessions\n  mcode doctor\n  mcode update\n  mcode delete <SESSION_ID>"
 )]
 pub struct Cli {
     /// Optional image(s) to attach to the initial prompt.
@@ -112,6 +112,9 @@ pub enum Command {
 
     /// Diagnose local configuration without making an API request.
     Doctor(OutputArgs),
+
+    /// Install the latest GitHub release.
+    Update,
 }
 
 #[derive(Debug, Args)]
@@ -233,6 +236,8 @@ mod tests {
             doctor.command,
             Some(Command::Doctor(OutputArgs { json: false }))
         ));
+        let update = Cli::parse_from(["mcode", "update"]);
+        assert!(matches!(update.command, Some(Command::Update)));
     }
 
     #[test]
