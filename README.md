@@ -14,7 +14,7 @@ Chat Completions 和 Responses API。
 - shell/MCP 执行审批
 - Pi 风格自动上下文压缩和溢出恢复
 - JSONL v3 会话、崩溃恢复和累计 token 统计
-- 模型、reasoning 和搜索模式独立切换
+- 模型、effort 和搜索模式独立切换
 - 当前正式支持 Linux x86_64 与 ARM64
 
 ## 安装
@@ -88,6 +88,8 @@ API key 可以省略，以连接不需要认证的端点。MCode 不会保存凭
 
 - `api`：`openai-completions` 或 `openai-responses`
 - `contextWindow` / `maxInputTokens`：上下文窗口与最大输入
+- `default`：每个模型必填，指定默认 effort；非推理模型使用 `off`
+- `thinkingLevelMap`：当前推理模型可选的 effort，`default` 必须是其中的非 `null` 等级
 - `compat`：控制 reasoning effort、流式 usage 和 strict tools
 - `webSearch`：`disabled`、`cached` 或 `live`
 - `compaction`：自动压缩开关、预留 token 和最近历史预算
@@ -106,6 +108,7 @@ Web Search 依 API 协议分流：
 
 当前工作目录中的普通 UTF-8 `AGENTS.md` 会加入 system instructions，大小上限 64 KiB；不会
 读取父目录、目录项或符号链接。
+除此之外，MCode 不注入身份、语气或工作流提示；工具能力仅通过标准工具 schema 提供。
 
 ## 使用
 
@@ -141,22 +144,24 @@ TUI 命令：
 | 命令 | 作用 |
 |---|---|
 | `/model [provider/model]` | 查看或切换模型 |
-| `/reasoning [LEVEL]` | 查看或切换思考强度 |
-| `/thinking [show\|hide]` | 展开或折叠已完成的思考过程 |
+| `/effort [LEVEL]` | 查看或切换思考强度 |
+| `/thinking [show\|hide]` | 显示或隐藏思考过程 |
 | `/search [disabled\|cached\|live]` | 查看或切换网页搜索 |
 | `/compact [INSTRUCTIONS]` | 手动压缩上下文 |
 | `/image [PATH\|clear]` | 管理下一条消息的图片 |
 | `/status` | 显示模型、端点和 token |
 | `/new` | 新建会话 |
-| `/delete` | 二次确认后删除当前会话 |
+| `/delete` | 选择 Yes 后删除当前会话并退出 |
 | `/clear` | 清屏 |
 | `/help` | 显示帮助 |
 | `/exit` | 退出 |
 
-思考过程在生成时展开，完成后自动折叠；使用 `/thinking show` 可查看全文。
+思考过程默认隐藏；使用 `/thinking show` 可查看全文。
 
-Enter 提交，Shift+Enter 或 Alt+Enter 换行，Escape 取消当前任务。审批提示中 `y` 允许一次，
-`a` 在当前会话允许同名工具，`n` 拒绝。
+输入 `/` 后可用方向键选择，Tab 或 Enter 补全命令及其可选参数。Enter 提交，Shift+Enter 或
+Alt+Enter 换行，Escape 取消当前任务。使用鼠标滚轮或方向键逐行滚动，PageUp/PageDown
+翻页，Ctrl+Home/Ctrl+End 跳到顶部/底部。删除确认默认选择 No，使用方向键切换并按 Enter
+确认。审批提示中 `y` 允许一次，`a` 在当前会话允许同名工具，`n` 拒绝。
 
 ## 会话恢复
 

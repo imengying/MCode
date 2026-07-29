@@ -33,39 +33,37 @@ struct GitHubAsset {
 
 pub async fn run() -> Result<()> {
     let (target, asset_name) = release_platform()?;
-    let current_version = Version::parse(crate::VERSION)
-        .context("the installed MCode version is not valid semantic versioning")?;
+    let current_version =
+        Version::parse(crate::VERSION).context("已安装的 MCode 版本不是有效的语义化版本")?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_mins(5))
         .https_only(true)
         .user_agent(format!("mcode/{}", crate::VERSION))
         .build()
-        .context("failed to create the update client")?;
+        .context("创建更新客户端失败")?;
 
-    println!("Checking for MCode updates...");
+    println!("正在检查 MCode 更新...");
     let metadata = download_limited(
         client
             .get(RELEASE_API_URL)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28"),
         MAX_RELEASE_METADATA_BYTES,
-        "release metadata",
+        "Release 元数据",
     )
     .await?;
     let release: GitHubRelease =
-        serde_json::from_slice(&metadata).context("failed to decode GitHub release metadata")?;
+        serde_json::from_slice(&metadata).context("解析 GitHub Release 元数据失败")?;
     let latest_version = version_from_tag(&release.tag_name)?;
 
     match latest_version.cmp(&current_version) {
         Ordering::Less => {
-            println!(
-                "Installed MCode {current_version} is newer than the latest release {latest_version}."
-            );
+            println!("已安装的 MCode {current_version} 比最新 Release {latest_version} 更新。");
             return Ok(());
         }
         Ordering::Equal => {
-            println!("MCode {current_version} is already up to date.");
+            println!("MCode {current_version} 已是最新版本。");
             return Ok(());
         }
         Ordering::Greater => {}
@@ -75,20 +73,20 @@ pub async fn run() -> Result<()> {
         .assets
         .iter()
         .find(|asset| asset.name == asset_name)
-        .with_context(|| format!("release {} does not contain {asset_name}", release.tag_name))?;
+        .with_context(|| format!("Release {} 不包含 {asset_name}", release.tag_name))?;
     let download_url = validated_download_url(&asset.browser_download_url)?;
-    println!("Downloading MCode {latest_version} for {target}...");
+    println!("正在下载适用于 {target} 的 MCode {latest_version}...");
     let compressed = download_limited(
         client.get(download_url),
         MAX_ARCHIVE_BYTES,
-        "release archive",
+        "Release 压缩包",
     )
     .await?;
     let binary = extract_binary(&compressed)?;
-    let executable = std::env::current_exe().context("failed to locate the MCode executable")?;
+    let executable = std::env::current_exe().context("无法定位 MCode 可执行文件")?;
     replace_executable(&executable, &binary).await?;
 
-    println!("Updated MCode {current_version} to {latest_version}.");
+    println!("MCode 已从 {current_version} 更新到 {latest_version}。");
     Ok(())
 }
 
@@ -96,19 +94,19 @@ fn release_platform() -> Result<(&'static str, &'static str)> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok(("x86_64-unknown-linux-musl", "MCode-amd64.tar.gz")),
         ("linux", "aarch64") => Ok(("aarch64-unknown-linux-musl", "MCode-arm64.tar.gz")),
-        (os, arch) => bail!("mcode update is not supported on {os}/{arch}"),
+        (os, arch) => bail!("mcode update 不支持 {os}/{arch}"),
     }
 }
 
 fn version_from_tag(tag: &str) -> Result<Version> {
     Version::parse(tag.strip_prefix('v').unwrap_or(tag))
-        .context("the latest GitHub release tag is not valid semantic versioning")
+        .context("最新 GitHub Release 标签不是有效的语义化版本")
 }
 
 fn validated_download_url(raw: &str) -> Result<Url> {
-    let url = Url::parse(raw).context("the release asset has an invalid download URL")?;
+    let url = Url::parse(raw).context("Release 产物的下载 URL 无效")?;
     if url.scheme() != "https" || url.host_str() != Some("github.com") {
-        bail!("the release asset download URL is not an official GitHub HTTPS URL");
+        bail!("Release 产物下载 URL 不是 GitHub 官方 HTTPS URL");
     }
     Ok(url)
 }
@@ -121,9 +119,9 @@ async fn download_limited(
     let response = request
         .send()
         .await
-        .with_context(|| format!("failed to request {description}"))?
+        .with_context(|| format!("请求{description}失败"))?
         .error_for_status()
-        .with_context(|| format!("failed to download {description}"))?;
+        .with_context(|| format!("下载{description}失败"))?;
     response_bytes_limited(response, limit, description).await
 }
 
@@ -137,14 +135,14 @@ async fn response_bytes_limited(
         .content_length()
         .is_some_and(|length| length > limit_u64)
     {
-        bail!("{description} exceeds the download limit");
+        bail!("{description}超过下载大小限制");
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("failed to read {description}"))?;
+        let chunk = chunk.with_context(|| format!("读取{description}失败"))?;
         if bytes.len().saturating_add(chunk.len()) > limit {
-            bail!("{description} exceeds the download limit");
+            bail!("{description}超过下载大小限制");
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -157,47 +155,45 @@ fn extract_binary(compressed: &[u8]) -> Result<Vec<u8>> {
     let mut binary = None;
     let mut unpacked_bytes = 0_u64;
     {
-        let entries = archive
-            .entries()
-            .context("failed to read the release archive")?;
+        let entries = archive.entries().context("读取 Release 压缩包失败")?;
         for entry in entries {
-            let mut entry = entry.context("failed to read an entry in the release archive")?;
+            let mut entry = entry.context("读取 Release 压缩包条目失败")?;
             let entry_size = entry
                 .header()
                 .size()
-                .context("release archive contains an invalid entry size")?;
+                .context("Release 压缩包包含大小无效的条目")?;
             unpacked_bytes = unpacked_bytes
                 .checked_add(entry_size)
-                .context("release archive size overflow")?;
+                .context("Release 压缩包大小溢出")?;
             if unpacked_bytes > MAX_UNPACKED_BYTES {
-                bail!("release archive exceeds the unpacked size limit");
+                bail!("Release 压缩包超过解压大小限制");
             }
             if entry.path()?.as_ref() != Path::new("mcode") {
                 continue;
             }
             if binary.is_some() {
-                bail!("release archive contains more than one mcode binary");
+                bail!("Release 压缩包包含多个 mcode 二进制文件");
             }
             if !entry.header().entry_type().is_file() {
-                bail!("the mcode archive entry is not a regular file");
+                bail!("压缩包中的 mcode 条目不是普通文件");
             }
             if entry_size > MAX_BINARY_BYTES {
-                bail!("the mcode binary exceeds the size limit");
+                bail!("mcode 二进制文件超过大小限制");
             }
-            let capacity = usize::try_from(entry_size).context("mcode binary is too large")?;
+            let capacity = usize::try_from(entry_size).context("mcode 二进制文件过大")?;
             let mut contents = Vec::with_capacity(capacity);
             entry
                 .read_to_end(&mut contents)
-                .context("failed to extract the mcode binary")?;
+                .context("提取 mcode 二进制文件失败")?;
             binary = Some(contents);
         }
     }
     let mut decoder = archive.into_inner();
-    io::copy(&mut decoder, &mut io::sink()).context("release archive checksum is invalid")?;
+    io::copy(&mut decoder, &mut io::sink()).context("Release 压缩包校验失败")?;
 
-    let binary = binary.context("release archive does not contain the mcode binary")?;
+    let binary = binary.context("Release 压缩包不包含 mcode 二进制文件")?;
     if !binary.starts_with(b"\x7fELF") {
-        bail!("the release archive does not contain a Linux executable");
+        bail!("Release 压缩包不包含 Linux 可执行文件");
     }
     Ok(binary)
 }
@@ -205,7 +201,7 @@ fn extract_binary(compressed: &[u8]) -> Result<Vec<u8>> {
 async fn replace_executable(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
-        .with_context(|| format!("executable path has no parent: {}", path.display()))?;
+        .with_context(|| format!("可执行文件路径没有父目录：{}", path.display()))?;
     let temporary = parent.join(format!(".mcode-update-{}.tmp", Uuid::now_v7()));
     let result = async {
         let mut file = tokio::fs::OpenOptions::new()
@@ -214,20 +210,13 @@ async fn replace_executable(path: &Path, contents: &[u8]) -> Result<()> {
             .open(&temporary)
             .await
             .with_context(|| {
-                format!(
-                    "failed to create an update file beside {}; is the directory writable?",
-                    path.display()
-                )
+                format!("无法在 {} 旁创建更新文件；该目录是否可写？", path.display())
             })?;
         file.write_all(contents)
             .await
-            .context("failed to write the updated executable")?;
-        file.flush()
-            .await
-            .context("failed to flush the updated executable")?;
-        file.sync_all()
-            .await
-            .context("failed to sync the updated executable")?;
+            .context("写入新版可执行文件失败")?;
+        file.flush().await.context("刷新新版可执行文件失败")?;
+        file.sync_all().await.context("同步新版可执行文件失败")?;
         drop(file);
 
         #[cfg(unix)]
@@ -236,11 +225,11 @@ async fn replace_executable(path: &Path, contents: &[u8]) -> Result<()> {
 
             tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
                 .await
-                .context("failed to make the updated executable runnable")?;
+                .context("设置新版可执行文件权限失败")?;
         }
         tokio::fs::rename(&temporary, path)
             .await
-            .with_context(|| format!("failed to replace {}; is it writable?", path.display()))?;
+            .with_context(|| format!("替换 {} 失败；该文件是否可写？", path.display()))?;
         Ok(())
     }
     .await;

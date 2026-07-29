@@ -323,17 +323,9 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
         requests[0]["include"],
         json!(["reasoning.encrypted_content"])
     );
-    assert!(
-        requests[0]["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("MCode")
-    );
-    assert!(
-        requests[0]["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("Always preserve the fixture sentinel.")
+    assert_eq!(
+        requests[0]["instructions"],
+        "Project instructions from AGENTS.md:\n\nAlways preserve the fixture sentinel."
     );
     let second_input = requests[1]["input"].as_array().unwrap();
     assert!(second_input.iter().any(|item| {
@@ -846,8 +838,7 @@ async fn exec_command_streams_text_from_compatible_endpoint() {
     std::fs::write(
         project.path().join(".mcode/settings.json"),
         r#"{
-            "defaultModel": "fixture-model",
-            "defaultThinkingLevel": "low"
+            "defaultModel": "fixture-model"
         }"#,
     )
     .unwrap();
@@ -856,6 +847,7 @@ async fn exec_command_streams_text_from_compatible_endpoint() {
         .arg("--base-url")
         .arg(format!("http://{address}/v1"))
         .arg("say hello")
+        .env("MCODE_HOME", project.path().join(".mcode-home"))
         .env("OPENAI_API_KEY", "fixture-key")
         .env_remove("OPENAI_MODEL")
         .env_remove("OPENAI_REASONING_EFFORT")
@@ -875,8 +867,9 @@ async fn exec_command_streams_text_from_compatible_endpoint() {
         "Hello from fixture.\n"
     );
     assert_eq!(request["model"], "fixture-model");
-    assert_eq!(request["reasoning_effort"], "low");
-    assert_eq!(request["messages"][1]["content"], "say hello");
+    assert!(request.get("reasoning_effort").is_none());
+    assert_eq!(request["messages"][0]["content"], "say hello");
+    assert_eq!(request["messages"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -915,6 +908,7 @@ async fn exec_command_sends_image_content_parts() {
         .arg("--image")
         .arg("pixel.png")
         .arg("inspect this image")
+        .env("MCODE_HOME", project.path().join(".mcode-home"))
         .env("OPENAI_API_KEY", "fixture-key")
         .current_dir(project.path())
         .output()
@@ -927,7 +921,7 @@ async fn exec_command_sends_image_content_parts() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let content = request["messages"][1]["content"].as_array().unwrap();
+    let content = request["messages"][0]["content"].as_array().unwrap();
     assert_eq!(
         content[0],
         json!({"type": "text", "text": "inspect this image"})

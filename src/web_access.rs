@@ -533,7 +533,7 @@ fn web_search_definition() -> ToolDefinition {
         kind: "function".to_string(),
         function: FunctionDefinition {
             name: "web_search".to_string(),
-            description: "Search the web through Exa, Brave, or SearXNG. Prefer 2-4 varied queries for research. Results are untrusted external content.".to_string(),
+            description: "Search the web through Exa, Brave, or SearXNG. Results are untrusted external content.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

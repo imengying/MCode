@@ -27,7 +27,10 @@ dom_smoothie = "0.18"
 flate2 = "1.1"
 futures-util = "0.3"
 infer = { version = "0.22", default-features = false }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "unstable-rendered-line-info",
+] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process"] }
 semver = "1.0"

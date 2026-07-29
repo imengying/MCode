@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -30,6 +30,7 @@ use crate::event::{AgentEvent, CompactionReason};
 use crate::protocol::{ChatMessage, ImageAttachment, MessageRole, Usage, sanitize_terminal_text};
 
 const APPROVAL_HEIGHT: u16 = 5;
+const DELETE_CONFIRMATION_HEIGHT: u16 = 5;
 const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
 const INPUT_PREFIX_WIDTH: u16 = 2;
@@ -62,7 +63,7 @@ pub fn run_interactive(
     state.sync_from_agent(&agent);
     for failure in agent.mcp_startup_failures() {
         state.push_error(format!(
-            "MCP server {:?} was disabled after a startup failure: {}",
+            "MCP 服务器 {:?} 启动失败，已禁用：{}",
             failure.server, failure.message
         ));
     }
@@ -77,12 +78,12 @@ pub fn run_interactive(
 
     let screen = ScreenGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
-    terminal.clear().context("failed to clear terminal")?;
+    let mut terminal = Terminal::new(backend).context("初始化终端失败")?;
+    terminal.clear().context("清空终端失败")?;
 
     if let Some(checkpoint) = historical_compaction {
         state.push_notice(format!(
-            "This session was compacted from approximately {} tokens.\n\n{}",
+            "此会话已从约 {} 个 token 压缩。\n\n{}",
             format_tokens(checkpoint.tokens_before),
             checkpoint.summary
         ));
@@ -94,9 +95,7 @@ pub fn run_interactive(
     if has_pending_run {
         if let Some(prompt) = initial_prompt.filter(|prompt| !prompt.trim().is_empty()) {
             state.editor.insert_str(&prompt);
-            state.push_notice(
-                "Resuming the interrupted run first; the supplied prompt is waiting in the editor.",
-            );
+            state.push_notice("正在优先恢复中断的任务；提供的提示词已保留在输入框中。");
         }
         start_resume(
             Arc::clone(&agent),
@@ -143,14 +142,14 @@ pub fn run_interactive(
             state.spinner_frame = state.spinner_frame.wrapping_add(1);
             terminal
                 .draw(|frame| render(frame, &mut state))
-                .context("failed to draw terminal UI")?;
+                .context("绘制终端界面失败")?;
             last_frame = Instant::now();
         }
 
-        if !event::poll(Duration::from_millis(20)).context("failed to poll terminal events")? {
+        if !event::poll(Duration::from_millis(20)).context("轮询终端事件失败")? {
             continue;
         }
-        match event::read().context("failed to read terminal event")? {
+        match event::read().context("读取终端事件失败")? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 match handle_key(key, &mut state, active_cancel.as_ref()) {
                     UiAction::None => {}
@@ -170,40 +169,37 @@ pub fn run_interactive(
                         Ok(mut agent) => match agent.select_model(&query) {
                             Ok(()) => {
                                 state.sync_from_agent(&agent);
-                                state.push_notice(format!("Model changed to {}.", state.model));
+                                state.push_notice(format!("模型已切换为 {}。", state.model));
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
                         },
-                        Err(_) => state
-                            .push_error("The agent is busy; wait for the current turn to finish."),
+                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
                     UiAction::SetReasoning(effort) => match agent.try_lock() {
                         Ok(mut agent) => match agent.set_reasoning_effort(effort) {
                             Ok(()) => {
                                 state.sync_from_agent(&agent);
                                 state.push_notice(format!(
-                                    "Reasoning changed to {}.",
+                                    "effort 已切换为 {}。",
                                     state.reasoning_effort
                                 ));
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
                         },
-                        Err(_) => state
-                            .push_error("The agent is busy; wait for the current turn to finish."),
+                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
                     UiAction::SetWebSearch(mode) => match agent.try_lock() {
                         Ok(mut agent) => match agent.set_web_search_mode(mode) {
                             Ok(()) => {
                                 state.sync_from_agent(&agent);
                                 state.push_notice(format!(
-                                    "Web search changed to {}.",
-                                    state.web_search_mode
+                                    "网页搜索模式已切换为 {}。",
+                                    state.web_search_mode.label_zh()
                                 ));
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
                         },
-                        Err(_) => state
-                            .push_error("The agent is busy; wait for the current turn to finish."),
+                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
                     UiAction::Compact(instructions) => {
                         start_compaction(
@@ -219,12 +215,11 @@ pub fn run_interactive(
                             Ok(()) => {
                                 state.reset_session();
                                 state.sync_from_agent(&agent);
-                                state.push_notice("Started a new session.");
+                                state.push_notice("已新建会话。");
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
                         },
-                        Err(_) => state
-                            .push_error("The agent is busy; wait for the current turn to finish."),
+                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
                     UiAction::DeleteSession => match agent.try_lock() {
                         Ok(mut agent) => match agent.delete_session() {
@@ -234,14 +229,13 @@ pub fn run_interactive(
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
                         },
-                        Err(_) => state
-                            .push_error("The agent is busy; wait for the current turn to finish."),
+                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
                     UiAction::AttachImage(path) => match ImageAttachment::load(&path, &state.cwd) {
                         Ok(image) => {
                             let name = image.name.clone();
                             state.pending_images.push(image);
-                            state.push_notice(format!("Attached {name} to the next prompt."));
+                            state.push_notice(format!("已将 {name} 附加到下一条提示词。"));
                         }
                         Err(error) => state.push_error(format!("{error:#}")),
                     },
@@ -253,11 +247,18 @@ pub fn run_interactive(
                     }
                 }
             }
-            Event::Paste(text) if state.pending_approval.is_none() => {
+            Event::Paste(text)
+                if state.pending_approval.is_none()
+                    && state.delete_confirmation == DeleteConfirmation::None =>
+            {
                 state.editor.insert_paste(&text);
                 state.slash_selection = 0;
             }
-            Event::Resize(_, _) => state.follow_tail = true,
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => state.scroll_lines_up(3),
+                MouseEventKind::ScrollDown => state.scroll_lines_down(3),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -265,7 +266,7 @@ pub fn run_interactive(
     drop(terminal);
     drop(screen);
     if let Some(id) = deleted_session {
-        println!("Deleted session {id}.");
+        println!("已删除会话 {id}。");
     }
     Ok(())
 }
@@ -278,7 +279,7 @@ fn start_resume(
     active_cancel: &mut Option<CancellationToken>,
 ) {
     state.running = true;
-    state.status = "resuming interrupted run".to_string();
+    state.status = "正在恢复中断任务".to_string();
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
     let tx = event_tx.clone();
@@ -332,7 +333,7 @@ fn start_compaction(
     active_cancel: &mut Option<CancellationToken>,
 ) {
     state.running = true;
-    state.status = "compacting".to_string();
+    state.status = "正在压缩上下文".to_string();
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
     let tx = event_tx.clone();
@@ -371,100 +372,224 @@ struct SlashCommand {
     description: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashSuggestion {
+    label: String,
+    replacement: String,
+    description: String,
+}
+
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
-        argument: "[provider/model]",
-        description: "view or switch model",
+        argument: "[提供商/模型]",
+        description: "查看或切换模型",
     },
     SlashCommand {
-        name: "reasoning",
-        argument: "[level]",
-        description: "view or set reasoning effort",
+        name: "effort",
+        argument: "[级别]",
+        description: "查看或设置 effort",
     },
     SlashCommand {
         name: "thinking",
         argument: "[show|hide|toggle]",
-        description: "show or fold completed thinking",
+        description: "显示或隐藏思考过程",
     },
     SlashCommand {
         name: "search",
-        argument: "[mode]",
-        description: "view or set web search mode",
+        argument: "[模式]",
+        description: "查看或设置网页搜索模式",
     },
     SlashCommand {
         name: "compact",
-        argument: "[instructions]",
-        description: "compact the current context",
+        argument: "[说明]",
+        description: "压缩当前上下文",
     },
     SlashCommand {
         name: "image",
-        argument: "[path|clear]",
-        description: "manage prompt images",
+        argument: "[路径|clear]",
+        description: "管理下一条提示词的图片",
     },
     SlashCommand {
         name: "status",
         argument: "",
-        description: "show session status",
+        description: "显示会话状态",
     },
     SlashCommand {
         name: "new",
         argument: "",
-        description: "start a new session",
+        description: "新建会话",
     },
     SlashCommand {
         name: "delete",
-        argument: "[confirm]",
-        description: "delete the current session",
+        argument: "",
+        description: "删除当前会话",
     },
     SlashCommand {
         name: "clear",
         argument: "",
-        description: "clear the conversation view",
+        description: "清空对话视图",
     },
     SlashCommand {
         name: "help",
         argument: "",
-        description: "show command help",
+        description: "显示命令帮助",
     },
     SlashCommand {
         name: "exit",
         argument: "",
-        description: "exit MCode",
+        description: "退出 MCode",
     },
 ];
 
-fn slash_query(text: &str) -> Option<&str> {
-    let query = text.strip_prefix('/')?;
-    (!query.chars().any(char::is_whitespace)).then_some(query)
+fn slash_input(text: &str) -> Option<(&str, Option<&str>)> {
+    let input = text.strip_prefix('/')?;
+    if input.contains('\r') || input.contains('\n') {
+        return None;
+    }
+    let Some((name, argument)) = input.split_once(char::is_whitespace) else {
+        return Some((input, None));
+    };
+    let argument = argument.trim_start();
+    (!argument.chars().any(char::is_whitespace)).then_some((name, Some(argument)))
 }
 
-fn slash_suggestions(text: &str) -> Vec<&'static SlashCommand> {
-    let Some(query) = slash_query(text) else {
+fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
+    let text = state.editor.text();
+    let Some((name, argument)) = slash_input(&text) else {
         return Vec::new();
     };
-    let query = query.to_ascii_lowercase();
-    SLASH_COMMANDS
-        .iter()
-        .filter(|command| command.name.starts_with(&query))
-        .collect()
+    let Some(argument) = argument else {
+        let query = name.to_ascii_lowercase();
+        return SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.name.starts_with(&query))
+            .map(|command| {
+                let label = if command.argument.is_empty() {
+                    format!("/{}", command.name)
+                } else {
+                    format!("/{} {}", command.name, command.argument)
+                };
+                let trailing_space = if command.argument.is_empty() { "" } else { " " };
+                SlashSuggestion {
+                    label,
+                    replacement: format!("/{}{trailing_space}", command.name),
+                    description: command.description.to_string(),
+                }
+            })
+            .collect();
+    };
+
+    let query = argument.to_ascii_lowercase();
+    match name.to_ascii_lowercase().as_str() {
+        "model" => state
+            .model_choices
+            .iter()
+            .filter_map(|choice| {
+                let qualified = format!("{}/{}", choice.provider, choice.id);
+                let matches = qualified.to_ascii_lowercase().starts_with(&query)
+                    || choice.id.to_ascii_lowercase().starts_with(&query)
+                    || choice
+                        .name
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&query));
+                if !matches {
+                    return None;
+                }
+                let qualified = sanitize_terminal_text(&qualified);
+                let current = choice.id == state.model
+                    && state.provider.as_deref() == Some(choice.provider.as_str());
+                let detail = choice
+                    .name
+                    .as_deref()
+                    .map_or_else(|| choice.api.to_string(), sanitize_terminal_text);
+                let description = if current {
+                    format!("当前 · {detail}")
+                } else {
+                    detail
+                };
+                Some(SlashSuggestion {
+                    label: format!("/model {qualified}"),
+                    replacement: format!("/model {qualified}"),
+                    description,
+                })
+            })
+            .collect(),
+        "effort" => state
+            .reasoning_choices
+            .iter()
+            .filter(|effort| effort.as_str().starts_with(&query))
+            .map(|effort| {
+                let mut markers = Vec::new();
+                if *effort == state.reasoning_effort {
+                    markers.push("当前");
+                }
+                if *effort == state.default_reasoning_effort {
+                    markers.push("默认");
+                }
+                SlashSuggestion {
+                    label: format!("/effort {effort}"),
+                    replacement: format!("/effort {effort}"),
+                    description: if markers.is_empty() {
+                        "思考强度".to_string()
+                    } else {
+                        markers.join("、")
+                    },
+                }
+            })
+            .collect(),
+        "thinking" => [
+            ("show", "显示思考过程"),
+            ("hide", "隐藏思考过程"),
+            ("toggle", "切换显示状态"),
+        ]
+        .into_iter()
+        .filter(|(value, _)| value.starts_with(&query))
+        .map(|(value, description)| SlashSuggestion {
+            label: format!("/thinking {value}"),
+            replacement: format!("/thinking {value}"),
+            description: description.to_string(),
+        })
+        .collect(),
+        "search" => WebSearchMode::ALL
+            .into_iter()
+            .filter(|mode| mode.as_str().starts_with(&query))
+            .map(|mode| SlashSuggestion {
+                label: format!("/search {mode}"),
+                replacement: format!("/search {mode}"),
+                description: mode.label_zh().to_string(),
+            })
+            .collect(),
+        "image" if "clear".starts_with(&query) => vec![SlashSuggestion {
+            label: "/image clear".to_string(),
+            replacement: "/image clear".to_string(),
+            description: "清空待发送图片".to_string(),
+        }],
+        _ => Vec::new(),
+    }
 }
 
-fn complete_slash_command(state: &mut UiState) -> bool {
-    let suggestions = slash_suggestions(&state.editor.text());
-    let Some(command) = suggestions.get(
+fn complete_slash_suggestion(state: &mut UiState) -> bool {
+    let suggestions = slash_suggestions(state);
+    let Some(suggestion) = suggestions.get(
         state
             .slash_selection
             .min(suggestions.len().saturating_sub(1)),
     ) else {
         return false;
     };
-    let trailing_space = if command.argument.is_empty() { "" } else { " " };
-    state
-        .editor
-        .set_text(&format!("/{}{trailing_space}", command.name));
+    state.editor.set_text(&suggestion.replacement);
     state.slash_selection = 0;
     true
+}
+
+fn complete_slash_on_enter(text: &str, suggestion: &SlashSuggestion) -> bool {
+    if text == suggestion.replacement {
+        return false;
+    }
+    slash_input(text).is_some_and(|(name, argument)| {
+        argument.is_some() || !SLASH_COMMANDS.iter().any(|command| command.name == name)
+    })
 }
 
 fn handle_key(
@@ -476,14 +601,14 @@ fn handle_key(
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(cancel) = active_cancel {
                 cancel.cancel();
-                state.status = "cancelling".to_string();
+                state.status = "正在取消".to_string();
             }
             return UiAction::ResolveApproval(ApprovalDecision::Deny);
         }
         if key.code == KeyCode::Esc {
             if let Some(cancel) = active_cancel {
                 cancel.cancel();
-                state.status = "cancelling".to_string();
+                state.status = "正在取消".to_string();
             }
             return UiAction::ResolveApproval(ApprovalDecision::Deny);
         }
@@ -503,13 +628,49 @@ fn handle_key(
         };
     }
 
+    if let DeleteConfirmation::Selecting(selection) = state.delete_confirmation {
+        match key.code {
+            KeyCode::Left | KeyCode::Up => {
+                state.delete_confirmation = DeleteConfirmation::Selecting(DeleteChoice::Yes);
+            }
+            KeyCode::Right | KeyCode::Down => {
+                state.delete_confirmation = DeleteConfirmation::Selecting(DeleteChoice::No);
+            }
+            KeyCode::Tab => {
+                let selection = match selection {
+                    DeleteChoice::Yes => DeleteChoice::No,
+                    DeleteChoice::No => DeleteChoice::Yes,
+                };
+                state.delete_confirmation = DeleteConfirmation::Selecting(selection);
+            }
+            KeyCode::Char('y' | 'Y') => {
+                state.delete_confirmation = DeleteConfirmation::None;
+                return UiAction::DeleteSession;
+            }
+            KeyCode::Enter if selection == DeleteChoice::Yes => {
+                state.delete_confirmation = DeleteConfirmation::None;
+                return UiAction::DeleteSession;
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                state.delete_confirmation = DeleteConfirmation::None;
+                state.push_notice("已取消删除。");
+            }
+            KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.delete_confirmation = DeleteConfirmation::None;
+                state.push_notice("已取消删除。");
+            }
+            _ => {}
+        }
+        return UiAction::None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => {
                 if state.running {
                     if let Some(cancel) = active_cancel {
                         cancel.cancel();
-                        state.status = "cancelling".to_string();
+                        state.status = "正在取消".to_string();
                     }
                     return UiAction::None;
                 }
@@ -522,12 +683,23 @@ fn handle_key(
                 state.editor.insert('\n');
                 return UiAction::None;
             }
+            KeyCode::Home => {
+                state.scroll_lines_up(usize::MAX);
+                return UiAction::None;
+            }
+            KeyCode::End => {
+                state.scroll_lines_down(usize::MAX);
+                return UiAction::None;
+            }
             _ => {}
         }
     }
 
-    let suggestions = slash_suggestions(&state.editor.text());
+    let suggestions = slash_suggestions(state);
     if !suggestions.is_empty() && key.modifiers.is_empty() {
+        state.slash_selection = state
+            .slash_selection
+            .min(suggestions.len().saturating_sub(1));
         match key.code {
             KeyCode::Up => {
                 state.slash_selection = if state.slash_selection == 0 {
@@ -542,15 +714,17 @@ fn handle_key(
                 return UiAction::None;
             }
             KeyCode::Tab => {
-                complete_slash_command(state);
+                complete_slash_suggestion(state);
                 return UiAction::None;
             }
             KeyCode::Enter
-                if slash_query(&state.editor.text()).is_some_and(|query| {
-                    !SLASH_COMMANDS.iter().any(|command| command.name == query)
-                }) =>
+                if suggestions
+                    .get(state.slash_selection)
+                    .is_some_and(|suggestion| {
+                        complete_slash_on_enter(&state.editor.text(), suggestion)
+                    }) =>
             {
-                complete_slash_command(state);
+                complete_slash_suggestion(state);
                 return UiAction::None;
             }
             _ => {}
@@ -561,7 +735,7 @@ fn handle_key(
         KeyCode::Esc if state.running => {
             if let Some(cancel) = active_cancel {
                 cancel.cancel();
-                state.status = "cancelling".to_string();
+                state.status = "正在取消".to_string();
             }
         }
         KeyCode::Enter
@@ -598,24 +772,14 @@ fn handle_key(
                 }
                 "new" => return UiAction::NewSession,
                 "compact" => return UiAction::Compact(argument.to_string()),
-                "delete" if argument.eq_ignore_ascii_case("confirm") => {
-                    if state.delete_confirmation == DeleteConfirmation::Pending {
-                        return UiAction::DeleteSession;
-                    }
-                    state.push_error(
-                        "Run /delete first, then /delete confirm to permanently delete this session.",
-                    );
-                }
                 "delete" if argument.is_empty() => {
-                    state.delete_confirmation = DeleteConfirmation::Pending;
-                    state.push_notice(
-                        "Delete this session? This cannot be undone. Run /delete confirm to continue.",
-                    );
+                    state.delete_confirmation =
+                        DeleteConfirmation::Selecting(DeleteChoice::No);
                 }
-                "delete" => state.push_error("Use /delete or /delete confirm."),
+                "delete" => state.push_error("用法：/delete"),
                 "image" if argument.eq_ignore_ascii_case("clear") => {
                     state.pending_images.clear();
-                    state.push_notice("Cleared pending images.");
+                    state.push_notice("已清空待发送的图片。");
                 }
                 "image" if argument.is_empty() => {
                     let notice = state.image_list_notice();
@@ -627,28 +791,37 @@ fn handle_key(
                     state.push_notice(notice);
                 }
                 "model" => return UiAction::SelectModel(argument.to_string()),
-                "reasoning" if argument.is_empty() => {
-                    let notice = state.reasoning_list_notice();
+                "effort" if argument.is_empty() => {
+                    let notice = state.effort_list_notice();
                     state.push_notice(notice);
                 }
-                "reasoning" => {
-                    if let Some(effort) = parse_reasoning_effort(argument) {
+                "effort" => {
+                    if let Some(effort) = parse_reasoning_effort(argument)
+                        && state.reasoning_choices.contains(&effort)
+                    {
                         return UiAction::SetReasoning(effort);
                     }
+                    let choices = state
+                        .reasoning_choices
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("、");
                     state.push_error(format!(
-                        "Unknown reasoning level {argument:?}. Use off, minimal, low, medium, high, xhigh, or max."
+                        "当前模型 {} 未配置 effort {argument:?}。可选值：{choices}。",
+                        state.qualified_model()
                     ));
                 }
                 "thinking" => match argument.to_ascii_lowercase().as_str() {
-                    "" | "toggle" => state.toggle_completed_thinking(),
-                    "show" => state.set_completed_thinking_visible(true),
-                    "hide" => state.set_completed_thinking_visible(false),
-                    _ => state.push_error("Use /thinking, /thinking show, or /thinking hide."),
+                    "" | "toggle" => state.toggle_thinking(),
+                    "show" => state.set_thinking_visible(true),
+                    "hide" => state.set_thinking_visible(false),
+                    _ => state.push_error("用法：/thinking、/thinking show 或 /thinking hide"),
                 },
                 "search" if argument.is_empty() => {
                     state.push_notice(format!(
-                        "Web search: {}\nSelect with /search <disabled|cached|live>.",
-                        state.web_search_mode
+                        "网页搜索：{}\n使用 /search <disabled|cached|live> 选择。",
+                        state.web_search_mode.label_zh()
                     ));
                 }
                 "search" => {
@@ -656,7 +829,7 @@ fn handle_key(
                         return UiAction::SetWebSearch(mode);
                     }
                     state.push_error(format!(
-                        "Unknown web search mode {argument:?}. Use disabled, cached, or live."
+                        "未知的网页搜索模式 {argument:?}。可用值：disabled、cached、live。"
                     ));
                 }
                 "status" => {
@@ -664,9 +837,9 @@ fn handle_key(
                     state.push_notice(notice);
                 }
                 "help" => state.push_notice(
-                    "Commands: /model [ID], /reasoning [LEVEL], /thinking [show|hide], /search [MODE], /compact [INSTRUCTIONS], /image [PATH|clear], /status, /new, /delete, /clear, /help, /exit",
+                    "命令：/model [ID]、/effort [级别]、/thinking [show|hide]、/search [模式]、/compact [说明]、/image [路径|clear]、/status、/new、/delete、/clear、/help、/exit",
                 ),
-                _ => state.push_error(format!("Unknown command: /{name}")),
+                _ => state.push_error(format!("未知命令：/{name}")),
             }
         }
         KeyCode::Char(character)
@@ -689,6 +862,8 @@ fn handle_key(
         KeyCode::Right => state.editor.move_right(),
         KeyCode::Home => state.editor.move_home(),
         KeyCode::End => state.editor.move_end(),
+        KeyCode::Up => state.scroll_lines_up(1),
+        KeyCode::Down => state.scroll_lines_down(1),
         KeyCode::PageUp => state.scroll_up(),
         KeyCode::PageDown => state.scroll_down(),
         _ => {}
@@ -746,7 +921,7 @@ impl Editor {
             self.cursor,
             EditorItem::Paste {
                 content: text.to_string(),
-                label: format!("[Pasted Content {character_count} chars]"),
+                label: format!("[已粘贴 {character_count} 个字符]"),
             },
         );
         self.cursor += 1;
@@ -883,14 +1058,21 @@ enum ViewRole {
 enum DeleteConfirmation {
     #[default]
     None,
-    Pending,
+    Selecting(DeleteChoice),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum CompletedThinkingDisplay {
+enum DeleteChoice {
+    Yes,
     #[default]
-    Folded,
-    Expanded,
+    No,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ThinkingDisplay {
+    #[default]
+    Hidden,
+    Shown,
 }
 
 #[derive(Debug)]
@@ -915,6 +1097,7 @@ struct UiState {
     provider: Option<String>,
     api: ApiProtocol,
     reasoning_effort: ReasoningEffort,
+    default_reasoning_effort: ReasoningEffort,
     web_search_mode: WebSearchMode,
     endpoint: String,
     cwd: std::path::PathBuf,
@@ -939,7 +1122,7 @@ struct UiState {
     delete_confirmation: DeleteConfirmation,
     pending_images: Vec<ImageAttachment>,
     slash_selection: usize,
-    completed_thinking_display: CompletedThinkingDisplay,
+    thinking_display: ThinkingDisplay,
     mcp_server_count: usize,
     mcp_tool_count: usize,
     pending_approval: Option<ApprovalView>,
@@ -952,6 +1135,7 @@ impl UiState {
             provider: None,
             api: ApiProtocol::ChatCompletions,
             reasoning_effort: ReasoningEffort::Off,
+            default_reasoning_effort: ReasoningEffort::Off,
             web_search_mode: WebSearchMode::Disabled,
             endpoint,
             cwd,
@@ -962,7 +1146,7 @@ impl UiState {
             running: false,
             current_assistant: None,
             generation_start: None,
-            status: "ready".to_string(),
+            status: "就绪".to_string(),
             usage: Usage::default(),
             context_tokens: 0,
             context_window: 128_000,
@@ -976,7 +1160,7 @@ impl UiState {
             delete_confirmation: DeleteConfirmation::None,
             pending_images: Vec::new(),
             slash_selection: 0,
-            completed_thinking_display: CompletedThinkingDisplay::Folded,
+            thinking_display: ThinkingDisplay::Hidden,
             mcp_server_count: 0,
             mcp_tool_count: 0,
             pending_approval: None,
@@ -988,6 +1172,7 @@ impl UiState {
         self.provider = agent.provider().map(sanitize_terminal_text);
         self.api = agent.api();
         self.reasoning_effort = agent.reasoning_effort();
+        self.default_reasoning_effort = agent.default_reasoning_effort();
         self.web_search_mode = agent.web_search_mode();
         self.endpoint = sanitize_terminal_text(agent.endpoint());
         self.model_choices = agent.model_choices();
@@ -1011,7 +1196,7 @@ impl UiState {
                 ));
                 self.messages.push(ViewMessage {
                     role: ViewRole::User,
-                    title: "you".to_string(),
+                    title: "你".to_string(),
                     content,
                     reasoning: String::new(),
                     tool_id: None,
@@ -1020,7 +1205,7 @@ impl UiState {
             }
             MessageRole::Assistant => self.messages.push(ViewMessage {
                 role: ViewRole::Assistant,
-                title: "assistant".to_string(),
+                title: "助手".to_string(),
                 content: sanitize_terminal_text(&message.content.unwrap_or_default()),
                 reasoning: sanitize_terminal_text(&message.reasoning_content.unwrap_or_default()),
                 tool_id: None,
@@ -1028,7 +1213,7 @@ impl UiState {
             }),
             MessageRole::Tool => self.messages.push(ViewMessage {
                 role: ViewRole::Tool,
-                title: "tool".to_string(),
+                title: "工具".to_string(),
                 content: sanitize_terminal_text(&message.content.unwrap_or_default()),
                 reasoning: String::new(),
                 tool_id: message.tool_call_id,
@@ -1042,7 +1227,7 @@ impl UiState {
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
         self.messages.push(ViewMessage {
             role: ViewRole::User,
-            title: "you".to_string(),
+            title: "你".to_string(),
             content: sanitize_terminal_text(&format_user_content(prompt, images)),
             reasoning: String::new(),
             tool_id: None,
@@ -1057,7 +1242,7 @@ impl UiState {
 
     fn image_list_notice(&self) -> String {
         if self.pending_images.is_empty() {
-            return "No images are attached to the next prompt.".to_string();
+            return "下一条提示词没有附加图片。".to_string();
         }
         let names = self
             .pending_images
@@ -1065,7 +1250,7 @@ impl UiState {
             .map(|image| format!("- {}", sanitize_terminal_text(&image.name)))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("Images attached to the next prompt:\n{names}")
+        format!("下一条提示词已附加以下图片：\n{names}")
     }
 
     fn push_notice(&mut self, content: impl AsRef<str>) {
@@ -1083,7 +1268,7 @@ impl UiState {
     fn push_error(&mut self, content: impl AsRef<str>) {
         self.messages.push(ViewMessage {
             role: ViewRole::Error,
-            title: "error".to_string(),
+            title: "错误".to_string(),
             content: sanitize_terminal_text(content.as_ref()),
             reasoning: String::new(),
             tool_id: None,
@@ -1097,13 +1282,13 @@ impl UiState {
             name: sanitize_terminal_text(&request.name),
             arguments: sanitize_terminal_text(&format_tool_arguments(&request.arguments)),
         });
-        self.status = "approval required".to_string();
+        self.status = "等待审批".to_string();
     }
 
     fn clear_pending_approval(&mut self) {
         self.pending_approval = None;
-        if self.running && self.status == "approval required" {
-            self.status = "working".to_string();
+        if self.running && self.status == "等待审批" {
+            self.status = "处理中".to_string();
         }
     }
 
@@ -1112,7 +1297,7 @@ impl UiState {
         self.usage = Usage::default();
         self.context_tokens = 0;
         self.usage_estimated = false;
-        self.status = "ready".to_string();
+        self.status = "就绪".to_string();
         self.follow_tail = true;
         self.delete_confirmation = DeleteConfirmation::None;
         self.pending_images.clear();
@@ -1122,11 +1307,11 @@ impl UiState {
     fn model_list_notice(&self) -> String {
         if self.model_choices.is_empty() {
             return format!(
-                "Current model: {}\nNo models are listed in ~/.mcode/agent/models.json; /model <ID> still selects a model on the current endpoint.",
+                "当前模型：{}\n~/.mcode/agent/models.json 中没有模型列表；仍可使用 /model <ID> 选择当前端点上的模型。",
                 self.model
             );
         }
-        let mut lines = vec!["Configured models:".to_string()];
+        let mut lines = vec!["已配置的模型：".to_string()];
         for choice in &self.model_choices {
             let selected = if choice.id == self.model
                 && self.provider.as_deref() == Some(choice.provider.as_str())
@@ -1138,12 +1323,16 @@ impl UiState {
             let name = choice.name.as_deref().map_or_else(String::new, |name| {
                 format!(" ({})", sanitize_terminal_text(name))
             });
-            let reasoning = if choice.reasoning { ", reasoning" } else { "" };
+            let reasoning = if choice.reasoning {
+                "，支持思考"
+            } else {
+                ""
+            };
             let limits = if choice.max_input_tokens == choice.context_window {
-                format!("{} context/input", format_tokens(choice.context_window))
+                format!("{} 上下文/输入", format_tokens(choice.context_window))
             } else {
                 format!(
-                    "{} context, {} max input",
+                    "{} 上下文，{} 最大输入",
                     format_tokens(choice.context_window),
                     format_tokens(choice.max_input_tokens)
                 )
@@ -1157,55 +1346,73 @@ impl UiState {
                 reasoning
             ));
         }
-        lines.push("Select with /model <provider/model>.".to_string());
+        lines.push("使用 /model <提供商/模型> 选择。".to_string());
         lines.join("\n")
     }
 
-    fn reasoning_list_notice(&self) -> String {
-        let mut lines = vec!["Reasoning levels:".to_string()];
+    fn effort_list_notice(&self) -> String {
+        let mut lines = vec![format!(
+            "当前模型 {} 配置的 effort 级别：",
+            self.qualified_model()
+        )];
         for effort in &self.reasoning_choices {
             let selected = if *effort == self.reasoning_effort {
                 "*"
             } else {
                 " "
             };
-            lines.push(format!("{selected} {effort}"));
+            let default = if *effort == self.default_reasoning_effort {
+                "（默认）"
+            } else {
+                ""
+            };
+            lines.push(format!("{selected} {effort}{default}"));
         }
-        lines.push("Select with /reasoning <level>.".to_string());
+        let choices = self
+            .reasoning_choices
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+        lines.push(format!("使用 /effort <{choices}> 选择。"));
         lines.join("\n")
     }
 
-    fn toggle_completed_thinking(&mut self) {
-        let visible = self.completed_thinking_display == CompletedThinkingDisplay::Folded;
-        self.set_completed_thinking_visible(visible);
+    fn qualified_model(&self) -> String {
+        self.provider.as_deref().map_or_else(
+            || self.model.clone(),
+            |provider| format!("{provider}/{}", self.model),
+        )
     }
 
-    fn set_completed_thinking_visible(&mut self, visible: bool) {
-        self.completed_thinking_display = if visible {
-            CompletedThinkingDisplay::Expanded
+    fn toggle_thinking(&mut self) {
+        let visible = self.thinking_display == ThinkingDisplay::Hidden;
+        self.set_thinking_visible(visible);
+    }
+
+    fn set_thinking_visible(&mut self, visible: bool) {
+        self.thinking_display = if visible {
+            ThinkingDisplay::Shown
         } else {
-            CompletedThinkingDisplay::Folded
+            ThinkingDisplay::Hidden
         };
         self.follow_tail = true;
         self.push_notice(if visible {
-            "Completed thinking is expanded."
+            "已显示思考过程。"
         } else {
-            "Completed thinking is folded."
+            "已隐藏思考过程。"
         });
     }
 
     fn status_notice(&self) -> String {
-        let qualified_model = self.provider.as_deref().map_or_else(
-            || self.model.clone(),
-            |provider| format!("{provider}/{}", self.model),
-        );
+        let qualified_model = self.qualified_model();
         let estimate = if self.usage_estimated { "~" } else { "" };
         let percent = format_context_percent(self.context_tokens, self.max_input_tokens);
         format!(
-            "Model: {qualified_model}\nAPI: {}\nReasoning: {}\nWeb search: {}\nInput: {estimate}{}/{} ({percent}%)\nModel context window: {}\nTokens: {estimate}in {} out {}\nMCP: {} server(s), {} tool(s)\nEndpoint: {}\nWorking directory: {}",
+            "模型：{qualified_model}\nAPI：{}\neffort：{}\n网页搜索：{}\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
             self.api,
             self.reasoning_effort,
-            self.web_search_mode,
+            self.web_search_mode.label_zh(),
             format_tokens(self.context_tokens),
             format_tokens(self.max_input_tokens),
             format_tokens(self.context_window),
@@ -1219,9 +1426,10 @@ impl UiState {
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent) {
+        let follow_tail = self.follow_tail;
         match event {
             AgentEvent::RunStarted | AgentEvent::RunResumed => {
-                self.status = "working".to_string();
+                self.status = "处理中".to_string();
                 self.running = true;
             }
             AgentEvent::AssistantStarted => {
@@ -1243,13 +1451,13 @@ impl UiState {
                     });
                 self.messages.truncate(index + 1);
                 if let Some(assistant) = self.messages.get_mut(index) {
-                    assistant.title = format!("assistant (retry {attempt}/{max_attempts})");
+                    assistant.title = format!("助手（重试 {attempt}/{max_attempts}）");
                     assistant.content.clear();
                     assistant.reasoning.clear();
                     assistant.running = true;
                 }
                 self.current_assistant = Some(index);
-                self.status = format!("retrying response: {}", sanitize_terminal_text(&message));
+                self.status = format!("正在重试响应：{}", sanitize_terminal_text(&message));
             }
             AgentEvent::TextDelta { text } => {
                 let index = self.ensure_assistant_message();
@@ -1273,13 +1481,13 @@ impl UiState {
                 let name = sanitize_terminal_text(&name);
                 self.messages.push(ViewMessage {
                     role: ViewRole::Tool,
-                    title: format!("approval required: {name}"),
+                    title: format!("等待审批：{name}"),
                     content: arguments,
                     reasoning: String::new(),
                     tool_id: Some(id),
                     running: true,
                 });
-                self.status = "approval required".to_string();
+                self.status = "等待审批".to_string();
             }
             AgentEvent::ApprovalResolved {
                 id,
@@ -1296,11 +1504,11 @@ impl UiState {
                 {
                     message.title = if approved {
                         format!(
-                            "approved{}: {name}",
-                            if for_session { " for session" } else { "" }
+                            "已允许{}：{name}",
+                            if for_session { "（本次会话）" } else { "" }
                         )
                     } else {
-                        format!("denied: {name}")
+                        format!("已拒绝：{name}")
                     };
                     message.running = false;
                     if !approved {
@@ -1362,13 +1570,13 @@ impl UiState {
                 self.finish_current_assistant_for_tool();
                 self.messages.push(ViewMessage {
                     role: ViewRole::Tool,
-                    title: "web search".to_string(),
-                    content: "searching...".to_string(),
+                    title: "网页搜索".to_string(),
+                    content: "正在搜索...".to_string(),
                     reasoning: String::new(),
                     tool_id: Some(id),
                     running: true,
                 });
-                self.status = "searching web".to_string();
+                self.status = "正在搜索网页".to_string();
             }
             AgentEvent::WebSearchFinished { id, action } => {
                 if let Some(message) = self
@@ -1377,10 +1585,10 @@ impl UiState {
                     .rev()
                     .find(|message| message.tool_id.as_deref() == Some(id.as_str()))
                 {
-                    message.content = sanitize_terminal_text(&action.description());
+                    message.content = sanitize_terminal_text(&action.description_zh());
                     message.running = false;
                 }
-                self.status = "working".to_string();
+                self.status = "处理中".to_string();
             }
             AgentEvent::Usage {
                 usage,
@@ -1407,12 +1615,12 @@ impl UiState {
                 dropped_turns,
                 estimated_tokens,
             } => self.push_notice(format!(
-                "Context limit: omitted {dropped_messages} message(s) from {dropped_turns} earlier turn(s); estimated input is {} tokens.",
+                "达到上下文限制：已省略较早 {dropped_turns} 轮中的 {dropped_messages} 条消息；预计输入为 {} 个 token。",
                 format_tokens(estimated_tokens)
             )),
             AgentEvent::CompactionStarted { .. } => {
                 self.finish_current_assistant_for_tool();
-                self.status = "compacting".to_string();
+                self.status = "正在压缩上下文".to_string();
             }
             AgentEvent::CompactionFinished {
                 reason,
@@ -1437,34 +1645,34 @@ impl UiState {
                 self.context_tokens = tokens_after;
                 self.usage_estimated = true;
                 self.push_notice(format!(
-                    "Context compacted ({} -> {} estimated tokens).\n\n{summary}",
+                    "上下文已压缩（预计 token：{} -> {}）。\n\n{summary}",
                     format_tokens(tokens_before),
                     format_tokens(tokens_after)
                 ));
                 if reason == CompactionReason::Manual {
-                    self.finish_run("ready");
+                    self.finish_run("就绪");
                 } else {
-                    self.status = "working".to_string();
+                    self.status = "处理中".to_string();
                 }
             }
             AgentEvent::CompactionFailed { reason, message } => {
                 if reason == CompactionReason::Manual {
-                    self.finish_run("error");
-                    self.push_error(format!("Compaction failed: {message}"));
+                    self.finish_run("错误");
+                    self.push_error(format!("上下文压缩失败：{message}"));
                 } else {
-                    self.status = "working".to_string();
+                    self.status = "处理中".to_string();
                     self.push_error(format!(
-                        "Automatic compaction failed; using hard context trimming as fallback: {message}"
+                        "自动压缩失败，已回退为硬裁剪上下文：{message}"
                     ));
                 }
             }
-            AgentEvent::RunFinished => self.finish_run("ready"),
-            AgentEvent::Cancelled => self.finish_run("cancelled"),
+            AgentEvent::RunFinished => self.finish_run("就绪"),
+            AgentEvent::Cancelled => self.finish_run("已取消"),
             AgentEvent::Error { message } => {
-                self.finish_run("error");
+                self.finish_run("错误");
                 self.messages.push(ViewMessage {
                     role: ViewRole::Error,
-                    title: "error".to_string(),
+                    title: "错误".to_string(),
                     content: sanitize_terminal_text(&message),
                     reasoning: String::new(),
                     tool_id: None,
@@ -1472,7 +1680,7 @@ impl UiState {
                 });
             }
         }
-        self.follow_tail = true;
+        self.follow_tail = follow_tail;
     }
 
     fn finish_run(&mut self, status: &str) {
@@ -1489,7 +1697,7 @@ impl UiState {
     fn start_assistant_message(&mut self) -> usize {
         self.messages.push(ViewMessage {
             role: ViewRole::Assistant,
-            title: "assistant".to_string(),
+            title: "助手".to_string(),
             content: String::new(),
             reasoning: String::new(),
             tool_id: None,
@@ -1521,14 +1729,25 @@ impl UiState {
     }
 
     fn scroll_up(&mut self) {
-        self.follow_tail = false;
         let amount = self.viewport_height.saturating_sub(2).max(1);
-        self.scroll = self.scroll.saturating_sub(amount);
+        self.scroll_lines_up(amount);
     }
 
     fn scroll_down(&mut self) {
         let amount = self.viewport_height.saturating_sub(2).max(1);
-        self.scroll = (self.scroll + amount).min(self.max_scroll);
+        self.scroll_lines_down(amount);
+    }
+
+    fn scroll_lines_up(&mut self, amount: usize) {
+        self.follow_tail = false;
+        self.scroll = self.scroll.saturating_sub(amount.max(1));
+    }
+
+    fn scroll_lines_down(&mut self, amount: usize) {
+        self.scroll = self
+            .scroll
+            .saturating_add(amount.max(1))
+            .min(self.max_scroll);
         if self.scroll >= self.max_scroll {
             self.follow_tail = true;
         }
@@ -1539,7 +1758,7 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     let area = frame.area();
     if area.width < 24 || area.height < 11 {
         frame.render_widget(
-            Paragraph::new("Terminal too small")
+            Paragraph::new("终端窗口过小")
                 .style(Style::default().fg(Color::Red))
                 .block(Block::default().borders(Borders::ALL)),
             area,
@@ -1549,21 +1768,25 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
 
     let input_height = if state.pending_approval.is_some() {
         APPROVAL_HEIGHT
+    } else if state.delete_confirmation != DeleteConfirmation::None {
+        DELETE_CONFIRMATION_HEIGHT
     } else {
         state
             .editor
             .rendered_height(area.width.saturating_sub(INPUT_PREFIX_WIDTH))
             .clamp(1, MAX_INPUT_HEIGHT)
     };
-    let suggestion_count = if state.pending_approval.is_some() {
+    let suggestion_count = if state.pending_approval.is_some()
+        || state.delete_confirmation != DeleteConfirmation::None
+    {
         0
     } else {
-        slash_suggestions(&state.editor.text()).len()
+        slash_suggestions(state).len()
     };
     let reserved_height = 1_u16
         .saturating_add(3)
         .saturating_add(input_height)
-        .saturating_add(2);
+        .saturating_add(1);
     let suggestion_height = u16::try_from(suggestion_count)
         .unwrap_or(u16::MAX)
         .min(MAX_SLASH_SUGGESTIONS)
@@ -1575,7 +1798,7 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
             Constraint::Min(3),
             Constraint::Length(suggestion_height),
             Constraint::Length(input_height),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
     render_header(frame, state, areas[0]);
@@ -1603,7 +1826,7 @@ fn render_header(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("reasoning {}", state.reasoning_effort),
+            format!("effort {}", state.reasoning_effort),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("  "),
@@ -1619,29 +1842,26 @@ fn render_header(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
 
 fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
     let lines = conversation_lines(state);
-    let width = usize::from(area.width.max(1));
-    let total_height = wrapped_height(&lines, width);
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let total_height = paragraph.line_count(area.width);
     state.viewport_height = usize::from(area.height.max(1));
-    state.max_scroll = total_height.saturating_sub(state.viewport_height);
+    state.max_scroll = total_height
+        .saturating_sub(state.viewport_height)
+        .min(usize::from(u16::MAX));
     if state.follow_tail {
         state.scroll = state.max_scroll;
     } else {
         state.scroll = state.scroll.min(state.max_scroll);
     }
     let scroll = u16::try_from(state.scroll).unwrap_or(u16::MAX);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        area,
-    );
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
 fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let suggestions = slash_suggestions(&state.editor.text());
+    let suggestions = slash_suggestions(state);
     if suggestions.is_empty() {
         return;
     }
@@ -1658,14 +1878,9 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
         .enumerate()
         .skip(start)
         .take(visible)
-        .map(|(index, command)| {
+        .map(|(index, suggestion)| {
             let marker = if index == selected { "> " } else { "  " };
-            let label = if command.argument.is_empty() {
-                format!("/{}", command.name)
-            } else {
-                format!("/{} {}", command.name, command.argument)
-            };
-            let padding = " ".repeat(30_usize.saturating_sub(label.len()));
+            let padding = " ".repeat(30_usize.saturating_sub(display_width(&suggestion.label)));
             let command_style = if index == selected {
                 Style::default()
                     .fg(Color::Rgb(126, 200, 255))
@@ -1680,9 +1895,12 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
                         .fg(Color::Rgb(126, 200, 255))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(label, command_style),
+                Span::styled(suggestion.label.clone(), command_style),
                 Span::raw(padding),
-                Span::styled(command.description, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    suggestion.description.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ])
         })
         .collect::<Vec<_>>();
@@ -1695,7 +1913,7 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .title(Span::styled(
-                " approval required ",
+                " 需要审批 ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1711,14 +1929,60 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             Line::from(details),
             Line::from(vec![
                 Span::styled("[y]", Style::default().fg(Color::Green)),
-                Span::raw(" once  "),
+                Span::raw(" 允许一次  "),
                 Span::styled("[a]", Style::default().fg(Color::Yellow)),
-                Span::raw(" session  "),
+                Span::raw(" 本次会话  "),
                 Span::styled("[n]", Style::default().fg(Color::Red)),
-                Span::raw(" deny"),
+                Span::raw(" 拒绝"),
             ]),
         ];
         frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    if let DeleteConfirmation::Selecting(selection) = state.delete_confirmation {
+        let yes_style = if selection == DeleteChoice::Yes {
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let no_style = if selection == DeleteChoice::No {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let yes_marker = if selection == DeleteChoice::Yes {
+            ">"
+        } else {
+            " "
+        };
+        let no_marker = if selection == DeleteChoice::No {
+            ">"
+        } else {
+            " "
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                "删除当前对话？此操作无法撤销。",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("{yes_marker} Yes  删除并退出"),
+                yes_style,
+            )),
+            Line::from(Span::styled(format!("{no_marker} No   返回"), no_style)),
+            Line::from(Span::styled(
+                "使用方向键选择，按 Enter 确认",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
 
@@ -1764,24 +2028,19 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
-    let cwd = sanitize_terminal_text(&state.cwd.to_string_lossy());
     let estimate = if state.usage_estimated { "~" } else { "" };
     let left = format!(
-        " {estimate}in {} out {} | input {estimate}{}/{} ({}%)",
+        " {estimate}输入 {} 输出 {} | 上下文 {estimate}{}/{} ({}%)",
         format_tokens(state.usage.prompt_tokens),
         format_tokens(state.usage.completion_tokens),
         format_tokens(state.context_tokens),
         format_tokens(state.max_input_tokens),
         format_context_percent(state.context_tokens, state.max_input_tokens)
     );
-    let right = format!("{} | reasoning {} ", state.model, state.reasoning_effort);
+    let right = format!("{} | effort {} ", state.model, state.reasoning_effort);
     let footer_line = align_footer_parts(&left, &right, usize::from(area.width));
-    let lines = vec![
-        Line::from(truncate_width(&format!(" {cwd}"), usize::from(area.width))),
-        Line::from(footer_line),
-    ];
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).style(
+        Paragraph::new(footer_line).style(
             Style::default()
                 .fg(Color::DarkGray)
                 .bg(Color::Rgb(24, 27, 32)),
@@ -1815,7 +2074,7 @@ fn format_user_content(mut content: String, images: &[ImageAttachment]) -> Strin
         if !content.is_empty() {
             content.push('\n');
         }
-        content.push_str("[image: ");
+        content.push_str("[图片：");
         content.push_str(&image.name);
         content.push(']');
     }
@@ -1854,17 +2113,16 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
         if message.role == ViewRole::Assistant {
             if !message.reasoning.is_empty() {
                 let reasoning_in_progress = message.running && message.content.is_empty();
-                let show_reasoning = reasoning_in_progress
-                    || state.completed_thinking_display == CompletedThinkingDisplay::Expanded;
+                let show_reasoning = state.thinking_display == ThinkingDisplay::Shown;
                 if show_reasoning {
                     let running = if reasoning_in_progress {
-                        "  reasoning"
+                        "  思考中"
                     } else {
                         ""
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            "thinking",
+                            "思考",
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::BOLD),
@@ -1887,23 +2145,15 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                         .count()
                         + 1;
                     let character_count = message.reasoning.chars().count();
-                    let line_unit = if line_count == 1 { "line" } else { "lines" };
-                    let character_unit = if character_count == 1 {
-                        "char"
-                    } else {
-                        "chars"
-                    };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            "thinking",
+                            "思考",
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            format!(
-                                "  collapsed, {line_count} {line_unit}, {character_count} {character_unit}"
-                            ),
+                            format!("  已隐藏，{line_count} 行，{character_count} 个字符"),
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
@@ -1913,10 +2163,10 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                 }
             }
             if !message.content.is_empty() || message.reasoning.is_empty() {
-                let running = if message.running { "  responding" } else { "" };
+                let running = if message.running { "  回复中" } else { "" };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "assistant",
+                        "助手",
                         Style::default()
                             .fg(Color::Rgb(103, 232, 163))
                             .add_modifier(Modifier::BOLD),
@@ -1940,7 +2190,7 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
             ViewRole::Error => (Color::Red, Style::default().fg(Color::LightRed)),
             ViewRole::Assistant => unreachable!(),
         };
-        let running = if message.running { "  running" } else { "" };
+        let running = if message.running { "  运行中" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(
                 message.title.clone(),
@@ -1955,7 +2205,7 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "Ready.",
+            "就绪。",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1985,20 +2235,12 @@ fn append_markdownish_lines(lines: &mut Vec<Line<'static>>, content: &str, base:
     }
 }
 
-fn wrapped_height(lines: &[Line<'_>], width: usize) -> usize {
-    let width = width.max(1);
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum()
-}
-
 fn truncate_for_ui(text: &str) -> String {
     const LIMIT: usize = 4_000;
     let mut chars = text.chars();
     let prefix: String = chars.by_ref().take(LIMIT).collect();
     if chars.next().is_some() {
-        format!("{prefix}\n... output shortened in UI; full result was sent to the model")
+        format!("{prefix}\n... 界面中的输出已截短；完整结果已发送给模型")
     } else {
         prefix
     }
@@ -2025,14 +2267,15 @@ struct ScreenGuard;
 
 impl ScreenGuard {
     fn enter() -> Result<Self> {
-        enable_raw_mode().context("failed to enable raw mode")?;
+        enable_raw_mode().context("启用终端原始模式失败")?;
         execute!(
             io::stdout(),
             EnterAlternateScreen,
             EnableBracketedPaste,
+            EnableMouseCapture,
             Hide
         )
-        .context("failed to enter alternate screen")?;
+        .context("进入终端备用屏幕失败")?;
         Ok(Self)
     }
 }
@@ -2043,6 +2286,7 @@ impl Drop for ScreenGuard {
         let _ = execute!(
             io::stdout(),
             Show,
+            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
@@ -2088,7 +2332,7 @@ mod tests {
 
         assert_eq!(
             editor.text(),
-            format!("before [Pasted Content {COLLAPSED_PASTE_CHAR_THRESHOLD} chars] after")
+            format!("before [已粘贴 {COLLAPSED_PASTE_CHAR_THRESHOLD} 个字符] after")
         );
         assert_eq!(editor.take(), format!("before {pasted} after"));
     }
@@ -2104,7 +2348,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         editor.insert_paste(&pasted);
-        assert!(editor.text().contains("[Pasted Content "));
+        assert!(editor.text().contains("[已粘贴 "));
         editor.backspace();
         assert_eq!(editor.text(), "short\npaste");
     }
@@ -2118,7 +2362,7 @@ mod tests {
             std::path::PathBuf::from("."),
         );
         state.editor.insert_paste(&pasted);
-        assert!(state.editor.text().starts_with("[Pasted Content "));
+        assert!(state.editor.text().starts_with("[已粘贴 "));
 
         let action = handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -2153,7 +2397,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("[Pasted Content "));
+        assert!(rendered.replace(' ', "").contains("[已粘贴"));
         assert!(!rendered.contains("private-start"));
     }
 
@@ -2200,16 +2444,17 @@ mod tests {
         assert!(rendered.contains("test-model"));
         assert!(rendered.contains("Please inspect the project"));
         assert!(rendered.contains("I found the relevant module."));
-        assert!(rendered.contains("web search"));
+        assert!(rendered.replace(' ', "").contains("网页搜索"));
         assert!(rendered.contains("current release"));
         assert!(rendered.contains("The current release is available."));
         assert!(rendered.contains('>'));
         assert!(!rendered.contains("prompt"));
         assert!(!rendered.contains('┌'));
-        assert!(rendered.contains("/tmp/project"));
-        assert!(rendered.contains("reasoning off"));
-        assert!(rendered.contains("in 0 out 0"));
-        assert!(rendered.contains("input 0/128k"));
+        assert!(!rendered.contains("/tmp/project"));
+        assert!(rendered.contains("effort off"));
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("输入0输出0"));
+        assert!(compact.contains("上下文0/128k"));
     }
 
     #[test]
@@ -2229,11 +2474,11 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(!rendered.contains("Terminal too small"));
+        assert!(!rendered.contains("终端窗口过小"));
     }
 
     #[test]
-    fn expands_active_thinking_and_folds_it_when_the_answer_starts() {
+    fn hides_active_and_completed_thinking_by_default() {
         let mut state = UiState::new(
             "reasoning-model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
@@ -2249,9 +2494,9 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rendered = rendered_terminal(&terminal);
-        assert!(rendered.contains("thinking  reasoning"));
-        assert!(rendered.contains("Inspecting the request."));
-        assert!(!rendered.contains("collapsed"));
+        assert!(rendered.replace(' ', "").contains("思考已隐藏，2行"));
+        assert!(!rendered.contains("Inspecting the request."));
+        assert!(!rendered.contains("Checking the implementation."));
 
         state.apply_agent_event(AgentEvent::TextDelta {
             text: "Final response.".to_string(),
@@ -2261,16 +2506,17 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rendered = rendered_terminal(&terminal);
-        assert!(rendered.contains("thinking"));
-        assert!(rendered.contains("collapsed, 2 lines"));
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("思考"));
+        assert!(compact.contains("已隐藏，2行"));
         assert!(!rendered.contains("Inspecting the request."));
-        assert!(rendered.contains("assistant"));
+        assert!(compact.contains("助手"));
         assert!(rendered.contains("Final response."));
-        assert!(rendered.contains("reasoning high"));
+        assert!(rendered.contains("effort high"));
     }
 
     #[test]
-    fn thinking_command_expands_and_refolds_completed_reasoning() {
+    fn thinking_command_shows_and_hides_reasoning() {
         let mut state = UiState::new(
             "reasoning-model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
@@ -2285,6 +2531,11 @@ mod tests {
             running: false,
         });
 
+        let lines = conversation_lines(&state);
+        let rendered = lines.iter().map(Line::to_string).collect::<String>();
+        assert!(rendered.contains("思考  已隐藏"));
+        assert!(!rendered.contains("Hidden reasoning."));
+
         state.editor.insert_str("/thinking show");
         assert!(matches!(
             handle_key(
@@ -2294,10 +2545,7 @@ mod tests {
             ),
             UiAction::None
         ));
-        assert_eq!(
-            state.completed_thinking_display,
-            CompletedThinkingDisplay::Expanded
-        );
+        assert_eq!(state.thinking_display, ThinkingDisplay::Shown);
         let lines = conversation_lines(&state);
         let rendered = lines.iter().map(Line::to_string).collect::<String>();
         assert!(rendered.contains("Hidden reasoning."));
@@ -2308,13 +2556,10 @@ mod tests {
             &mut state,
             None,
         );
-        assert_eq!(
-            state.completed_thinking_display,
-            CompletedThinkingDisplay::Folded
-        );
+        assert_eq!(state.thinking_display, ThinkingDisplay::Hidden);
         let lines = conversation_lines(&state);
         let rendered = lines.iter().map(Line::to_string).collect::<String>();
-        assert!(rendered.contains("collapsed"));
+        assert!(rendered.contains("已隐藏"));
         assert!(!rendered.contains("Hidden reasoning."));
     }
 
@@ -2336,8 +2581,10 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("/model [provider/model]"));
-        assert!(rendered.contains("view or switch model"));
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("/model[提供商/模型]"));
+        assert!(compact.contains("查看或切换模型"));
+        assert!(compact.contains("/effort[级别]"));
         assert!(rendered.contains("/thinking [show|hide|toggle]"));
 
         let mut filtered = UiState::new(
@@ -2384,8 +2631,8 @@ mod tests {
             ),
             UiAction::None
         ));
-        assert_eq!(state.editor.text(), "/reasoning ");
-        assert!(slash_suggestions(&state.editor.text()).is_empty());
+        assert_eq!(state.editor.text(), "/effort ");
+        assert_eq!(slash_suggestions(&state).len(), ReasoningEffort::ALL.len());
 
         state.editor.set_text("/sta");
         assert!(matches!(
@@ -2400,13 +2647,80 @@ mod tests {
     }
 
     #[test]
+    fn completes_slash_arguments_from_runtime_choices() {
+        let mut state = UiState::new(
+            "grok-4".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.provider = Some("xai".to_string());
+        state.reasoning_choices = vec![ReasoningEffort::Low, ReasoningEffort::High];
+        state.reasoning_effort = ReasoningEffort::Low;
+        state.default_reasoning_effort = ReasoningEffort::High;
+        state.model_choices = vec![ModelChoice {
+            provider: "xai".to_string(),
+            id: "grok-4".to_string(),
+            name: Some("Grok 4".to_string()),
+            api: ApiProtocol::Responses,
+            context_window: 256_000,
+            max_input_tokens: 256_000,
+            reasoning: true,
+        }];
+
+        state.editor.set_text("/effort ");
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "/effort high");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::SetReasoning(ReasoningEffort::High)
+        ));
+
+        state.editor.set_text("/search l");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "/search live");
+
+        state.editor.set_text("/thinking s");
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "/thinking show");
+
+        state.editor.set_text("/model gro");
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "/model xai/grok-4");
+    }
+
+    #[test]
     fn slash_runtime_controls_return_independent_actions() {
         let mut state = UiState::new(
             "model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
             std::path::PathBuf::from("."),
         );
-        state.editor.insert_str("/reasoning high");
+        state.editor.insert_str("/effort high");
         let action = handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut state,
@@ -2426,6 +2740,77 @@ mod tests {
         assert!(matches!(
             action,
             UiAction::SetWebSearch(WebSearchMode::Live)
+        ));
+
+        state.editor.insert_str("/reasoning high");
+        let action = handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert!(matches!(action, UiAction::None));
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("未知命令：/reasoning")
+        );
+    }
+
+    #[test]
+    fn slash_effort_lists_and_accepts_only_the_current_model_configuration() {
+        let mut state = UiState::new(
+            "grok".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.provider = Some("xai".to_string());
+        state.reasoning_effort = ReasoningEffort::Medium;
+        state.default_reasoning_effort = ReasoningEffort::High;
+        state.reasoning_choices = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ];
+
+        state.editor.insert_str("/effort");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        let notice = &state.messages.last().unwrap().content;
+        assert!(notice.contains("xai/grok"));
+        assert!(notice.contains("* medium"));
+        assert!(notice.contains("high（默认）"));
+        assert!(notice.contains("/effort <low|medium|high>"));
+        assert!(!notice.contains("xhigh"));
+
+        state.editor.insert_str("/effort xhigh");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        let error = &state.messages.last().unwrap().content;
+        assert!(error.contains("未配置 effort \"xhigh\""));
+        assert!(error.contains("可选值：low、medium、high"));
+
+        state.editor.insert_str("/effort low");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::SetReasoning(ReasoningEffort::Low)
         ));
     }
 
@@ -2460,7 +2845,7 @@ mod tests {
                 .messages
                 .last()
                 .map(|message| message.content.as_str()),
-            Some("Unknown command: /quit")
+            Some("未知命令：/quit")
         );
     }
 
@@ -2486,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_delete_requires_a_two_step_confirmation() {
+    fn slash_delete_uses_a_keyboard_confirmation_defaulting_to_no() {
         let mut state = UiState::new(
             "model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
@@ -2501,9 +2886,43 @@ mod tests {
             ),
             UiAction::None
         ));
-        assert_eq!(state.delete_confirmation, DeleteConfirmation::Pending);
+        assert_eq!(
+            state.delete_confirmation,
+            DeleteConfirmation::Selecting(DeleteChoice::No)
+        );
 
-        state.editor.insert_str("/delete confirm");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert_eq!(state.delete_confirmation, DeleteConfirmation::None);
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("已取消删除。")
+        );
+
+        state.editor.insert_str("/delete");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(
+            state.delete_confirmation,
+            DeleteConfirmation::Selecting(DeleteChoice::Yes)
+        );
         assert!(matches!(
             handle_key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -2512,6 +2931,49 @@ mod tests {
             ),
             UiAction::DeleteSession
         ));
+        assert_eq!(state.delete_confirmation, DeleteConfirmation::None);
+    }
+
+    #[test]
+    fn scrolling_up_stays_detached_while_streaming_output_arrives() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.apply_agent_event(AgentEvent::AssistantStarted);
+        state.apply_agent_event(AgentEvent::TextDelta {
+            text: "输出行\n".repeat(80),
+        });
+        let backend = TestBackend::new(50, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert!(state.max_scroll > 0);
+        assert_eq!(state.scroll, state.max_scroll);
+
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        let scroll = state.scroll;
+        assert!(!state.follow_tail);
+        assert!(scroll < state.max_scroll);
+
+        state.apply_agent_event(AgentEvent::TextDelta {
+            text: "后续流式输出\n".repeat(10),
+        });
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert!(!state.follow_tail);
+        assert_eq!(state.scroll, scroll);
+
+        handle_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
+            &mut state,
+            None,
+        );
+        assert!(state.follow_tail);
+        assert_eq!(state.scroll, state.max_scroll);
     }
 
     #[test]
@@ -2573,10 +3035,12 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("approval required"));
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("需要审批"));
         assert!(rendered.contains("shell"));
-        assert!(rendered.contains("[y] once"));
-        assert!(rendered.contains("/tmp/project"));
+        assert!(compact.contains("[y]允许一次"));
+        assert!(!rendered.contains("/tmp/project"));
+        assert!(rendered.contains("effort off"));
     }
 
     #[test]

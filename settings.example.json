@@ -1,7 +1,6 @@
 {
   "defaultProvider": "openai-compatible",
   "defaultModel": "example-coder",
-  "defaultThinkingLevel": "high",
   "webSearch": "disabled",
   "webSearchConfig": {
     "provider": "auto",

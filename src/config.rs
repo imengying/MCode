@@ -123,6 +123,15 @@ impl WebSearchMode {
     }
 
     #[must_use]
+    pub const fn label_zh(self) -> &'static str {
+        match self {
+            Self::Disabled => "禁用",
+            Self::Cached => "缓存",
+            Self::Live => "实时",
+        }
+    }
+
+    #[must_use]
     pub const fn is_enabled(self) -> bool {
         !matches!(self, Self::Disabled)
     }
@@ -167,6 +176,7 @@ pub struct ModelProfile {
     pub max_input_tokens: u64,
     pub reasoning: bool,
     pub compat: ModelCompat,
+    default_reasoning_effort: ReasoningEffort,
     thinking_level_map: BTreeMap<ReasoningEffort, Option<String>>,
 }
 
@@ -187,6 +197,9 @@ impl ModelProfile {
         if !self.supports_reasoning(effort) {
             bail!("model {} does not support {effort} reasoning", self.id);
         }
+        if effort == ReasoningEffort::Off {
+            return Ok(None);
+        }
         match self.thinking_level_map.get(&effort) {
             Some(Some(value)) if value.trim().is_empty() => {
                 bail!(
@@ -196,8 +209,7 @@ impl ModelProfile {
             }
             Some(Some(value)) => Ok(Some(value.clone())),
             Some(None) => bail!("model {} does not support {effort} reasoning", self.id),
-            None if effort == ReasoningEffort::Off => Ok(None),
-            None => Ok(Some(effort.as_str().to_string())),
+            None => bail!("model {} does not configure {effort} reasoning", self.id),
         }
     }
 
@@ -206,19 +218,23 @@ impl ModelProfile {
         if !self.reasoning {
             return effort == ReasoningEffort::Off;
         }
-        match self.thinking_level_map.get(&effort) {
-            Some(None) => false,
-            Some(Some(_)) => true,
-            None => !matches!(effort, ReasoningEffort::Xhigh | ReasoningEffort::Max),
-        }
+        matches!(self.thinking_level_map.get(&effort), Some(Some(_)))
     }
 
     #[must_use]
     pub fn supported_reasoning_efforts(&self) -> Vec<ReasoningEffort> {
+        if !self.reasoning {
+            return vec![ReasoningEffort::Off];
+        }
         ReasoningEffort::ALL
             .into_iter()
             .filter(|effort| self.supports_reasoning(*effort))
             .collect()
+    }
+
+    #[must_use]
+    pub const fn default_reasoning_effort(&self) -> ReasoningEffort {
+        self.default_reasoning_effort
     }
 
     #[must_use]
@@ -290,8 +306,6 @@ struct SettingsFile {
     provider: Option<String>,
     #[serde(rename = "defaultModel")]
     model: Option<String>,
-    #[serde(rename = "defaultThinkingLevel")]
-    thinking_level: Option<ReasoningEffort>,
     #[serde(default, rename = "mcpServers")]
     mcp_servers: BTreeMap<String, McpServerFile>,
     #[serde(default)]
@@ -338,9 +352,6 @@ impl SettingsFile {
         }
         if other.model.is_some() {
             self.model = other.model;
-        }
-        if other.thinking_level.is_some() {
-            self.thinking_level = other.thinking_level;
         }
         if other.compaction.enabled.is_some() {
             self.compaction.enabled = other.compaction.enabled;
@@ -401,6 +412,7 @@ struct ModelFile {
     name: Option<String>,
     api: Option<String>,
     reasoning: Option<bool>,
+    default: Option<ReasoningEffort>,
     context_window: Option<u64>,
     max_input_tokens: Option<u64>,
     #[serde(default)]
@@ -505,14 +517,9 @@ impl AppConfig {
         let api = selected_profile.map_or(ApiProtocol::ChatCompletions, |profile| profile.api);
 
         let environment_reasoning = env_reasoning("OPENAI_REASONING_EFFORT").transpose()?;
-        let requested_reasoning_effort = overrides
-            .reasoning_effort
-            .or(environment_reasoning)
-            .or(settings.thinking_level)
-            .unwrap_or_default();
-        let reasoning_effort = selected_profile.map_or(requested_reasoning_effort, |profile| {
-            profile.clamp_reasoning_effort(requested_reasoning_effort)
-        });
+        let requested_reasoning_effort = overrides.reasoning_effort.or(environment_reasoning);
+        let reasoning_effort =
+            resolve_initial_reasoning_effort(selected_profile, requested_reasoning_effort);
         let reasoning_value = selected_profile.map_or_else(
             || {
                 Ok((reasoning_effort != ReasoningEffort::Off)
@@ -688,6 +695,17 @@ impl AppConfig {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+fn resolve_initial_reasoning_effort(
+    profile: Option<&ModelProfile>,
+    requested: Option<ReasoningEffort>,
+) -> ReasoningEffort {
+    match (profile, requested) {
+        (Some(profile), Some(requested)) => profile.clamp_reasoning_effort(requested),
+        (Some(profile), None) => profile.default_reasoning_effort(),
+        (None, requested) => requested.unwrap_or_default(),
     }
 }
 
@@ -929,6 +947,13 @@ fn build_model_profiles(
                 .or(model.max_input_tokens)
                 .unwrap_or(context_window);
             let compat = provider.compat.merge(model.compat);
+            let reasoning = model.reasoning.unwrap_or(false);
+            let default_reasoning_effort = model.default.with_context(|| {
+                format!(
+                    "模型 {}/{} 缺少 default；请指定默认 effort",
+                    provider_name, model.id
+                )
+            })?;
             if context_window == 0 {
                 bail!(
                     "model {}/{} has a zero contextWindow",
@@ -946,7 +971,7 @@ fn build_model_profiles(
             let supports_strict_tools = compat.strict_tools.unwrap_or_else(|| {
                 api == ApiProtocol::Responses && is_official_openai_url(&base_url)
             });
-            profiles.push(ModelProfile {
+            let profile = ModelProfile {
                 provider: provider_name.clone(),
                 id: model.id,
                 name: model.name,
@@ -955,14 +980,35 @@ fn build_model_profiles(
                 api_key,
                 context_window,
                 max_input_tokens,
-                reasoning: model.reasoning.unwrap_or(false),
+                reasoning,
                 compat: ModelCompat {
                     reasoning_effort: compat.reasoning_effort.unwrap_or(true),
                     usage_in_streaming: compat.usage_in_streaming.unwrap_or(true),
                     strict_tools: supports_strict_tools,
                 },
+                default_reasoning_effort,
                 thinking_level_map,
-            });
+            };
+            let configured_efforts = profile.supported_reasoning_efforts();
+            if profile.reasoning && configured_efforts.is_empty() {
+                bail!(
+                    "模型 {} 必须在 thinkingLevelMap 中配置至少一个非 null 等级",
+                    profile.qualified_id()
+                );
+            }
+            if !configured_efforts.contains(&profile.default_reasoning_effort) {
+                let configured = configured_efforts
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "模型 {} 的默认 effort {} 不可用；可选值：{configured}",
+                    profile.qualified_id(),
+                    profile.default_reasoning_effort
+                );
+            }
+            profiles.push(profile);
         }
     }
     Ok(profiles)
@@ -1076,7 +1122,6 @@ mod tests {
         let mut base = SettingsFile {
             provider: Some("one".into()),
             model: Some("model-one".into()),
-            thinking_level: Some(ReasoningEffort::Low),
             mcp_servers: BTreeMap::new(),
             compaction: CompactionSettingsFile::default(),
             web_search: None,
@@ -1084,12 +1129,10 @@ mod tests {
         };
         base.overlay(SettingsFile {
             model: Some("model-two".into()),
-            thinking_level: Some(ReasoningEffort::High),
             ..SettingsFile::default()
         });
         assert_eq!(base.provider.as_deref(), Some("one"));
         assert_eq!(base.model.as_deref(), Some("model-two"));
-        assert_eq!(base.thinking_level, Some(ReasoningEffort::High));
     }
 
     #[test]
@@ -1133,6 +1176,7 @@ mod tests {
                             "id": "coder",
                             "name": "Coder",
                             "reasoning": true,
+                            "default": "high",
                             "contextWindow": 200000,
                             "compat": {"supportsReasoningEffort": true},
                             "thinkingLevelMap": {"high": "high", "max": null}
@@ -1149,6 +1193,15 @@ mod tests {
         assert_eq!(profile.context_window, 200_000);
         assert!(profile.reasoning);
         assert!(profile.compat.reasoning_effort);
+        assert_eq!(profile.default_reasoning_effort(), ReasoningEffort::High);
+        assert_eq!(
+            resolve_initial_reasoning_effort(Some(profile), None),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            profile.supported_reasoning_efforts(),
+            vec![ReasoningEffort::High]
+        );
         assert!(!profile.compat.usage_in_streaming);
         assert_eq!(
             profile.reasoning_value(ReasoningEffort::High).unwrap(),
@@ -1159,6 +1212,51 @@ mod tests {
             ReasoningEffort::High
         );
         assert!(profile.reasoning_value(ReasoningEffort::Max).is_err());
+    }
+
+    #[test]
+    fn rejects_a_model_default_outside_its_configured_efforts() {
+        let file: ModelsFile = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "proxy": {
+                        "baseUrl": "https://proxy.test/v1",
+                        "api": "openai-completions",
+                        "models": [{
+                            "id": "coder",
+                            "reasoning": true,
+                            "default": "medium",
+                            "thinkingLevelMap": {"high": "high"}
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let error = build_model_profiles(file, None, None, None, None, None)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("可选值：high"));
+    }
+
+    #[test]
+    fn rejects_a_model_without_an_explicit_default_effort() {
+        let file: ModelsFile = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "proxy": {
+                        "baseUrl": "https://proxy.test/v1",
+                        "api": "openai-completions",
+                        "models": [{"id": "coder"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let error = build_model_profiles(file, None, None, None, None, None)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("缺少 default"));
     }
 
     #[test]
@@ -1197,12 +1295,12 @@ mod tests {
                         "baseUrl": "https://explicit.test/v1",
                         "api": "openai-completions",
                         "apiKey": "$MCODE_TEST_EXPLICIT_KEY_THAT_DOES_NOT_EXIST",
-                        "models": [{"id": "one"}]
+                        "models": [{"id": "one", "default": "off"}]
                     },
                     "implicit": {
                         "baseUrl": "https://implicit.test/v1",
                         "api": "openai-completions",
-                        "models": [{"id": "two"}]
+                        "models": [{"id": "two", "default": "off"}]
                     }
                 }
             }"#,
@@ -1260,6 +1358,7 @@ mod tests {
                         "api": "openai-responses",
                         "models": [{
                             "id": "gpt-test",
+                            "default": "off",
                             "contextWindow": 300000,
                             "maxInputTokens": 272000
                         }]
@@ -1330,9 +1429,10 @@ mod tests {
                     "openai": {
                         "api": "openai-responses",
                         "models": [
-                            {"id": "official-default"},
+                            {"id": "official-default", "default": "off"},
                             {
                                 "id": "official-disabled",
+                                "default": "off",
                                 "compat": {"supportsStrictTools": false}
                             }
                         ]
@@ -1340,7 +1440,7 @@ mod tests {
                     "proxy": {
                         "baseUrl": "https://proxy.test/v1",
                         "api": "openai-responses",
-                        "models": [{"id": "proxy-default"}]
+                        "models": [{"id": "proxy-default", "default": "off"}]
                     }
                 }
             }"#,
@@ -1378,6 +1478,7 @@ mod tests {
                 usage_in_streaming: true,
                 strict_tools: false,
             },
+            default_reasoning_effort: ReasoningEffort::Off,
             thinking_level_map: BTreeMap::new(),
         };
         let profiles = vec![profile("one"), profile("two")];
@@ -1410,6 +1511,7 @@ mod tests {
                 usage_in_streaming: false,
                 strict_tools: false,
             },
+            default_reasoning_effort: ReasoningEffort::High,
             thinking_level_map: map,
         };
         let mut config = AppConfig {
@@ -1463,6 +1565,7 @@ mod tests {
                 usage_in_streaming: true,
                 strict_tools: false,
             },
+            default_reasoning_effort: ReasoningEffort::Off,
             thinking_level_map: BTreeMap::new(),
         };
         assert!(profile.reasoning_value(ReasoningEffort::Medium).is_err());
@@ -1484,12 +1587,13 @@ mod tests {
             api_key: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
             max_input_tokens: DEFAULT_CONTEXT_WINDOW,
-            reasoning: true,
+            reasoning: false,
             compat: ModelCompat {
                 reasoning_effort: true,
                 usage_in_streaming: true,
                 strict_tools: false,
             },
+            default_reasoning_effort: ReasoningEffort::Off,
             thinking_level_map: BTreeMap::new(),
         };
         let profiles = [profile];

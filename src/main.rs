@@ -3,12 +3,11 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use mcode::agent::{Agent, RunStatus};
 use mcode::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
 use mcode::cli::{Cli, Command, join_prompt};
 use mcode::config::{AppConfig, ConfigOverrides, McpServerConfig, WebSearchMode};
-use mcode::event::AgentEvent;
+use mcode::event::{AgentEvent, CompactionReason};
 use mcode::protocol::{ImageAttachment, sanitize_terminal_text};
 use mcode::session::{Session, SessionMetadata};
 use tokio::sync::mpsc;
@@ -20,14 +19,14 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error:#}");
+            eprintln!("错误：{error:#}");
             ExitCode::FAILURE
         }
     }
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_localized();
     if matches!(&cli.command, Some(Command::Update)) {
         return mcode::update::run().await;
     }
@@ -89,35 +88,31 @@ async fn run() -> Result<()> {
                 mcode::ui::run_interactive(agent, prompt, images, bypass_approvals)
             } else if agent.has_pending_run() {
                 if prompt.is_some() {
-                    bail!(
-                        "this session has an interrupted run; resume it without a new prompt first"
-                    );
+                    bail!("此会话存在中断的任务；请先在不提供新提示词的情况下恢复它");
                 }
                 run_exec(agent, String::new(), Vec::new(), false, bypass_approvals).await
             } else {
                 let prompt = prompt.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "resume requires a prompt when standard input is not interactive"
-                    )
+                    anyhow::anyhow!("标准输入不是交互终端时，resume 需要提供提示词")
                 })?;
                 run_exec(agent, prompt, images, false, bypass_approvals).await
             }
         }
         Some(Command::Delete(args)) => {
             if args.force && Uuid::parse_str(&args.session).is_err() {
-                bail!("--force requires a complete session UUID");
+                bail!("--force 需要完整的会话 UUID");
             }
             if !args.force && !confirm_session_delete(&args.session)? {
-                println!("Delete cancelled.");
+                println!("已取消删除。");
                 return Ok(());
             }
             let id = Session::delete(&config.cwd, &args.session)?;
-            println!("Deleted session {id}.");
+            println!("已删除会话 {id}。");
             Ok(())
         }
         Some(Command::Sessions(args)) => list_sessions(&config, args.json),
         Some(Command::Doctor(args)) => run_doctor(&config, args.json),
-        Some(Command::Update) => unreachable!("update is handled before configuration loading"),
+        Some(Command::Update) => unreachable!("update 已在加载配置前处理"),
         None if io::stdin().is_terminal() && io::stdout().is_terminal() => {
             prepare_mcp_servers(&mut config, bypass_approvals, true);
             let session =
@@ -145,12 +140,12 @@ fn list_sessions(config: &AppConfig, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&sessions).context("failed to encode sessions as JSON")?
+            serde_json::to_string_pretty(&sessions).context("将会话编码为 JSON 失败")?
         );
         return Ok(());
     }
     if sessions.is_empty() {
-        println!("No saved sessions for {}.", config.cwd.display());
+        println!("{} 没有已保存的会话。", config.cwd.display());
         return Ok(());
     }
     for session in sessions {
@@ -166,7 +161,7 @@ fn list_sessions(config: &AppConfig, json: bool) -> Result<()> {
             |provider| format!("{provider}/{}", session.model),
         );
         println!(
-            "{}  {}  {}  {}  {} message(s), {} token(s){}\n    {}",
+            "{}  {}  {}  {}  {} 条消息，{} 个 token{}\n    {}",
             session.id,
             timestamp,
             sanitize_terminal_text(&model),
@@ -174,7 +169,7 @@ fn list_sessions(config: &AppConfig, json: bool) -> Result<()> {
             session.message_count,
             session.total_usage.total_tokens,
             if session.has_pending_run {
-                " [interrupted]"
+                " [已中断]"
             } else {
                 ""
             },
@@ -275,25 +270,81 @@ fn run_doctor(config: &AppConfig, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&checks).context("failed to encode doctor report")?
+            serde_json::to_string_pretty(&checks).context("将诊断报告编码为 JSON 失败")?
         );
     } else {
-        println!("MCode doctor");
+        println!("MCode 诊断");
         for check in &checks {
             let status = check["status"].as_str().unwrap_or("error");
             let name = check["name"].as_str().unwrap_or("unknown");
-            let detail = check["detail"]
-                .as_str()
-                .map_or_else(|| check["detail"].to_string(), ToString::to_string);
+            let detail = localized_doctor_detail(status, name, &check["detail"]);
             println!(
                 "[{}] {}: {}",
-                status.to_ascii_uppercase(),
-                sanitize_terminal_text(name),
+                localized_doctor_status(status),
+                localized_doctor_name(name),
                 sanitize_terminal_text(&detail)
             );
         }
     }
     Ok(())
+}
+
+fn localized_doctor_status(status: &str) -> &'static str {
+    match status {
+        "ok" => "正常",
+        "warning" => "警告",
+        _ => "错误",
+    }
+}
+
+fn localized_doctor_name(name: &str) -> &str {
+    match name {
+        "version" => "版本",
+        "working_directory" => "工作目录",
+        "model" => "模型",
+        "endpoint" => "端点",
+        "api_key" => "API 密钥",
+        "session_storage" => "会话存储",
+        "sessions" => "会话",
+        _ => name,
+    }
+}
+
+fn localized_doctor_detail(status: &str, name: &str, detail: &serde_json::Value) -> String {
+    match name {
+        "model" => format!(
+            "提供商 {}，模型 {}，API {}，上下文窗口 {}，最大输入 {}，网页搜索 {}",
+            detail["provider"].as_str().unwrap_or("未指定"),
+            detail["id"].as_str().unwrap_or("未知"),
+            detail["api"].as_str().unwrap_or("未知"),
+            detail["contextWindow"],
+            detail["maxInputTokens"],
+            localized_web_search_mode(detail["webSearch"].as_str().unwrap_or(""))
+        ),
+        "api_key" if detail.as_str() == Some("configured (value hidden)") => {
+            "已配置（值已隐藏）".to_string()
+        }
+        "api_key" => "未配置；仅无需身份验证的端点可正常使用".to_string(),
+        "sessions" if status == "ok" => detail
+            .as_str()
+            .and_then(|value| value.split_whitespace().next())
+            .map_or_else(
+                || detail.to_string(),
+                |count| format!("可读取 {count} 个会话"),
+            ),
+        _ => detail
+            .as_str()
+            .map_or_else(|| detail.to_string(), ToString::to_string),
+    }
+}
+
+fn localized_web_search_mode(mode: &str) -> &str {
+    match mode {
+        "disabled" => "禁用",
+        "cached" => "缓存",
+        "live" => "实时",
+        _ => "未知",
+    }
 }
 
 fn existing_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -328,7 +379,7 @@ fn prepare_mcp_servers(config: &mut AppConfig, bypass_approvals: bool, may_promp
     for server in std::mem::take(&mut config.mcp_servers) {
         let details = mcp_startup_details(&server);
         let decision = if can_prompt {
-            confirm_tool_execution(&format!("MCP server {}", server.name), &details)
+            confirm_tool_execution(&format!("MCP 服务器 {}", server.name), &details)
         } else {
             ApprovalDecision::Deny
         };
@@ -338,10 +389,7 @@ fn prepare_mcp_servers(config: &mut AppConfig, bypass_approvals: bool, may_promp
         ) {
             approved.push(server);
         } else {
-            eprintln!(
-                "MCP server {:?} disabled because startup was not approved",
-                server.name
-            );
+            eprintln!("MCP 服务器 {:?} 因启动未获批准而被禁用", server.name);
         }
     }
     config.mcp_servers = approved;
@@ -369,18 +417,16 @@ fn load_images(
 
 fn confirm_session_delete(session: &str) -> Result<bool> {
     if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
-        bail!("cannot confirm deletion without a terminal; rerun with --force and a session UUID");
+        bail!("无法在非终端环境中确认删除；请使用 --force 和完整会话 UUID 重试");
     }
-    eprintln!("Permanently delete session {session}?");
-    eprintln!("This cannot be undone.");
-    eprint!("Continue? [y/N]: ");
-    io::stderr()
-        .flush()
-        .context("failed to flush deletion prompt")?;
+    eprintln!("永久删除会话 {session}？");
+    eprintln!("此操作无法撤销。");
+    eprint!("继续？[y/N]：");
+    io::stderr().flush().context("刷新删除确认提示失败")?;
     let mut answer = String::new();
     io::stdin()
         .read_line(&mut answer)
-        .context("failed to read deletion confirmation")?;
+        .context("读取删除确认失败")?;
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
@@ -391,19 +437,19 @@ fn resolve_exec_prompt(parts: &[String]) -> Result<String> {
     if parts.is_empty() || (parts.len() == 1 && parts[0] == "-") {
         return read_stdin_prompt();
     }
-    join_prompt(parts).ok_or_else(|| anyhow::anyhow!("prompt cannot be empty"))
+    join_prompt(parts).ok_or_else(|| anyhow::anyhow!("提示词不能为空"))
 }
 
 fn read_stdin_prompt() -> Result<String> {
     if io::stdin().is_terminal() {
-        bail!("no prompt supplied; pass text or pipe a prompt on standard input");
+        bail!("未提供提示词；请传入文本或通过标准输入管道提供提示词");
     }
     let mut prompt = String::new();
     io::stdin()
         .read_to_string(&mut prompt)
-        .context("failed to read prompt from standard input")?;
+        .context("从标准输入读取提示词失败")?;
     if prompt.trim().is_empty() {
-        bail!("standard input did not contain a prompt");
+        bail!("标准输入中没有提示词");
     }
     Ok(prompt)
 }
@@ -418,7 +464,7 @@ async fn run_exec(
     let resume_pending = agent.has_pending_run();
     for failure in agent.mcp_startup_failures() {
         eprintln!(
-            "warning: MCP server {:?} disabled after startup failure: {}",
+            "警告：MCP 服务器 {:?} 启动失败，已禁用：{}",
             sanitize_terminal_text(&failure.server),
             sanitize_terminal_text(&failure.message)
         );
@@ -464,14 +510,14 @@ async fn run_exec(
         if json {
             println!(
                 "{}",
-                serde_json::to_string(&event).context("failed to encode JSON event")?
+                serde_json::to_string(&event).context("编码 JSON 事件失败")?
             );
             continue;
         }
         match event {
             AgentEvent::TextDelta { text } => {
                 print!("{}", sanitize_terminal_text(&text));
-                io::stdout().flush().context("failed to flush stdout")?;
+                io::stdout().flush().context("刷新标准输出失败")?;
                 streamed_text = true;
             }
             AgentEvent::AssistantRetrying {
@@ -484,7 +530,7 @@ async fn run_exec(
                     streamed_text = false;
                 }
                 eprintln!(
-                    "[response retry {attempt}/{max_attempts}] {}",
+                    "[响应重试 {attempt}/{max_attempts}] {}",
                     sanitize_terminal_text(&message)
                 );
             }
@@ -493,12 +539,16 @@ async fn run_exec(
                     println!();
                     streamed_text = false;
                 }
-                eprintln!("[tool] {}", sanitize_terminal_text(&name));
+                eprintln!("[工具] {}", sanitize_terminal_text(&name));
             }
             AgentEvent::ToolFinished { name, is_error, .. } => {
                 eprintln!(
                     "[{}] {}",
-                    if is_error { "tool error" } else { "tool done" },
+                    if is_error {
+                        "工具错误"
+                    } else {
+                        "工具完成"
+                    },
                     sanitize_terminal_text(&name)
                 );
             }
@@ -507,16 +557,16 @@ async fn run_exec(
                     println!();
                     streamed_text = false;
                 }
-                eprintln!("[web search] searching");
+                eprintln!("[网页搜索] 正在搜索");
             }
             AgentEvent::WebSearchFinished { action, .. } => {
                 eprintln!(
-                    "[web search done] {}",
-                    sanitize_terminal_text(&action.description())
+                    "[网页搜索完成] {}",
+                    sanitize_terminal_text(&action.description_zh())
                 );
             }
             AgentEvent::ApprovalRequested { name, .. } => {
-                eprintln!("[approval required] {}", sanitize_terminal_text(&name));
+                eprintln!("[需要审批] {}", sanitize_terminal_text(&name));
             }
             AgentEvent::ApprovalResolved {
                 name,
@@ -526,24 +576,22 @@ async fn run_exec(
             } => {
                 let result = if approved {
                     if for_session {
-                        "approved for this session"
+                        "本次会话已允许"
                     } else {
-                        "approved once"
+                        "已允许一次"
                     }
                 } else {
-                    "denied"
+                    "已拒绝"
                 };
-                eprintln!("[approval {result}] {}", sanitize_terminal_text(&name));
+                eprintln!("[审批：{result}] {}", sanitize_terminal_text(&name));
             }
             AgentEvent::ContextTrimmed {
                 dropped_messages,
                 dropped_turns,
                 ..
-            } => eprintln!(
-                "[context] omitted {dropped_messages} message(s) from {dropped_turns} earlier turn(s)"
-            ),
+            } => eprintln!("[上下文] 已省略较早 {dropped_turns} 轮中的 {dropped_messages} 条消息"),
             AgentEvent::CompactionStarted { reason } => {
-                eprintln!("[context] compaction started ({reason:?})");
+                eprintln!("[上下文] 开始压缩（{}）", compaction_reason_label(reason));
             }
             AgentEvent::CompactionFinished {
                 reason,
@@ -551,14 +599,16 @@ async fn run_exec(
                 tokens_after,
                 ..
             } => eprintln!(
-                "[context] compaction finished ({reason:?}): {tokens_before} -> {tokens_after} estimated tokens"
+                "[上下文] 压缩完成（{}）：预计 token {tokens_before} -> {tokens_after}",
+                compaction_reason_label(reason)
             ),
             AgentEvent::CompactionFailed { reason, message } => eprintln!(
-                "[context] compaction failed ({reason:?}); using hard trimming fallback: {}",
+                "[上下文] 压缩失败（{}），已回退为硬裁剪：{}",
+                compaction_reason_label(reason),
                 sanitize_terminal_text(&message)
             ),
             AgentEvent::Error { message } => {
-                eprintln!("error: {}", sanitize_terminal_text(&message));
+                eprintln!("错误：{}", sanitize_terminal_text(&message));
             }
             AgentEvent::RunFinished | AgentEvent::Cancelled if streamed_text => {
                 println!();
@@ -574,14 +624,12 @@ async fn run_exec(
         }
     }
 
-    let status = task.await.context("agent task failed")??;
+    let status = task.await.context("Agent 任务失败")??;
     if let Some(approval_task) = approval_task {
-        approval_task
-            .await
-            .context("approval handler task failed")?;
+        approval_task.await.context("审批处理任务失败")?;
     }
     if status == RunStatus::Cancelled {
-        bail!("cancelled");
+        bail!("已取消");
     }
     Ok(())
 }
@@ -606,9 +654,9 @@ async fn handle_exec_approvals(
 
 fn confirm_tool_execution(name: &str, arguments: &str) -> ApprovalDecision {
     let arguments = format_tool_arguments(arguments);
-    eprintln!("\n{name} wants to execute with:");
+    eprintln!("\n{name} 请求使用以下参数执行：");
     eprintln!("{arguments}");
-    eprint!("Allow? [y]es once / [a]lways this session / [N]o: ");
+    eprint!("是否允许？[y] 允许一次 / [a] 本次会话始终允许 / [N] 拒绝：");
     if io::stderr().flush().is_err() {
         return ApprovalDecision::Deny;
     }
@@ -620,6 +668,14 @@ fn confirm_tool_execution(name: &str, arguments: &str) -> ApprovalDecision {
         "y" | "yes" => ApprovalDecision::ApproveOnce,
         "a" | "always" => ApprovalDecision::ApproveForSession,
         _ => ApprovalDecision::Deny,
+    }
+}
+
+fn compaction_reason_label(reason: CompactionReason) -> &'static str {
+    match reason {
+        CompactionReason::Manual => "手动",
+        CompactionReason::Threshold => "达到阈值",
+        CompactionReason::Overflow => "上下文溢出",
     }
 }
 
@@ -639,5 +695,13 @@ mod tests {
         let details = mcp_startup_details(&server);
         assert!(details.contains("SECRET_TOKEN"));
         assert!(!details.contains("secret-value"));
+    }
+
+    #[test]
+    fn localizes_web_search_status_only_for_human_output() {
+        assert_eq!(WebSearchMode::Disabled.to_string(), "disabled");
+        assert_eq!(localized_web_search_mode("disabled"), "禁用");
+        assert_eq!(localized_web_search_mode("cached"), "缓存");
+        assert_eq!(localized_web_search_mode("live"), "实时");
     }
 }

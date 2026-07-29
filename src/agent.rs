@@ -43,7 +43,7 @@ pub struct Agent {
     usage_estimated: bool,
     tools: ToolRegistry,
     session: Session,
-    system_prompt: String,
+    system_prompt: Option<String>,
     max_tool_turns: usize,
     total_usage: Usage,
     approved_tools: BTreeSet<String>,
@@ -213,7 +213,7 @@ impl Agent {
 
                 let active_messages = self.session.context_messages();
                 let selection = select_context(
-                    &self.system_prompt,
+                    self.system_prompt.as_deref(),
                     &active_messages,
                     &definitions,
                     self.max_input_tokens,
@@ -721,11 +721,17 @@ impl Agent {
         )
     }
 
+    #[must_use]
+    pub fn default_reasoning_effort(&self) -> ReasoningEffort {
+        self.current_profile()
+            .map_or(ReasoningEffort::Off, ModelProfile::default_reasoning_effort)
+    }
+
     pub fn select_model(&mut self, query: &str) -> Result<()> {
         let profile =
             find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?.cloned();
         if let Some(profile) = profile {
-            let effective_effort = profile.clamp_reasoning_effort(self.reasoning_effort);
+            let effective_effort = profile.default_reasoning_effort();
             let reasoning_value = profile.reasoning_value(effective_effort)?;
             self.client.reconfigure(OpenAiModelConfig {
                 base_url: profile.base_url.clone(),
@@ -858,7 +864,9 @@ impl Agent {
     }
 
     fn estimated_context_tokens(&self) -> u64 {
-        estimate_text_tokens(&self.system_prompt)
+        self.system_prompt
+            .as_deref()
+            .map_or(0, estimate_text_tokens)
             .saturating_add(
                 self.session
                     .context_messages()
@@ -871,30 +879,20 @@ impl Agent {
     }
 }
 
-fn build_system_prompt(cwd: &Path) -> Result<String> {
+fn build_system_prompt(cwd: &Path) -> Result<Option<String>> {
     const MAX_PROJECT_INSTRUCTIONS_BYTES: u64 = 64 * 1024;
 
-    let mut prompt = format!(
-        "You are MCode, a focused coding agent running in a terminal.\n\
-         Work directly in the user's repository and complete requested changes end to end.\n\
-         Use read_file before editing unfamiliar code. Use edit_file for precise changes, \
-         write_file for new or fully replaced files, and shell for searches, builds, and tests.\n\
-         Prefer rg for text search when available. Keep changes scoped to the request.\n\
-         Never claim a command succeeded unless you observed its output.\n\
-         The working directory is {}. File tools cannot access paths outside it.",
-        cwd.display()
-    );
     let instructions_path = cwd.join("AGENTS.md");
     let metadata = match fs::symlink_metadata(&instructions_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(prompt),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to inspect {}", instructions_path.display()));
         }
     };
     if !metadata.file_type().is_file() {
-        return Ok(prompt);
+        return Ok(None);
     }
     if metadata.len() > MAX_PROJECT_INSTRUCTIONS_BYTES {
         bail!(
@@ -904,11 +902,9 @@ fn build_system_prompt(cwd: &Path) -> Result<String> {
     }
     let instructions = fs::read_to_string(&instructions_path)
         .with_context(|| format!("failed to read {}", instructions_path.display()))?;
-    if !instructions.trim().is_empty() {
-        prompt.push_str("\n\nProject instructions from AGENTS.md:\n\n");
-        prompt.push_str(instructions.trim());
-    }
-    Ok(prompt)
+    let instructions = instructions.trim();
+    Ok((!instructions.is_empty())
+        .then(|| format!("Project instructions from AGENTS.md:\n\n{instructions}")))
 }
 
 fn normalize_usage(mut usage: Usage) -> Usage {
@@ -983,7 +979,7 @@ struct ContextSelection {
 }
 
 fn select_context(
-    system_prompt: &str,
+    system_prompt: Option<&str>,
     messages: &[ChatMessage],
     definitions: &[ToolDefinition],
     max_input_tokens: u64,
@@ -996,8 +992,10 @@ fn select_context(
         .saturating_mul(INPUT_BUDGET_PERCENT)
         .checked_div(100)
         .unwrap_or_default();
-    let system = ChatMessage::system(system_prompt);
-    let base_tokens = estimate_message_tokens(&system)
+    let system = system_prompt.map(ChatMessage::system);
+    let base_tokens = system
+        .as_ref()
+        .map_or(0, estimate_message_tokens)
         .saturating_add(estimate_tool_definitions(definitions))
         .saturating_add(4);
     if base_tokens > budget {
@@ -1012,8 +1010,8 @@ fn select_context(
         .collect::<Vec<_>>();
     let full_tokens = base_tokens.saturating_add(message_tokens.iter().sum::<u64>());
     if full_tokens <= budget {
-        let mut context = Vec::with_capacity(messages.len() + 1);
-        context.push(system);
+        let mut context = Vec::with_capacity(messages.len() + usize::from(system.is_some()));
+        context.extend(system);
         context.extend_from_slice(messages);
         return Ok(ContextSelection {
             messages: context,
@@ -1026,13 +1024,16 @@ fn select_context(
     let turns = conversation_turns(messages);
     let Some(latest) = turns.last() else {
         return Ok(ContextSelection {
-            messages: vec![system],
+            messages: system.into_iter().collect(),
             dropped_messages: 0,
             dropped_turns: 0,
             estimated_tokens: base_tokens,
         });
     };
-    let trimmed_system = ChatMessage::system(format!("{system_prompt}\n\n{OMISSION_NOTICE}"));
+    let trimmed_system = ChatMessage::system(system_prompt.map_or_else(
+        || OMISSION_NOTICE.to_string(),
+        |prompt| format!("{prompt}\n\n{OMISSION_NOTICE}"),
+    ));
     let fixed_tokens = estimate_message_tokens(&trimmed_system)
         .saturating_add(estimate_tool_definitions(definitions))
         .saturating_add(4);
@@ -1110,7 +1111,7 @@ mod tests {
             ChatMessage::assistant(Some("recent answer".to_string()), None, Vec::new()),
             ChatMessage::user("current question"),
         ];
-        let selection = select_context("system", &messages, &[], 300).unwrap();
+        let selection = select_context(Some("system"), &messages, &[], 300).unwrap();
 
         assert!(selection.dropped_messages >= 2);
         assert!(selection.dropped_turns >= 1);
@@ -1130,7 +1131,7 @@ mod tests {
     #[test]
     fn context_trimming_rejects_an_oversized_current_turn() {
         let messages = vec![ChatMessage::user("x".repeat(2_000))];
-        let error = select_context("system", &messages, &[], 200)
+        let error = select_context(Some("system"), &messages, &[], 200)
             .err()
             .unwrap()
             .to_string();
@@ -1144,6 +1145,20 @@ mod tests {
     }
 
     #[test]
+    fn context_without_project_instructions_has_no_system_message() {
+        let messages = vec![ChatMessage::user("hello")];
+        let selection = select_context(None, &messages, &[], 1_000).unwrap();
+
+        assert_eq!(selection.messages, messages);
+        assert!(
+            selection
+                .messages
+                .iter()
+                .all(|message| message.role != MessageRole::System)
+        );
+    }
+
+    #[test]
     fn project_instructions_load_only_from_a_regular_agents_file() {
         let project = tempdir().unwrap();
         fs::write(
@@ -1152,14 +1167,16 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = build_system_prompt(project.path()).unwrap();
+        let prompt = build_system_prompt(project.path()).unwrap().unwrap();
         assert!(prompt.contains("Project instructions from AGENTS.md:"));
         assert!(prompt.ends_with("Keep the project sentinel intact."));
+        assert!(!prompt.contains("You are MCode"));
+        assert!(!prompt.contains(&project.path().display().to_string()));
 
         fs::remove_file(project.path().join("AGENTS.md")).unwrap();
         fs::create_dir(project.path().join("AGENTS.md")).unwrap();
         let prompt = build_system_prompt(project.path()).unwrap();
-        assert!(!prompt.contains("Project instructions from AGENTS.md:"));
+        assert!(prompt.is_none());
     }
 
     #[cfg(unix)]
@@ -1176,7 +1193,6 @@ mod tests {
         .unwrap();
 
         let prompt = build_system_prompt(project.path()).unwrap();
-        assert!(!prompt.contains("do not load me"));
-        assert!(!prompt.contains("Project instructions from AGENTS.md:"));
+        assert!(prompt.is_none());
     }
 }

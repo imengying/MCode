@@ -241,6 +241,26 @@ impl WebSearchAction {
             Self::Other => "web search completed".to_string(),
         }
     }
+
+    #[must_use]
+    pub fn description_zh(&self) -> String {
+        match self {
+            Self::Search { query, queries } => query
+                .clone()
+                .or_else(|| (!queries.is_empty()).then(|| queries.join("、")))
+                .unwrap_or_else(|| "搜索完成".to_string()),
+            Self::OpenPage { url } => url
+                .as_deref()
+                .map_or_else(|| "已打开页面".to_string(), |url| format!("已打开 {url}")),
+            Self::FindInPage { url, pattern } => match (pattern, url) {
+                (Some(pattern), Some(url)) => format!("在 {url} 中找到 {pattern:?}"),
+                (Some(pattern), None) => format!("在页面中找到 {pattern:?}"),
+                (None, Some(url)) => format!("已在 {url} 中搜索"),
+                (None, None) => "已在页面内搜索".to_string(),
+            },
+            Self::Other => "网页搜索完成".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -282,6 +302,14 @@ mod tests {
             sanitize_terminal_text("safe\u{1b}]52;c;secret\u{7}\r\ntext\tend"),
             "safe]52;c;secret\n\ntext\tend"
         );
+    }
+
+    #[test]
+    fn localizes_web_search_action_descriptions() {
+        let action = WebSearchAction::OpenPage {
+            url: Some("https://example.com".to_string()),
+        };
+        assert_eq!(action.description_zh(), "已打开 https://example.com");
     }
 }
 

@@ -1472,6 +1472,28 @@ mod tests {
     }
 
     #[test]
+    fn omits_empty_instructions_from_responses_requests() {
+        let (instructions, input) = responses_input(&[ChatMessage::user("hello")]).unwrap();
+        let request = ResponsesRequest {
+            model: "test-model",
+            instructions: &instructions,
+            input: &input,
+            tools: &[],
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            max_output_tokens: None,
+            include: None,
+            store: false,
+            stream: true,
+        };
+
+        let encoded = serde_json::to_value(request).unwrap();
+        assert!(encoded.get("instructions").is_none());
+        assert_eq!(encoded["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
     fn responses_tools_follow_codex_web_search_modes() {
         let mut settings = WebSearchSettings {
             mode: WebSearchMode::Cached,
