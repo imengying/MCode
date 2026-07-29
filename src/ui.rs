@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +13,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use pulldown_cmark::{
+    Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions, Parser, Tag, TagEnd,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,21 +25,33 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
+use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents, get_mime_types};
 
 use crate::agent::{Agent, ModelChoice};
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
 use crate::config::{ApiProtocol, ReasoningEffort, WebSearchMode};
 use crate::event::{AgentEvent, CompactionReason};
-use crate::protocol::{ChatMessage, ImageAttachment, MessageRole, Usage, sanitize_terminal_text};
+use crate::protocol::{
+    ChatMessage, ImageAttachment, MAX_IMAGE_BYTES, MessageRole, Usage, sanitize_terminal_text,
+};
 
-const APPROVAL_HEIGHT: u16 = 5;
+const APPROVAL_HEIGHT: u16 = 6;
 const DELETE_CONFIRMATION_HEIGHT: u16 = 5;
 const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
 const INPUT_PREFIX_WIDTH: u16 = 2;
 const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
+const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
+const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
+const TOOL_PREVIEW_LINE_CHARS: usize = 240;
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
+    ("image/png", "png"),
+    ("image/jpeg", "jpg"),
+    ("image/gif", "gif"),
+    ("image/webp", "webp"),
+];
 
 pub fn run_interactive(
     agent: Agent,
@@ -231,14 +246,7 @@ pub fn run_interactive(
                         },
                         Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
-                    UiAction::AttachImage(path) => match ImageAttachment::load(&path, &state.cwd) {
-                        Ok(image) => {
-                            let name = image.name.clone();
-                            state.pending_images.push(image);
-                            state.push_notice(format!("已将 {name} 附加到下一条提示词。"));
-                        }
-                        Err(error) => state.push_error(format!("{error:#}")),
-                    },
+                    UiAction::PasteClipboard => paste_from_clipboard(&mut state),
                     UiAction::ResolveApproval(decision) => {
                         if let Some(request) = pending_approval.take() {
                             request.resolve(decision);
@@ -251,8 +259,7 @@ pub fn run_interactive(
                 if state.pending_approval.is_none()
                     && state.delete_confirmation == DeleteConfirmation::None =>
             {
-                state.editor.insert_paste(&text);
-                state.slash_selection = 0;
+                paste_text_or_image(&mut state, &text);
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => state.scroll_lines_up(3),
@@ -361,7 +368,7 @@ enum UiAction {
     Compact(String),
     NewSession,
     DeleteSession,
-    AttachImage(PathBuf),
+    PasteClipboard,
     ResolveApproval(ApprovalDecision),
 }
 
@@ -404,11 +411,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "compact",
         accepts_argument: true,
         description: "压缩当前上下文",
-    },
-    SlashCommand {
-        name: "image",
-        accepts_argument: true,
-        description: "管理下一条提示词的图片",
     },
     SlashCommand {
         name: "status",
@@ -555,11 +557,6 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                 description: mode.label_zh().to_string(),
             })
             .collect(),
-        "image" if "clear".starts_with(&query) => vec![SlashSuggestion {
-            label: "/image clear".to_string(),
-            replacement: "/image clear".to_string(),
-            description: "清空待发送图片".to_string(),
-        }],
         _ => Vec::new(),
     }
 }
@@ -576,15 +573,6 @@ fn complete_slash_suggestion(state: &mut UiState) -> bool {
     state.editor.set_text(&suggestion.replacement);
     state.slash_selection = 0;
     true
-}
-
-fn complete_slash_on_enter(text: &str, suggestion: &SlashSuggestion) -> bool {
-    if text == suggestion.replacement {
-        return false;
-    }
-    slash_input(text).is_some_and(|(name, argument)| {
-        argument.is_some() || !SLASH_COMMANDS.iter().any(|command| command.name == name)
-    })
 }
 
 fn handle_key(
@@ -614,11 +602,31 @@ fn handle_key(
             return UiAction::None;
         }
         return match key.code {
-            KeyCode::Char('y' | 'Y') => UiAction::ResolveApproval(ApprovalDecision::ApproveOnce),
-            KeyCode::Char('a' | 'A') => {
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(approval) = state.pending_approval.as_mut() {
+                    approval.selection = approval.selection.previous();
+                }
+                UiAction::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(approval) = state.pending_approval.as_mut() {
+                    approval.selection = approval.selection.next();
+                }
+                UiAction::None
+            }
+            KeyCode::Enter => state
+                .pending_approval
+                .as_ref()
+                .map_or(UiAction::None, |approval| {
+                    UiAction::ResolveApproval(approval.selection.decision())
+                }),
+            KeyCode::Char('1' | 'y' | 'Y') => {
+                UiAction::ResolveApproval(ApprovalDecision::ApproveOnce)
+            }
+            KeyCode::Char('2' | 'a' | 'A') => {
                 UiAction::ResolveApproval(ApprovalDecision::ApproveForSession)
             }
-            KeyCode::Char('n' | 'N') => UiAction::ResolveApproval(ApprovalDecision::Deny),
+            KeyCode::Char('3' | 'n' | 'N') => UiAction::ResolveApproval(ApprovalDecision::Deny),
             _ => UiAction::None,
         };
     }
@@ -678,6 +686,7 @@ fn handle_key(
                 state.editor.insert('\n');
                 return UiAction::None;
             }
+            KeyCode::Char('v') => return UiAction::PasteClipboard,
             KeyCode::Home => {
                 state.scroll_lines_up(usize::MAX);
                 return UiAction::None;
@@ -712,15 +721,9 @@ fn handle_key(
                 complete_slash_suggestion(state);
                 return UiAction::None;
             }
-            KeyCode::Enter
-                if suggestions
-                    .get(state.slash_selection)
-                    .is_some_and(|suggestion| {
-                        complete_slash_on_enter(&state.editor.text(), suggestion)
-                    }) =>
-            {
+            KeyCode::Enter if !state.running => {
                 complete_slash_suggestion(state);
-                return UiAction::None;
+                return submit_editor(state);
             }
             _ => {}
         }
@@ -740,102 +743,7 @@ fn handle_key(
             state.editor.insert('\n');
         }
         KeyCode::Enter if !state.running => {
-            state.slash_selection = 0;
-            let prompt = state.editor.take();
-            if prompt.trim().is_empty() {
-                return UiAction::None;
-            }
-            let trimmed = prompt.trim();
-            let Some(command) = trimmed.strip_prefix('/') else {
-                state.delete_confirmation = DeleteConfirmation::None;
-                return UiAction::Submit {
-                    prompt,
-                    images: state.take_pending_images(),
-                };
-            };
-            let (name, argument) = command
-                .split_once(char::is_whitespace)
-                .map_or((command, ""), |(name, argument)| (name, argument.trim()));
-            if name != "delete" {
-                state.delete_confirmation = DeleteConfirmation::None;
-            }
-            match name {
-                "exit" => return UiAction::Quit,
-                "clear" => {
-                    state.messages.clear();
-                    state.follow_tail = true;
-                }
-                "new" => return UiAction::NewSession,
-                "compact" => return UiAction::Compact(argument.to_string()),
-                "delete" if argument.is_empty() => {
-                    state.delete_confirmation =
-                        DeleteConfirmation::Selecting(DeleteChoice::No);
-                }
-                "delete" => state.push_error("用法：/delete"),
-                "image" if argument.eq_ignore_ascii_case("clear") => {
-                    state.pending_images.clear();
-                    state.push_notice("已清空待发送的图片。");
-                }
-                "image" if argument.is_empty() => {
-                    let notice = state.image_list_notice();
-                    state.push_notice(notice);
-                }
-                "image" => return UiAction::AttachImage(PathBuf::from(argument)),
-                "model" if argument.is_empty() => {
-                    let notice = state.model_list_notice();
-                    state.push_notice(notice);
-                }
-                "model" => return UiAction::SelectModel(argument.to_string()),
-                "effort" if argument.is_empty() => {
-                    let notice = state.effort_list_notice();
-                    state.push_notice(notice);
-                }
-                "effort" => {
-                    if let Some(effort) = parse_reasoning_effort(argument)
-                        && state.reasoning_choices.contains(&effort)
-                    {
-                        return UiAction::SetReasoning(effort);
-                    }
-                    let choices = state
-                        .reasoning_choices
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("、");
-                    state.push_error(format!(
-                        "当前模型 {} 未配置 effort {argument:?}。可选值：{choices}。",
-                        state.qualified_model()
-                    ));
-                }
-                "thinking" => match argument.to_ascii_lowercase().as_str() {
-                    "" | "toggle" => state.toggle_thinking(),
-                    "show" => state.set_thinking_visible(true),
-                    "hide" => state.set_thinking_visible(false),
-                    _ => state.push_error("用法：/thinking、/thinking show 或 /thinking hide"),
-                },
-                "search" if argument.is_empty() => {
-                    state.push_notice(format!(
-                        "网页搜索：{}\n使用 /search <disabled|cached|live> 选择。",
-                        state.web_search_mode.label_zh()
-                    ));
-                }
-                "search" => {
-                    if let Some(mode) = parse_web_search_mode(argument) {
-                        return UiAction::SetWebSearch(mode);
-                    }
-                    state.push_error(format!(
-                        "未知的网页搜索模式 {argument:?}。可用值：disabled、cached、live。"
-                    ));
-                }
-                "status" => {
-                    let notice = state.status_notice();
-                    state.push_notice(notice);
-                }
-                "help" => state.push_notice(
-                    "命令：/model [ID]、/effort [级别]、/thinking [show|hide]、/search [模式]、/compact [说明]、/image [路径|clear]、/status、/new、/delete、/clear、/help、/exit",
-                ),
-                _ => state.push_error(format!("未知命令：/{name}")),
-            }
+            return submit_editor(state);
         }
         KeyCode::Char(character)
             if !key
@@ -846,7 +754,13 @@ fn handle_key(
             state.slash_selection = 0;
         }
         KeyCode::Backspace => {
-            state.editor.backspace();
+            if state.editor.is_empty() {
+                if state.pending_images.pop().is_some() {
+                    state.status = attachment_status(state.pending_images.len());
+                }
+            } else {
+                state.editor.backspace();
+            }
             state.slash_selection = 0;
         }
         KeyCode::Delete => {
@@ -864,6 +778,224 @@ fn handle_key(
         _ => {}
     }
     UiAction::None
+}
+
+fn submit_editor(state: &mut UiState) -> UiAction {
+    state.slash_selection = 0;
+    let prompt = state.editor.take();
+    if prompt.trim().is_empty() {
+        return UiAction::None;
+    }
+    let trimmed = prompt.trim();
+    let Some(command) = trimmed.strip_prefix('/') else {
+        state.delete_confirmation = DeleteConfirmation::None;
+        return UiAction::Submit {
+            prompt,
+            images: state.take_pending_images(),
+        };
+    };
+    let (name, argument) = command
+        .split_once(char::is_whitespace)
+        .map_or((command, ""), |(name, argument)| (name, argument.trim()));
+    if name != "delete" {
+        state.delete_confirmation = DeleteConfirmation::None;
+    }
+    match name {
+        "exit" => UiAction::Quit,
+        "clear" => {
+            state.messages.clear();
+            state.follow_tail = true;
+            UiAction::None
+        }
+        "new" => UiAction::NewSession,
+        "compact" => UiAction::Compact(argument.to_string()),
+        "delete" if argument.is_empty() => {
+            state.delete_confirmation = DeleteConfirmation::Selecting(DeleteChoice::No);
+            UiAction::None
+        }
+        "delete" => {
+            state.push_error("用法：/delete");
+            UiAction::None
+        }
+        "model" if argument.is_empty() => {
+            let notice = state.model_list_notice();
+            state.push_notice(notice);
+            UiAction::None
+        }
+        "model" => UiAction::SelectModel(argument.to_string()),
+        "effort" if argument.is_empty() => {
+            let notice = state.effort_list_notice();
+            state.push_notice(notice);
+            UiAction::None
+        }
+        "effort" => {
+            if let Some(effort) = parse_reasoning_effort(argument)
+                && state.reasoning_choices.contains(&effort)
+            {
+                return UiAction::SetReasoning(effort);
+            }
+            let choices = state
+                .reasoning_choices
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("、");
+            state.push_error(format!(
+                "当前模型 {} 未配置 effort {argument:?}。可选值：{choices}。",
+                state.qualified_model()
+            ));
+            UiAction::None
+        }
+        "thinking" => {
+            match argument.to_ascii_lowercase().as_str() {
+                "" | "toggle" => state.toggle_thinking(),
+                "show" => state.set_thinking_visible(true),
+                "hide" => state.set_thinking_visible(false),
+                _ => state.push_error("用法：/thinking、/thinking show 或 /thinking hide"),
+            }
+            UiAction::None
+        }
+        "search" if argument.is_empty() => {
+            state.push_notice(format!(
+                "网页搜索：{}\n使用 /search <disabled|cached|live> 选择。",
+                state.web_search_mode.label_zh()
+            ));
+            UiAction::None
+        }
+        "search" => {
+            if let Some(mode) = parse_web_search_mode(argument) {
+                return UiAction::SetWebSearch(mode);
+            }
+            state.push_error(format!(
+                "未知的网页搜索模式 {argument:?}。可用值：disabled、cached、live。"
+            ));
+            UiAction::None
+        }
+        "status" => {
+            let notice = state.status_notice();
+            state.push_notice(notice);
+            UiAction::None
+        }
+        "help" => {
+            state.push_notice(
+                "命令：/model [ID]、/effort [级别]、/thinking [show|hide]、/search [模式]、/compact [说明]、/status、/new、/delete、/clear、/help、/exit",
+            );
+            UiAction::None
+        }
+        _ => {
+            state.push_error(format!("未知命令：/{name}"));
+            UiAction::None
+        }
+    }
+}
+
+fn paste_from_clipboard(state: &mut UiState) {
+    let clipboard = ClipboardType::Regular;
+    let seat = Seat::Unspecified;
+    let mime_types = match get_mime_types(clipboard, seat) {
+        Ok(mime_types) => mime_types,
+        Err(error) => {
+            state.push_error(format!("无法访问 Wayland 剪贴板：{error}"));
+            return;
+        }
+    };
+
+    if let Some(&(mime_type, extension)) = CLIPBOARD_IMAGE_TYPES
+        .iter()
+        .find(|(mime_type, _)| mime_types.contains(*mime_type))
+    {
+        let (reader, _) = match get_contents(clipboard, seat, MimeType::Specific(mime_type)) {
+            Ok(contents) => contents,
+            Err(error) => {
+                state.push_error(format!("无法读取 Wayland 剪贴板图片：{error}"));
+                return;
+            }
+        };
+        let bytes = match read_limited(reader, MAX_IMAGE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                state.push_error(format!("无法读取 Wayland 剪贴板图片：{error}"));
+                return;
+            }
+        };
+        let name = format!("clipboard-{}.{}", state.pending_images.len() + 1, extension);
+        match ImageAttachment::from_encoded_bytes(name, bytes) {
+            Ok(image) => attach_image(state, image),
+            Err(error) => state.push_error(format!("无法附加剪贴板图片：{error:#}")),
+        }
+        return;
+    }
+
+    let (reader, _) = match get_contents(clipboard, seat, MimeType::Text) {
+        Ok(contents) => contents,
+        Err(error) => {
+            state.push_error(format!("Wayland 剪贴板中没有可粘贴的图片或文本：{error}"));
+            return;
+        }
+    };
+    match read_limited(reader, MAX_IMAGE_BYTES).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }) {
+        Ok(text) if !text.is_empty() => paste_text_or_image(state, &text),
+        Ok(_) => state.push_error("Wayland 剪贴板为空。"),
+        Err(error) => state.push_error(format!("无法读取 Wayland 剪贴板文本：{error}")),
+    }
+}
+
+fn read_limited(reader: impl io::Read, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "剪贴板内容超过 20 MiB 限制",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn paste_text_or_image(state: &mut UiState, text: &str) {
+    let image =
+        pasted_image_path(text).and_then(|path| ImageAttachment::load(&path, &state.cwd).ok());
+    if let Some(image) = image {
+        attach_image(state, image);
+    } else {
+        state.editor.insert_paste(text);
+    }
+    state.slash_selection = 0;
+}
+
+fn pasted_image_path(text: &str) -> Option<PathBuf> {
+    if text.contains(['\r', '\n', '\0']) {
+        return None;
+    }
+    let value = text.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = match value.as_bytes() {
+        [b'\'', .., b'\''] | [b'"', .., b'"'] if value.len() >= 2 => &value[1..value.len() - 1],
+        _ => value,
+    };
+    if value.starts_with("file://") {
+        return url::Url::parse(value).ok()?.to_file_path().ok();
+    }
+    Some(PathBuf::from(value))
+}
+
+fn attach_image(state: &mut UiState, image: ImageAttachment) {
+    state.pending_images.push(image);
+    state.status = attachment_status(state.pending_images.len());
+}
+
+fn attachment_status(count: usize) -> String {
+    if count == 0 {
+        "就绪".to_string()
+    } else {
+        format!("已附加 {count} 张图片")
+    }
 }
 
 fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
@@ -1076,6 +1208,7 @@ struct ViewMessage {
     title: String,
     content: String,
     reasoning: String,
+    tool_arguments: Option<String>,
     tool_id: Option<String>,
     running: bool,
 }
@@ -1084,6 +1217,39 @@ struct ViewMessage {
 struct ApprovalView {
     name: String,
     arguments: String,
+    selection: ApprovalChoice,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ApprovalChoice {
+    #[default]
+    ApproveOnce,
+    ApproveForSession,
+    Deny,
+}
+
+impl ApprovalChoice {
+    fn previous(self) -> Self {
+        match self {
+            Self::ApproveOnce | Self::ApproveForSession => Self::ApproveOnce,
+            Self::Deny => Self::ApproveForSession,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::ApproveOnce => Self::ApproveForSession,
+            Self::ApproveForSession | Self::Deny => Self::Deny,
+        }
+    }
+
+    fn decision(self) -> ApprovalDecision {
+        match self {
+            Self::ApproveOnce => ApprovalDecision::ApproveOnce,
+            Self::ApproveForSession => ApprovalDecision::ApproveForSession,
+            Self::Deny => ApprovalDecision::Deny,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1191,29 +1357,66 @@ impl UiState {
                 ));
                 self.messages.push(ViewMessage {
                     role: ViewRole::User,
-                    title: "你".to_string(),
+                    title: String::new(),
                     content,
                     reasoning: String::new(),
+                    tool_arguments: None,
                     tool_id: None,
                     running: false,
                 });
             }
-            MessageRole::Assistant => self.messages.push(ViewMessage {
-                role: ViewRole::Assistant,
-                title: "助手".to_string(),
-                content: sanitize_terminal_text(&message.content.unwrap_or_default()),
-                reasoning: sanitize_terminal_text(&message.reasoning_content.unwrap_or_default()),
-                tool_id: None,
-                running: false,
-            }),
-            MessageRole::Tool => self.messages.push(ViewMessage {
-                role: ViewRole::Tool,
-                title: "工具".to_string(),
-                content: sanitize_terminal_text(&message.content.unwrap_or_default()),
-                reasoning: String::new(),
-                tool_id: message.tool_call_id,
-                running: false,
-            }),
+            MessageRole::Assistant => {
+                let content = sanitize_terminal_text(&message.content.unwrap_or_default());
+                let reasoning =
+                    sanitize_terminal_text(&message.reasoning_content.unwrap_or_default());
+                if !content.is_empty() || !reasoning.is_empty() {
+                    self.messages.push(ViewMessage {
+                        role: ViewRole::Assistant,
+                        title: String::new(),
+                        content,
+                        reasoning,
+                        tool_arguments: None,
+                        tool_id: None,
+                        running: false,
+                    });
+                }
+                for call in message.tool_calls {
+                    let name = sanitize_terminal_text(&call.function.name);
+                    self.messages.push(ViewMessage {
+                        role: ViewRole::Tool,
+                        title: name.clone(),
+                        content: String::new(),
+                        reasoning: String::new(),
+                        tool_arguments: Some(format_tool_input(&name, &call.function.arguments)),
+                        tool_id: Some(call.id),
+                        running: false,
+                    });
+                }
+            }
+            MessageRole::Tool => {
+                let tool_id = message.tool_call_id;
+                let content = truncate_for_ui(&sanitize_terminal_text(
+                    &message.content.unwrap_or_default(),
+                ));
+                if let Some(existing) = tool_id.as_deref().and_then(|id| {
+                    self.messages
+                        .iter_mut()
+                        .rev()
+                        .find(|view| view.tool_id.as_deref() == Some(id))
+                }) {
+                    existing.content = content;
+                } else {
+                    self.messages.push(ViewMessage {
+                        role: ViewRole::Tool,
+                        title: "工具".to_string(),
+                        content,
+                        reasoning: String::new(),
+                        tool_arguments: None,
+                        tool_id,
+                        running: false,
+                    });
+                }
+            }
         }
         self.follow_tail = true;
         self.delete_confirmation = DeleteConfirmation::None;
@@ -1222,9 +1425,10 @@ impl UiState {
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
         self.messages.push(ViewMessage {
             role: ViewRole::User,
-            title: "你".to_string(),
+            title: String::new(),
             content: sanitize_terminal_text(&format_user_content(prompt, images)),
             reasoning: String::new(),
+            tool_arguments: None,
             tool_id: None,
             running: false,
         });
@@ -1235,25 +1439,13 @@ impl UiState {
         std::mem::take(&mut self.pending_images)
     }
 
-    fn image_list_notice(&self) -> String {
-        if self.pending_images.is_empty() {
-            return "下一条提示词没有附加图片。".to_string();
-        }
-        let names = self
-            .pending_images
-            .iter()
-            .map(|image| format!("- {}", sanitize_terminal_text(&image.name)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("下一条提示词已附加以下图片：\n{names}")
-    }
-
     fn push_notice(&mut self, content: impl AsRef<str>) {
         self.messages.push(ViewMessage {
             role: ViewRole::Notice,
             title: "MCode".to_string(),
             content: sanitize_terminal_text(content.as_ref()),
             reasoning: String::new(),
+            tool_arguments: None,
             tool_id: None,
             running: false,
         });
@@ -1266,6 +1458,7 @@ impl UiState {
             title: "错误".to_string(),
             content: sanitize_terminal_text(content.as_ref()),
             reasoning: String::new(),
+            tool_arguments: None,
             tool_id: None,
             running: false,
         });
@@ -1273,9 +1466,11 @@ impl UiState {
     }
 
     fn set_pending_approval(&mut self, request: &ApprovalRequest) {
+        let name = sanitize_terminal_text(&request.name);
         self.pending_approval = Some(ApprovalView {
-            name: sanitize_terminal_text(&request.name),
-            arguments: sanitize_terminal_text(&format_tool_arguments(&request.arguments)),
+            arguments: format_tool_input(&name, &request.arguments),
+            name,
+            selection: ApprovalChoice::default(),
         });
         self.status = "等待审批".to_string();
     }
@@ -1446,13 +1641,16 @@ impl UiState {
                     });
                 self.messages.truncate(index + 1);
                 if let Some(assistant) = self.messages.get_mut(index) {
-                    assistant.title = format!("助手（重试 {attempt}/{max_attempts}）");
+                    assistant.title.clear();
                     assistant.content.clear();
                     assistant.reasoning.clear();
                     assistant.running = true;
                 }
                 self.current_assistant = Some(index);
-                self.status = format!("正在重试响应：{}", sanitize_terminal_text(&message));
+                self.status = format!(
+                    "正在重试响应（{attempt}/{max_attempts}）：{}",
+                    sanitize_terminal_text(&message)
+                );
             }
             AgentEvent::TextDelta { text } => {
                 let index = self.ensure_assistant_message();
@@ -1472,13 +1670,13 @@ impl UiState {
                 arguments,
             } => {
                 self.finish_current_assistant_for_tool();
-                let arguments = sanitize_terminal_text(&format_tool_arguments(&arguments));
                 let name = sanitize_terminal_text(&name);
                 self.messages.push(ViewMessage {
                     role: ViewRole::Tool,
                     title: format!("等待审批：{name}"),
-                    content: arguments,
+                    content: String::new(),
                     reasoning: String::new(),
+                    tool_arguments: Some(format_tool_input(&name, &arguments)),
                     tool_id: Some(id),
                     running: true,
                 });
@@ -1518,8 +1716,8 @@ impl UiState {
                 arguments,
             } => {
                 self.finish_current_assistant_for_tool();
-                let arguments = sanitize_terminal_text(&format_tool_arguments(&arguments));
                 let name = sanitize_terminal_text(&name);
+                let arguments = format_tool_input(&name, &arguments);
                 if let Some(message) = self
                     .messages
                     .iter_mut()
@@ -1528,14 +1726,16 @@ impl UiState {
                 {
                     message.role = ViewRole::Tool;
                     message.title = name;
-                    message.content = arguments;
+                    message.content.clear();
+                    message.tool_arguments = Some(arguments);
                     message.running = true;
                 } else {
                     self.messages.push(ViewMessage {
                         role: ViewRole::Tool,
                         title: name,
-                        content: arguments,
+                        content: String::new(),
                         reasoning: String::new(),
+                        tool_arguments: Some(arguments),
                         tool_id: Some(id),
                         running: true,
                     });
@@ -1568,6 +1768,7 @@ impl UiState {
                     title: "网页搜索".to_string(),
                     content: "正在搜索...".to_string(),
                     reasoning: String::new(),
+                    tool_arguments: None,
                     tool_id: Some(id),
                     running: true,
                 });
@@ -1670,6 +1871,7 @@ impl UiState {
                     title: "错误".to_string(),
                     content: sanitize_terminal_text(&message),
                     reasoning: String::new(),
+                    tool_arguments: None,
                     tool_id: None,
                     running: false,
                 });
@@ -1692,9 +1894,10 @@ impl UiState {
     fn start_assistant_message(&mut self) -> usize {
         self.messages.push(ViewMessage {
             role: ViewRole::Assistant,
-            title: "助手".to_string(),
+            title: String::new(),
             content: String::new(),
             reasoning: String::new(),
+            tool_arguments: None,
             tool_id: None,
             running: true,
         });
@@ -1766,10 +1969,11 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     } else if state.delete_confirmation != DeleteConfirmation::None {
         DELETE_CONFIRMATION_HEIGHT
     } else {
-        state
+        let editor_height = state
             .editor
             .rendered_height(area.width.saturating_sub(INPUT_PREFIX_WIDTH))
-            .clamp(1, MAX_INPUT_HEIGHT)
+            .clamp(1, MAX_INPUT_HEIGHT);
+        editor_height.saturating_add(u16::from(!state.pending_images.is_empty()))
     };
     let suggestion_count = if state.pending_approval.is_some()
         || state.delete_confirmation != DeleteConfirmation::None
@@ -1805,7 +2009,11 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
 
 fn render_header(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     let spinner = ["-", "\\", "|", "/"][state.spinner_frame % 4];
-    let activity = if state.running { spinner } else { " " };
+    let (activity, activity_color) = if state.running {
+        (spinner, Color::Yellow)
+    } else {
+        ("•", Color::Rgb(103, 232, 163))
+    };
     let line = Line::from(vec![
         Span::styled(
             " MCode ",
@@ -1815,19 +2023,16 @@ fn render_header(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(
-            state.model.clone(),
-            Style::default().fg(Color::Rgb(126, 200, 255)),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("effort {}", state.reasoning_effort),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        Span::styled(activity, Style::default().fg(Color::Yellow)),
+        Span::styled(activity, Style::default().fg(activity_color)),
         Span::raw(" "),
-        Span::styled(state.status.clone(), Style::default().fg(Color::Gray)),
+        Span::styled(
+            state.status.clone(),
+            Style::default().fg(if state.running {
+                Color::White
+            } else {
+                Color::Gray
+            }),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(Color::Rgb(24, 27, 32))),
@@ -1868,15 +2073,29 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
         .saturating_add(1)
         .saturating_sub(visible)
         .min(suggestions.len().saturating_sub(visible));
+    let end = start.saturating_add(visible).min(suggestions.len());
+    let available = usize::from(area.width.saturating_sub(2));
+    let label_column = suggestions[start..end]
+        .iter()
+        .map(|suggestion| display_width(&suggestion.label))
+        .max()
+        .unwrap_or(0)
+        .min(available.saturating_mul(3) / 5);
     let lines = suggestions
         .iter()
         .enumerate()
         .skip(start)
         .take(visible)
         .map(|(index, suggestion)| {
-            let marker = if index == selected { "> " } else { "  " };
-            let padding = " ".repeat(30_usize.saturating_sub(display_width(&suggestion.label)));
-            let command_style = if index == selected {
+            let is_selected = index == selected;
+            let marker = if is_selected { "› " } else { "  " };
+            let label = truncate_width(&suggestion.label, label_column.saturating_add(1));
+            let padding = " ".repeat(
+                label_column
+                    .saturating_sub(display_width(&label))
+                    .saturating_add(2),
+            );
+            let command_style = if is_selected {
                 Style::default()
                     .fg(Color::Rgb(126, 200, 255))
                     .add_modifier(Modifier::BOLD)
@@ -1890,13 +2109,22 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
                         .fg(Color::Rgb(126, 200, 255))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(suggestion.label.clone(), command_style),
+                Span::styled(label, command_style),
                 Span::raw(padding),
                 Span::styled(
                     suggestion.description.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(if is_selected {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
             ])
+            .style(if is_selected {
+                Style::default().bg(Color::Rgb(31, 35, 41))
+            } else {
+                Style::default()
+            })
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
@@ -1904,34 +2132,44 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
 
 fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     if let Some(approval) = &state.pending_approval {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(
-                " 需要审批 ",
+        let arguments = approval.arguments.replace(['\r', '\n'], " ");
+        let argument_prefix = if approval.name == "shell" {
+            "$ "
+        } else {
+            "↳ "
+        };
+        let details = truncate_width(
+            &format!("{argument_prefix}{arguments}"),
+            usize::from(area.width.saturating_sub(2)),
+        );
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("是否允许运行 {}？", approval.name),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(area);
-        let arguments = approval.arguments.replace(['\r', '\n'], " ");
-        let details = truncate_width(&arguments, usize::from(inner.width));
-        let lines = vec![
-            Line::from(Span::styled(
-                approval.name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from(details),
-            Line::from(vec![
-                Span::styled("[y]", Style::default().fg(Color::Green)),
-                Span::raw(" 允许一次  "),
-                Span::styled("[a]", Style::default().fg(Color::Yellow)),
-                Span::raw(" 本次会话  "),
-                Span::styled("[n]", Style::default().fg(Color::Red)),
-                Span::raw(" 拒绝"),
-            ]),
+            Line::from(Span::styled(details, Style::default().fg(Color::Gray))),
+            approval_option_line(
+                ApprovalChoice::ApproveOnce,
+                approval.selection,
+                "1. 允许一次",
+            ),
+            approval_option_line(
+                ApprovalChoice::ApproveForSession,
+                approval.selection,
+                "2. 本次会话内始终允许",
+            ),
+            approval_option_line(ApprovalChoice::Deny, approval.selection, "3. 拒绝"),
+            Line::from(Span::styled(
+                "  ↑/↓ 选择 · Enter 确认 · Esc 取消任务",
+                Style::default().fg(Color::DarkGray),
+            )),
         ];
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(Color::Rgb(24, 27, 32))),
+            area,
+        );
         return;
     }
 
@@ -1981,13 +2219,30 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         return;
     }
 
+    let mut editor_area = area;
+    if !state.pending_images.is_empty() {
+        let attachment_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
+        render_pending_images(frame, state, attachment_area);
+        editor_area = Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        );
+    }
+
     let prompt_color = if state.running {
         Color::Yellow
     } else {
         Color::Rgb(126, 200, 255)
     };
-    let prefix_width = INPUT_PREFIX_WIDTH.min(area.width);
-    let prefix_area = Rect::new(area.x, area.y, prefix_width, 1.min(area.height));
+    let prefix_width = INPUT_PREFIX_WIDTH.min(editor_area.width);
+    let prefix_area = Rect::new(
+        editor_area.x,
+        editor_area.y,
+        prefix_width,
+        1.min(editor_area.height),
+    );
     frame.render_widget(
         Paragraph::new(Span::styled(
             "> ",
@@ -1998,10 +2253,10 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         prefix_area,
     );
     let input_area = Rect::new(
-        area.x.saturating_add(prefix_width),
-        area.y,
-        area.width.saturating_sub(prefix_width),
-        area.height,
+        editor_area.x.saturating_add(prefix_width),
+        editor_area.y,
+        editor_area.width.saturating_sub(prefix_width),
+        editor_area.height,
     );
     let (cursor_x, cursor_y, scroll) = state
         .editor
@@ -2022,26 +2277,205 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     ));
 }
 
+fn render_pending_images(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    let names = state
+        .pending_images
+        .iter()
+        .take(3)
+        .map(|image| sanitize_terminal_text(&image.name))
+        .collect::<Vec<_>>()
+        .join("、");
+    let hidden = state.pending_images.len().saturating_sub(3);
+    let suffix = if hidden == 0 {
+        names
+    } else {
+        format!("{names} 等 {} 张", state.pending_images.len())
+    };
+    let label = format!("图片 {}  ", state.pending_images.len());
+    let available = usize::from(area.width).saturating_sub(display_width(&label) + 4);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  + ",
+                Style::default()
+                    .fg(Color::Rgb(103, 232, 163))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Rgb(103, 232, 163))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_width(&suffix, available.saturating_add(1)),
+                Style::default().fg(Color::Gray),
+            ),
+        ])),
+        area,
+    );
+}
+
 fn render_footer(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(footer_line(state, usize::from(area.width)))
+            .style(Style::default().bg(Color::Rgb(24, 27, 32))),
+        area,
+    );
+}
+
+fn approval_option_line(
+    choice: ApprovalChoice,
+    selected: ApprovalChoice,
+    label: &'static str,
+) -> Line<'static> {
+    let is_selected = choice == selected;
+    let style = if is_selected {
+        Style::default()
+            .fg(Color::Rgb(126, 200, 255))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Line::from(vec![
+        Span::styled(
+            if is_selected { "› " } else { "  " },
+            Style::default()
+                .fg(Color::Rgb(126, 200, 255))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label, style),
+    ])
+}
+
+fn footer_line(state: &UiState, width: usize) -> Line<'static> {
     let estimate = if state.usage_estimated { "~" } else { "" };
-    let left = format!(
-        " {estimate}输入 {} 输出 {} | 上下文 {estimate}{}/{} ({}%)",
-        format_tokens(state.usage.prompt_tokens),
-        format_tokens(state.usage.completion_tokens),
+    let context_full = format!(
+        "{estimate}{}/{} ({}%)",
         format_tokens(state.context_tokens),
         format_tokens(state.max_input_tokens),
         format_context_percent(state.context_tokens, state.max_input_tokens)
     );
-    let right = format!("{} | effort {} ", state.model, state.reasoning_effort);
-    let footer_line = align_footer_parts(&left, &right, usize::from(area.width));
-    frame.render_widget(
-        Paragraph::new(footer_line).style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .bg(Color::Rgb(24, 27, 32)),
-        ),
-        area,
+    let context_compact = format!(
+        "{estimate}{}%",
+        format_context_percent(state.context_tokens, state.max_input_tokens)
     );
+    let usage = format!(
+        " | 输入 {} 输出 {}",
+        format_tokens(state.usage.prompt_tokens),
+        format_tokens(state.usage.completion_tokens)
+    );
+    let effort = state.reasoning_effort.to_string();
+    let context_label = " 上下文 ";
+    let full_right_width = display_width(&state.model)
+        .saturating_add(display_width(" | effort "))
+        .saturating_add(display_width(&effort))
+        .saturating_add(1);
+    let model_right_width = display_width(&state.model).saturating_add(1);
+    let full_left_width = display_width(context_label)
+        .saturating_add(display_width(&context_full))
+        .saturating_add(display_width(&usage));
+    let context_left_width =
+        display_width(context_label).saturating_add(display_width(&context_full));
+    let compact_left_width =
+        display_width(context_label).saturating_add(display_width(&context_compact));
+
+    let (context, usage, show_effort, model) = if full_left_width
+        .saturating_add(full_right_width)
+        .saturating_add(2)
+        <= width
+    {
+        (context_full, Some(usage), true, state.model.clone())
+    } else if context_left_width
+        .saturating_add(full_right_width)
+        .saturating_add(2)
+        <= width
+    {
+        (context_full, None, true, state.model.clone())
+    } else if compact_left_width
+        .saturating_add(full_right_width)
+        .saturating_add(2)
+        <= width
+    {
+        (context_compact, None, true, state.model.clone())
+    } else {
+        let available = width.saturating_sub(compact_left_width).saturating_sub(3);
+        (
+            context_compact,
+            None,
+            false,
+            truncate_width(&state.model, available.saturating_add(1)),
+        )
+    };
+
+    let left_width = display_width(context_label)
+        .saturating_add(display_width(&context))
+        .saturating_add(usage.as_deref().map_or(0, display_width));
+    let right_width = if model.is_empty() {
+        0
+    } else if show_effort {
+        full_right_width
+    } else {
+        model_right_width.min(display_width(&model).saturating_add(1))
+    };
+    let padding = width.saturating_sub(left_width.saturating_add(right_width));
+    let mut spans = vec![
+        Span::styled(
+            context_label,
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            context,
+            Style::default()
+                .fg(context_usage_color(
+                    state.context_tokens,
+                    state.max_input_tokens,
+                ))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(usage) = usage {
+        spans.push(Span::styled(usage, Style::default().fg(Color::DarkGray)));
+    }
+    spans.push(Span::raw(" ".repeat(padding)));
+    if !model.is_empty() {
+        spans.push(Span::styled(
+            model,
+            Style::default()
+                .fg(Color::Rgb(126, 200, 255))
+                .add_modifier(Modifier::BOLD),
+        ));
+        if show_effort {
+            spans.push(Span::styled(
+                " | effort ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                effort,
+                Style::default()
+                    .fg(Color::Rgb(245, 190, 78))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
+}
+
+fn context_usage_color(tokens: u64, limit: u64) -> Color {
+    if limit == 0 {
+        return Color::Gray;
+    }
+    let percent = u128::from(tokens).saturating_mul(100) / u128::from(limit);
+    if percent >= 90 {
+        Color::LightRed
+    } else if percent >= 70 {
+        Color::Yellow
+    } else {
+        Color::Rgb(103, 232, 163)
+    }
 }
 
 fn format_tokens(count: u64) -> String {
@@ -2084,18 +2518,6 @@ fn format_context_percent(tokens: u64, window: u64) -> String {
     format!("{}.{:01}", tenths / 10, tenths % 10)
 }
 
-fn align_footer_parts(left: &str, right: &str, width: usize) -> String {
-    let left_width = display_width(left);
-    let right_width = display_width(right);
-    if left_width.saturating_add(right_width).saturating_add(2) <= width {
-        return format!(
-            "{left}{}{right}",
-            " ".repeat(width - left_width - right_width)
-        );
-    }
-    truncate_width(&format!("{left}  {right}"), width)
-}
-
 fn display_width(text: &str) -> usize {
     text.chars()
         .map(|character| character.width().unwrap_or(0))
@@ -2111,13 +2533,13 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                 let show_reasoning = state.thinking_display == ThinkingDisplay::Shown;
                 if show_reasoning {
                     let running = if reasoning_in_progress {
-                        "  思考中"
+                        "（思考中）"
                     } else {
                         ""
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            "思考",
+                            "• 思考",
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::BOLD),
@@ -2125,12 +2547,15 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                         Span::styled(running, Style::default().fg(Color::DarkGray)),
                     ]));
                     for line in message.reasoning.lines() {
-                        lines.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
+                            ),
+                        ]));
                     }
                 } else {
                     let line_count = message
@@ -2142,13 +2567,13 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                     let character_count = message.reasoning.chars().count();
                     lines.push(Line::from(vec![
                         Span::styled(
-                            "思考",
+                            "• 思考",
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            format!("  已隐藏，{line_count} 行，{character_count} 个字符"),
+                            format!("（已隐藏，{line_count} 行，{character_count} 个字符）"),
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
@@ -2158,32 +2583,40 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
                 }
             }
             if !message.content.is_empty() || message.reasoning.is_empty() {
-                let running = if message.running { "  回复中" } else { "" };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "助手",
-                        Style::default()
-                            .fg(Color::Rgb(103, 232, 163))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(running, Style::default().fg(Color::DarkGray)),
-                ]));
-                append_markdownish_lines(
-                    &mut lines,
-                    &message.content,
-                    Style::default().fg(Color::White),
-                );
+                if message.content.is_empty() && message.running {
+                    lines.push(Line::from(Span::styled(
+                        "• 正在回复...",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    append_markdown_lines(
+                        &mut lines,
+                        &message.content,
+                        Style::default().fg(Color::White),
+                    );
+                }
             }
             lines.push(Line::default());
             continue;
         }
 
+        if matches!(message.role, ViewRole::Tool | ViewRole::Error) && message.tool_id.is_some() {
+            append_tool_message(&mut lines, message);
+            lines.push(Line::default());
+            continue;
+        }
+
+        if message.role == ViewRole::User {
+            append_user_message(&mut lines, &message.content);
+            lines.push(Line::default());
+            continue;
+        }
+
         let (label_color, content_style) = match message.role {
-            ViewRole::User => (Color::Rgb(126, 200, 255), Style::default().fg(Color::White)),
             ViewRole::Tool => (Color::Rgb(245, 190, 78), Style::default().fg(Color::Gray)),
             ViewRole::Notice => (Color::Cyan, Style::default().fg(Color::Gray)),
             ViewRole::Error => (Color::Red, Style::default().fg(Color::LightRed)),
-            ViewRole::Assistant => unreachable!(),
+            ViewRole::User | ViewRole::Assistant => unreachable!(),
         };
         let running = if message.running { "  运行中" } else { "" };
         lines.push(Line::from(vec![
@@ -2195,7 +2628,7 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
             ),
             Span::styled(running, Style::default().fg(Color::DarkGray)),
         ]));
-        append_markdownish_lines(&mut lines, &message.content, content_style);
+        append_markdown_lines(&mut lines, &message.content, content_style);
         lines.push(Line::default());
     }
     if lines.is_empty() {
@@ -2207,26 +2640,461 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
     lines
 }
 
-fn append_markdownish_lines(lines: &mut Vec<Line<'static>>, content: &str, base: Style) {
-    let mut in_code = false;
-    for raw_line in content.lines() {
-        if raw_line.trim_start().as_bytes().starts_with(&[96, 96, 96]) {
-            in_code = !in_code;
-            continue;
+fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
+    let mut content_lines = content.lines();
+    let first = content_lines.next().unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "› ",
+            Style::default()
+                .fg(Color::Rgb(126, 200, 255))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(first.to_string(), Style::default().fg(Color::White)),
+    ]));
+    for line in content_lines {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(line.to_string(), Style::default().fg(Color::White)),
+        ]));
+    }
+}
+
+fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
+    let failed = message.role == ViewRole::Error;
+    let color = if failed {
+        Color::LightRed
+    } else {
+        Color::Rgb(245, 190, 78)
+    };
+    let status = if message.running {
+        "（运行中）"
+    } else {
+        ""
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            "• ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            message.title.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(status, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    if let Some(arguments) = message
+        .tool_arguments
+        .as_deref()
+        .filter(|arguments| !arguments.is_empty())
+    {
+        let first_prefix = if message.title == "shell" {
+            "  $ "
+        } else {
+            "  ↳ "
+        };
+        append_collapsed_plain_lines(
+            lines,
+            arguments,
+            TOOL_ARGUMENT_PREVIEW_LINES,
+            first_prefix,
+            "    ",
+            Style::default().fg(Color::Gray),
+        );
+    }
+    if !message.content.is_empty() {
+        append_collapsed_plain_lines(
+            lines,
+            &message.content,
+            TOOL_OUTPUT_PREVIEW_LINES,
+            "  └ ",
+            "    ",
+            if failed {
+                Style::default().fg(Color::LightRed)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        );
+    }
+}
+
+fn append_collapsed_plain_lines(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    limit: usize,
+    first_prefix: &str,
+    continuation_prefix: &str,
+    style: Style,
+) {
+    let content_lines = content.lines().collect::<Vec<_>>();
+    for (index, line) in content_lines.iter().take(limit).enumerate() {
+        let prefix = if index == 0 {
+            first_prefix
+        } else {
+            continuation_prefix
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(truncate_tool_preview_line(line), style),
+        ]));
+    }
+    let hidden = content_lines.len().saturating_sub(limit);
+    if hidden > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(
+                continuation_prefix.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("… 已折叠 {hidden} 行"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+}
+
+fn truncate_tool_preview_line(line: &str) -> String {
+    let mut characters = line.chars();
+    let preview = characters
+        .by_ref()
+        .take(TOOL_PREVIEW_LINE_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+fn format_tool_input(name: &str, arguments: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let concise = parsed.as_ref().and_then(|value| match name {
+        "shell" => value.get("command")?.as_str().map(ToString::to_string),
+        "read_file" | "write_file" | "edit_file" => {
+            value.get("path")?.as_str().map(ToString::to_string)
         }
-        let style = if in_code {
+        "web_search" => value
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        "fetch_content" => value
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
+    });
+    let formatted = concise.unwrap_or_else(|| format_tool_arguments(arguments));
+    truncate_for_ui(&sanitize_terminal_text(&formatted))
+}
+
+fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, base: Style) {
+    lines.extend(MarkdownRenderer::new(base).render(content));
+}
+
+struct MarkdownList {
+    next: Option<u64>,
+}
+
+struct MarkdownRenderer {
+    lines: Vec<Line<'static>>,
+    current: Vec<Span<'static>>,
+    base: Style,
+    heading: Option<HeadingLevel>,
+    strong_depth: usize,
+    emphasis_depth: usize,
+    strikethrough_depth: usize,
+    code_block: bool,
+    quote_depth: usize,
+    lists: Vec<MarkdownList>,
+    item_continuations: Vec<String>,
+    pending_item_prefix: Option<String>,
+    links: Vec<String>,
+}
+
+impl MarkdownRenderer {
+    fn new(base: Style) -> Self {
+        Self {
+            lines: Vec::new(),
+            current: Vec::new(),
+            base,
+            heading: None,
+            strong_depth: 0,
+            emphasis_depth: 0,
+            strikethrough_depth: 0,
+            code_block: false,
+            quote_depth: 0,
+            lists: Vec::new(),
+            item_continuations: Vec::new(),
+            pending_item_prefix: None,
+            links: Vec::new(),
+        }
+    }
+
+    fn render(mut self, content: &str) -> Vec<Line<'static>> {
+        for event in Parser::new_ext(content, MarkdownOptions::all()) {
+            self.event(event);
+        }
+        self.flush_line(false);
+        if self.lines.is_empty() {
+            self.lines.push(Line::default());
+        }
+        self.lines
+    }
+
+    fn event(&mut self, event: MarkdownEvent<'_>) {
+        match event {
+            MarkdownEvent::Start(tag) => self.start_tag(tag),
+            MarkdownEvent::End(tag) => self.end_tag(tag),
+            MarkdownEvent::Text(text)
+            | MarkdownEvent::Html(text)
+            | MarkdownEvent::InlineHtml(text) => {
+                self.push_text(&text, self.current_style());
+            }
+            MarkdownEvent::Code(code) => self.push_text(
+                &code,
+                Style::default()
+                    .fg(Color::Rgb(215, 220, 230))
+                    .bg(Color::Rgb(31, 35, 41)),
+            ),
+            MarkdownEvent::InlineMath(math) => {
+                self.push_text(&format!("${math}$"), self.current_style());
+            }
+            MarkdownEvent::DisplayMath(math) => {
+                self.flush_line(false);
+                self.push_text(&format!("$${math}$$"), self.current_style());
+                self.flush_line(false);
+            }
+            MarkdownEvent::FootnoteReference(label) => {
+                self.push_text(&format!("[^{label}]"), self.current_style());
+            }
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => self.flush_line(false),
+            MarkdownEvent::Rule => {
+                self.flush_line(false);
+                self.push_text(
+                    "────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                );
+                self.flush_line(false);
+            }
+            MarkdownEvent::TaskListMarker(checked) => {
+                self.push_text(if checked { "[x] " } else { "[ ] " }, self.current_style());
+            }
+        }
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph | Tag::TableRow => self.flush_line(false),
+            Tag::Heading { level, .. } => {
+                self.flush_line(false);
+                self.heading = Some(level);
+            }
+            Tag::BlockQuote(_) => {
+                self.flush_line(false);
+                self.quote_depth = self.quote_depth.saturating_add(1);
+            }
+            Tag::CodeBlock(_) => {
+                self.flush_line(false);
+                self.code_block = true;
+            }
+            Tag::List(start) => {
+                self.flush_line(false);
+                self.lists.push(MarkdownList { next: start });
+            }
+            Tag::Item => {
+                self.flush_line(false);
+                let depth = self.lists.len().saturating_sub(1);
+                let marker = self.lists.last_mut().map_or_else(
+                    || "- ".to_string(),
+                    |list| match list.next.as_mut() {
+                        Some(next) => {
+                            let marker = format!("{next}. ");
+                            *next = next.saturating_add(1);
+                            marker
+                        }
+                        None => "- ".to_string(),
+                    },
+                );
+                let indentation = "  ".repeat(depth);
+                self.pending_item_prefix = Some(format!("{indentation}{marker}"));
+                self.item_continuations.push(format!(
+                    "{indentation}{}",
+                    " ".repeat(display_width(&marker))
+                ));
+            }
+            Tag::FootnoteDefinition(label) => {
+                self.flush_line(false);
+                self.pending_item_prefix = Some(format!("[^{label}] "));
+            }
+            Tag::DefinitionListTitle | Tag::Strong => {
+                self.strong_depth = self.strong_depth.saturating_add(1);
+            }
+            Tag::DefinitionListDefinition => {
+                self.flush_line(false);
+                self.pending_item_prefix = Some(": ".to_string());
+            }
+            Tag::TableCell => {
+                if !self.current.is_empty() {
+                    self.push_text(" | ", Style::default().fg(Color::DarkGray));
+                }
+            }
+            Tag::Emphasis => self.emphasis_depth = self.emphasis_depth.saturating_add(1),
+            Tag::Strikethrough => {
+                self.strikethrough_depth = self.strikethrough_depth.saturating_add(1);
+            }
+            Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
+            Tag::Image { dest_url, .. } => {
+                self.push_text("图片：", Style::default().fg(Color::DarkGray));
+                self.links.push(dest_url.into_string());
+            }
+            Tag::HtmlBlock
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::DefinitionList
+            | Tag::Superscript
+            | Tag::Subscript
+            | Tag::MetadataBlock(_) => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::TableRow => {
+                self.flush_line(false);
+                if matches!(tag, TagEnd::Heading(_)) {
+                    self.heading = None;
+                }
+            }
+            TagEnd::BlockQuote(_) => {
+                self.flush_line(false);
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+            }
+            TagEnd::CodeBlock => {
+                self.flush_line(false);
+                self.code_block = false;
+            }
+            TagEnd::List(_) => {
+                self.flush_line(false);
+                self.lists.pop();
+            }
+            TagEnd::Item => {
+                self.flush_line(false);
+                self.pending_item_prefix = None;
+                self.item_continuations.pop();
+            }
+            TagEnd::FootnoteDefinition | TagEnd::DefinitionListDefinition => {
+                self.flush_line(false);
+                self.pending_item_prefix = None;
+            }
+            TagEnd::DefinitionListTitle => {
+                self.strong_depth = self.strong_depth.saturating_sub(1);
+                self.flush_line(false);
+            }
+            TagEnd::Emphasis => self.emphasis_depth = self.emphasis_depth.saturating_sub(1),
+            TagEnd::Strong => self.strong_depth = self.strong_depth.saturating_sub(1),
+            TagEnd::Strikethrough => {
+                self.strikethrough_depth = self.strikethrough_depth.saturating_sub(1);
+            }
+            TagEnd::Link | TagEnd::Image => {
+                if let Some(destination) = self.links.pop()
+                    && !destination.is_empty()
+                {
+                    self.push_text(
+                        &format!(" ({destination})"),
+                        Style::default()
+                            .fg(Color::Rgb(126, 200, 255))
+                            .add_modifier(Modifier::UNDERLINED),
+                    );
+                }
+            }
+            TagEnd::TableCell
+            | TagEnd::HtmlBlock
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::DefinitionList
+            | TagEnd::Superscript
+            | TagEnd::Subscript
+            | TagEnd::MetadataBlock(_) => {}
+        }
+    }
+
+    fn current_style(&self) -> Style {
+        let mut style = if self.code_block {
             Style::default()
                 .fg(Color::Rgb(215, 220, 230))
                 .bg(Color::Rgb(31, 35, 41))
-        } else if raw_line.starts_with('#') {
-            base.add_modifier(Modifier::BOLD)
         } else {
-            base
+            self.base
         };
-        lines.push(Line::from(Span::styled(raw_line.to_string(), style)));
+        if let Some(level) = self.heading {
+            style = style
+                .fg(match level {
+                    HeadingLevel::H1 => Color::Rgb(103, 232, 163),
+                    HeadingLevel::H2 => Color::Rgb(126, 200, 255),
+                    _ => Color::White,
+                })
+                .add_modifier(Modifier::BOLD);
+        }
+        if self.strong_depth > 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if self.emphasis_depth > 0 {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if self.strikethrough_depth > 0 {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if !self.links.is_empty() {
+            style = style
+                .fg(Color::Rgb(126, 200, 255))
+                .add_modifier(Modifier::UNDERLINED);
+        }
+        style
     }
-    if content.is_empty() {
-        lines.push(Line::default());
+
+    fn push_text(&mut self, text: &str, style: Style) {
+        for (index, part) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.flush_line(true);
+            }
+            if !part.is_empty() {
+                self.ensure_prefix();
+                self.current.push(Span::styled(part.to_string(), style));
+            }
+        }
+    }
+
+    fn ensure_prefix(&mut self) {
+        if !self.current.is_empty() {
+            return;
+        }
+        if self.quote_depth > 0 {
+            self.current.push(Span::styled(
+                "│ ".repeat(self.quote_depth),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let prefix = self
+            .pending_item_prefix
+            .take()
+            .or_else(|| self.item_continuations.last().cloned());
+        if let Some(prefix) = prefix {
+            self.current
+                .push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+        }
+    }
+
+    fn flush_line(&mut self, force: bool) {
+        if self.current.is_empty() && force {
+            self.ensure_prefix();
+        }
+        if !self.current.is_empty() {
+            self.lines
+                .push(Line::from(std::mem::take(&mut self.current)));
+        }
     }
 }
 
@@ -2371,6 +3239,66 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_v_requests_a_wayland_clipboard_paste() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                &mut state,
+                None,
+            ),
+            UiAction::PasteClipboard
+        ));
+    }
+
+    #[test]
+    fn pasted_image_paths_become_removable_attachments() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("pixel.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .unwrap();
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            temp.path().to_path_buf(),
+        );
+
+        paste_text_or_image(&mut state, "'pixel.png'");
+        assert!(state.editor.is_empty());
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(state.pending_images[0].name, "pixel.png");
+
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rendered = rendered_terminal(&terminal);
+        assert!(rendered.replace(' ', "").contains("图片1"));
+        assert!(rendered.contains("pixel.png"));
+
+        handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert!(state.pending_images.is_empty());
+        assert_eq!(state.status, "就绪");
+    }
+
+    #[test]
+    fn clipboard_reads_are_bounded() {
+        let exact = read_limited(io::Cursor::new(vec![1; 4]), 4).unwrap();
+        assert_eq!(exact, vec![1; 4]);
+        assert!(read_limited(io::Cursor::new(vec![1; 5]), 4).is_err());
+    }
+
+    #[test]
     fn renders_collapsed_paste_without_exposing_its_contents() {
         let pasted = format!(
             "private-start{}",
@@ -2394,6 +3322,131 @@ mod tests {
             .collect::<String>();
         assert!(rendered.replace(' ', "").contains("[已粘贴"));
         assert!(!rendered.contains("private-start"));
+    }
+
+    #[test]
+    fn renders_commonmark_as_terminal_styles() {
+        let content = "# Heading\n\n**bold** and *italic* with `code` and [docs](https://example.com).\n\n- one\n- two\n\n> quote\n\n```rust\nlet value = 1;\n```";
+        let mut lines = Vec::new();
+        append_markdown_lines(&mut lines, content, Style::default().fg(Color::White));
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Heading"));
+        assert!(rendered.contains("- one"));
+        assert!(rendered.contains("│ quote"));
+        assert!(rendered.contains("docs (https://example.com)"));
+        assert!(rendered.contains("let value = 1;"));
+        assert!(!rendered.contains("# Heading"));
+        assert!(!rendered.contains("**bold**"));
+        assert!(!rendered.contains("```"));
+
+        let spans = lines.iter().flat_map(|line| line.spans.iter());
+        let bold = spans
+            .clone()
+            .find(|span| span.content.as_ref() == "bold")
+            .unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        let italic = spans
+            .clone()
+            .find(|span| span.content.as_ref() == "italic")
+            .unwrap();
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
+        let code = spans
+            .clone()
+            .find(|span| span.content.as_ref() == "code")
+            .unwrap();
+        assert_eq!(code.style.bg, Some(Color::Rgb(31, 35, 41)));
+    }
+
+    #[test]
+    fn folds_tool_arguments_and_output() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.apply_agent_event(AgentEvent::ToolStarted {
+            id: "call_shell".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({
+                "command": "first\nsecond\nthird",
+                "timeout_seconds": 30
+            })
+            .to_string(),
+        });
+        state.apply_agent_event(AgentEvent::ToolFinished {
+            id: "call_shell".to_string(),
+            name: "shell".to_string(),
+            output: (0..12)
+                .map(|index| format!("output {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_error: false,
+        });
+
+        let rendered = conversation_lines(&state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("• shell"));
+        assert!(rendered.contains("$ first"));
+        assert!(rendered.contains("second"));
+        assert!(!rendered.contains("third"));
+        assert!(rendered.contains("output 0"));
+        assert!(rendered.contains("output 4"));
+        assert!(!rendered.contains("output 5"));
+        assert!(!rendered.contains("output 11"));
+        assert!(rendered.contains("已折叠 1 行"));
+        assert!(rendered.contains("已折叠 7 行"));
+    }
+
+    #[test]
+    fn rebuilds_folded_tool_views_from_session_history() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_history(ChatMessage::assistant(
+            None,
+            None,
+            vec![crate::protocol::ToolCall {
+                id: "call_read".to_string(),
+                kind: "function".to_string(),
+                function: crate::protocol::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "README.md",
+                        "offset": 1,
+                        "limit": 20
+                    })
+                    .to_string(),
+                },
+            }],
+        ));
+        state.push_history(ChatMessage::tool(
+            "call_read",
+            (0..8)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+
+        let rendered = conversation_lines(&state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("• read_file"));
+        assert!(rendered.contains("README.md"));
+        assert!(rendered.contains("line 0"));
+        assert!(!rendered.contains("line 7"));
+        assert!(rendered.contains("已折叠 3 行"));
     }
 
     #[test]
@@ -2442,6 +3495,8 @@ mod tests {
         assert!(rendered.replace(' ', "").contains("网页搜索"));
         assert!(rendered.contains("current release"));
         assert!(rendered.contains("The current release is available."));
+        assert!(!rendered.contains("你"));
+        assert!(!rendered.contains("助手"));
         assert!(rendered.contains('>'));
         assert!(!rendered.contains("prompt"));
         assert!(!rendered.contains('┌'));
@@ -2489,7 +3544,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rendered = rendered_terminal(&terminal);
-        assert!(rendered.replace(' ', "").contains("思考已隐藏，2行"));
+        assert!(rendered.replace(' ', "").contains("思考（已隐藏，2行"));
         assert!(!rendered.contains("Inspecting the request."));
         assert!(!rendered.contains("Checking the implementation."));
 
@@ -2505,7 +3560,7 @@ mod tests {
         assert!(compact.contains("思考"));
         assert!(compact.contains("已隐藏，2行"));
         assert!(!rendered.contains("Inspecting the request."));
-        assert!(compact.contains("助手"));
+        assert!(!compact.contains("助手"));
         assert!(rendered.contains("Final response."));
         assert!(rendered.contains("effort high"));
     }
@@ -2522,13 +3577,14 @@ mod tests {
             title: "assistant".to_string(),
             content: "Done.".to_string(),
             reasoning: "Hidden reasoning.".to_string(),
+            tool_arguments: None,
             tool_id: None,
             running: false,
         });
 
         let lines = conversation_lines(&state);
         let rendered = lines.iter().map(Line::to_string).collect::<String>();
-        assert!(rendered.contains("思考  已隐藏"));
+        assert!(rendered.contains("思考（已隐藏"));
         assert!(!rendered.contains("Hidden reasoning."));
 
         state.editor.insert_str("/thinking show");
@@ -2640,7 +3696,8 @@ mod tests {
             ),
             UiAction::None
         ));
-        assert_eq!(state.editor.text(), "/status");
+        assert!(state.editor.is_empty());
+        assert!(state.messages.last().unwrap().content.contains("模型"));
     }
 
     #[test]
@@ -2686,12 +3743,15 @@ mod tests {
         ));
 
         state.editor.set_text("/search l");
-        handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut state,
-            None,
-        );
-        assert_eq!(state.editor.text(), "/search live");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::SetWebSearch(WebSearchMode::Live)
+        ));
+        assert!(state.editor.is_empty());
 
         state.editor.set_text("/thinking s");
         handle_key(
@@ -2974,7 +4034,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_prompt_accepts_once_session_or_deny_keys() {
+    fn approval_prompt_supports_vertical_selection_and_shortcuts() {
         let mut state = UiState::new(
             "model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
@@ -2983,7 +4043,62 @@ mod tests {
         state.pending_approval = Some(ApprovalView {
             name: "shell".to_string(),
             arguments: r#"{"command":"cargo test"}"#.to_string(),
+            selection: ApprovalChoice::ApproveOnce,
         });
+
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert_eq!(
+            state.pending_approval.as_ref().unwrap().selection,
+            ApprovalChoice::ApproveForSession
+        );
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::ResolveApproval(ApprovalDecision::ApproveForSession)
+        ));
+
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(
+            state.pending_approval.as_ref().unwrap().selection,
+            ApprovalChoice::Deny
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(
+            state.pending_approval.as_ref().unwrap().selection,
+            ApprovalChoice::ApproveForSession
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &mut state,
+            None,
+        );
+        assert_eq!(
+            state.pending_approval.as_ref().unwrap().selection,
+            ApprovalChoice::ApproveOnce
+        );
 
         assert!(matches!(
             handle_key(
@@ -3021,6 +4136,7 @@ mod tests {
         state.pending_approval = Some(ApprovalView {
             name: "shell".to_string(),
             arguments: r#"{"command":"cargo test --all-targets"}"#.to_string(),
+            selection: ApprovalChoice::ApproveOnce,
         });
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3033,9 +4149,11 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         let compact = rendered.replace(' ', "");
-        assert!(compact.contains("需要审批"));
+        assert!(compact.contains("是否允许运行shell？"));
         assert!(rendered.contains("shell"));
-        assert!(compact.contains("[y]允许一次"));
+        assert!(compact.contains("›1.允许一次"));
+        assert!(compact.contains("2.本次会话内始终允许"));
+        assert!(compact.contains("↑/↓选择·Enter确认"));
         assert!(!rendered.contains("/tmp/project"));
         assert!(rendered.contains("effort off"));
     }
@@ -3046,5 +4164,50 @@ mod tests {
         assert_eq!(format_tokens(1_250), "1.2k");
         assert_eq!(format_tokens(12_500), "13k");
         assert_eq!(format_context_percent(24_000, 128_000), "18.7");
+    }
+
+    #[test]
+    fn footer_highlights_context_model_and_effort() {
+        let mut state = UiState::new(
+            "test-model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.context_tokens = 24_000;
+        state.max_input_tokens = 128_000;
+        state.reasoning_effort = ReasoningEffort::High;
+
+        let line = footer_line(&state, 80);
+        let context = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("24k/128k"))
+            .unwrap();
+        assert_eq!(context.style.fg, Some(Color::Rgb(103, 232, 163)));
+        assert!(context.style.add_modifier.contains(Modifier::BOLD));
+
+        let model = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "test-model")
+            .unwrap();
+        assert_eq!(model.style.fg, Some(Color::Rgb(126, 200, 255)));
+        assert!(model.style.add_modifier.contains(Modifier::BOLD));
+
+        let effort = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "high")
+            .unwrap();
+        assert_eq!(effort.style.fg, Some(Color::Rgb(245, 190, 78)));
+
+        state.context_tokens = 100_000;
+        assert_eq!(context_usage_color(100_000, 128_000), Color::Yellow);
+        assert_eq!(context_usage_color(120_000, 128_000), Color::LightRed);
+
+        let compact = footer_line(&state, 32).to_string();
+        assert!(compact.contains("上下文"));
+        assert!(compact.contains("test-model"));
+        assert!(display_width(&compact) <= 32);
     }
 }

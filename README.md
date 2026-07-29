@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/imengying/MCode/actions/workflows/ci.yml/badge.svg)](https://github.com/imengying/MCode/actions/workflows/ci.yml)
 
-面向 Linux 的 Rust 终端 coding agent，提供 Codex 风格交互，支持 OpenAI-compatible
+面向 Linux Wayland 的 Rust 终端 coding agent，提供 Codex 风格交互，支持 OpenAI-compatible
 Chat Completions 和 Responses API。
 
 ## 功能
@@ -148,7 +148,6 @@ TUI 命令：
 | `/thinking [show\|hide]` | 显示或隐藏思考过程 |
 | `/search [disabled\|cached\|live]` | 查看或切换网页搜索 |
 | `/compact [INSTRUCTIONS]` | 手动压缩上下文 |
-| `/image [PATH\|clear]` | 管理下一条消息的图片 |
 | `/status` | 显示模型、端点和 token |
 | `/new` | 新建会话 |
 | `/delete` | 选择 Yes 后删除当前会话并退出 |
@@ -158,10 +157,12 @@ TUI 命令：
 
 思考过程默认隐藏；使用 `/thinking show` 可查看全文。
 
-输入 `/` 后可用方向键选择，Tab 或 Enter 补全命令及其可选参数。Enter 提交，Shift+Enter 或
-Alt+Enter 换行，Escape 取消当前任务。使用鼠标滚轮或方向键逐行滚动，PageUp/PageDown
-翻页，Ctrl+Home/Ctrl+End 跳到顶部/底部。删除确认默认选择 No，使用方向键切换并按 Enter
-确认。审批提示中 `y` 允许一次，`a` 在当前会话允许同名工具，`n` 拒绝。
+输入 `/` 后可用方向键选择，Tab 补全，Enter 补全并立即执行命令。Enter 提交，Shift+Enter
+或 Alt+Enter 换行，Escape 取消当前任务。使用 `Ctrl+V` 粘贴 Wayland 剪贴板中的图片或文本，
+也可将单个图片文件拖入终端；启动时可用 `-i/--image` 附加图片。使用鼠标滚轮或方向键逐行
+滚动，PageUp/PageDown 翻页，Ctrl+Home/Ctrl+End 跳到顶部/底部。删除确认默认选择 No，
+使用方向键切换并按 Enter 确认。审批提示中 `y` 允许一次，`a` 在当前会话允许同名工具，
+`n` 拒绝。
 
 ## 会话恢复
 

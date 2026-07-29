@@ -27,6 +27,7 @@ dom_smoothie = "0.18"
 flate2 = "1.1"
 futures-util = "0.3"
 infer = { version = "0.22", default-features = false }
+pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm",
     "unstable-rendered-line-info",
@@ -44,6 +45,7 @@ tokio-util = "0.7"
 unicode-width = "0.2"
 url = "2.5"
 uuid = { version = "1.12", features = ["serde", "v7"] }
+wl-clipboard-rs = "0.9.3"
 
 [dev-dependencies]
 rmcp = { version = "2.2", default-features = false, features = ["server"] }

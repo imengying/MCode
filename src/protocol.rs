@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] =
     ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
@@ -147,22 +147,27 @@ impl ImageAttachment {
         }
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read image: {}", path.display()))?;
-        let mime_type = infer::get(&bytes)
-            .map(|kind| kind.mime_type())
-            .filter(|mime| SUPPORTED_IMAGE_MIME_TYPES.contains(mime))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unsupported image format for {}; use PNG, JPEG, GIF, or WebP",
-                    path.display()
-                )
-            })?;
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("image")
             .to_string();
+        Self::from_encoded_bytes(name, bytes)
+            .with_context(|| format!("invalid image: {}", path.display()))
+    }
+
+    pub fn from_encoded_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Result<Self> {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_IMAGE_BYTES {
+            bail!("image exceeds the 20 MiB limit");
+        }
+        let mime_type = infer::get(&bytes)
+            .map(|kind| kind.mime_type())
+            .filter(|mime| SUPPORTED_IMAGE_MIME_TYPES.contains(mime))
+            .ok_or_else(|| {
+                anyhow::anyhow!("unsupported image format; use PNG, JPEG, GIF, or WebP")
+            })?;
         Ok(Self {
-            name,
+            name: name.into(),
             mime_type: mime_type.to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
         })
@@ -294,6 +299,19 @@ mod tests {
         let encoded =
             serde_json::to_value(ChatMessage::user_with_images("look", vec![image])).unwrap();
         assert_eq!(encoded["images"][0]["name"], "pixel.png");
+    }
+
+    #[test]
+    fn accepts_encoded_clipboard_images() {
+        let image = ImageAttachment::from_encoded_bytes(
+            "clipboard.png",
+            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(image.name, "clipboard.png");
+        assert_eq!(image.mime_type, "image/png");
+        assert!(image.data_url().starts_with("data:image/png;base64,"));
+        assert!(ImageAttachment::from_encoded_bytes("bad.png", vec![0; 12]).is_err());
     }
 
     #[test]

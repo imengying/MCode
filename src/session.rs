@@ -281,20 +281,39 @@ impl Session {
                     .is_some_and(|name| name.contains(selector))
             });
         }
-        let path = candidates
-            .into_iter()
-            .max_by_key(|path| {
-                path.metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(UNIX_EPOCH)
-            })
-            .ok_or_else(|| {
-                if let Some(selector) = selector {
-                    anyhow!("no session matching {selector:?} for {}", cwd.display())
-                } else {
-                    anyhow!("no previous session for {}", cwd.display())
+        let prefer_non_empty = selector.is_none_or(|value| value.eq_ignore_ascii_case("last"));
+        let mut load_error = None;
+        let mut sessions = Vec::new();
+        for path in candidates {
+            match Self::load_readonly(&path) {
+                Ok(session) => {
+                    sessions.push((path, session.created_at, session.id, session.messages.len()));
                 }
-            })?;
+                Err(error) if prefer_non_empty => load_error = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        let newest = |sessions: &[(PathBuf, u64, Uuid, usize)], non_empty: bool| {
+            sessions
+                .iter()
+                .filter(|(_, _, _, message_count)| !non_empty || *message_count > 0)
+                .max_by_key(|(_, created_at, id, _)| (*created_at, *id))
+                .map(|(path, _, _, _)| path.clone())
+        };
+        let path = prefer_non_empty
+            .then(|| newest(&sessions, true))
+            .flatten()
+            .or_else(|| newest(&sessions, false));
+        let Some(path) = path else {
+            if let Some(error) = load_error {
+                return Err(error);
+            }
+            return Err(if let Some(selector) = selector {
+                anyhow!("no session matching {selector:?} for {}", cwd.display())
+            } else {
+                anyhow!("no previous session for {}", cwd.display())
+            });
+        };
         Self::load_for_project(&path, &directory, &cwd)
     }
 
@@ -1375,6 +1394,58 @@ mod tests {
         assert_eq!(loaded.web_search_mode(), WebSearchMode::Live);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.messages()[0], ChatMessage::user("hello"));
+    }
+
+    #[test]
+    fn resume_skips_a_newer_empty_session() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let mut conversation =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+                .unwrap();
+        let conversation_id = conversation.id();
+        conversation.append(ChatMessage::user("hello")).unwrap();
+        drop(conversation);
+
+        let empty = Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+            .unwrap();
+        assert!(empty.id() > conversation_id);
+        drop(empty);
+
+        let resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
+        assert_eq!(resumed.id(), conversation_id);
+        assert_eq!(resumed.messages(), &[ChatMessage::user("hello")]);
+    }
+
+    #[test]
+    fn automatic_resume_skips_corrupt_candidates_but_explicit_resume_reports_them() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let mut conversation =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+                .unwrap();
+        let conversation_id = conversation.id();
+        conversation.append(ChatMessage::user("hello")).unwrap();
+        drop(conversation);
+
+        let corrupt =
+            Session::create_in(base.path(), project.path(), metadata(ReasoningEffort::Low))
+                .unwrap();
+        let corrupt_id = corrupt.id();
+        let corrupt_path = corrupt.path().unwrap().to_path_buf();
+        drop(corrupt);
+        let mut file = OpenOptions::new().append(true).open(&corrupt_path).unwrap();
+        file.write_all(b"not json\n").unwrap();
+        drop(file);
+
+        let resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
+        assert_eq!(resumed.id(), conversation_id);
+        drop(resumed);
+
+        let error = Session::resume_in(base.path(), project.path(), Some(&corrupt_id.to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid session record"));
     }
 
     #[test]
