@@ -145,7 +145,6 @@ TUI 命令：
 |---|---|
 | `/model [provider/model]` | 查看或切换模型 |
 | `/effort [LEVEL]` | 查看或切换思考强度 |
-| `/thinking [show\|hide]` | 显示或隐藏思考过程 |
 | `/search [disabled\|cached\|live]` | 查看或切换网页搜索 |
 | `/compact [INSTRUCTIONS]` | 手动压缩上下文 |
 | `/status` | 显示模型、端点和 token |
@@ -155,12 +154,11 @@ TUI 命令：
 | `/help` | 显示帮助 |
 | `/exit` | 退出 |
 
-思考过程默认隐藏；使用 `/thinking show` 可查看全文。
-
 输入 `/` 后可用方向键选择，Tab 补全，Enter 补全并立即执行命令。Enter 提交，Shift+Enter
 或 Alt+Enter 换行，Escape 取消当前任务。使用 `Ctrl+V` 粘贴 Wayland 剪贴板中的图片或文本，
-也可将单个图片文件拖入终端；启动时可用 `-i/--image` 附加图片。使用鼠标滚轮或方向键逐行
-滚动，PageUp/PageDown 翻页，Ctrl+Home/Ctrl+End 跳到顶部/底部。删除确认默认选择 No，
+也可将单个图片文件拖入终端；启动时可用 `-i/--image` 附加图片。使用上下方向键恢复历史
+输入，鼠标滚轮滚动对话，PageUp/PageDown 翻页，Ctrl+Home/Ctrl+End 跳到顶部/底部。
+删除确认默认选择 No，
 使用方向键切换并按 Enter 确认。审批提示中 `y` 允许一次，`a` 在当前会话允许同名工具，
 `n` 拒绝。
 

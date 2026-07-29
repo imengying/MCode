@@ -17,7 +17,7 @@ use pulldown_cmark::{
     Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions, Parser, Tag, TagEnd,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -41,10 +41,11 @@ const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
 const INPUT_PREFIX_WIDTH: u16 = 2;
 const MAX_INPUT_HEIGHT: u16 = 5;
+const MAX_INPUT_HISTORY: usize = 100;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
+const PREVIEW_LINE_CHARS: usize = 240;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
-const TOOL_PREVIEW_LINE_CHARS: usize = 240;
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
     ("image/png", "png"),
@@ -154,7 +155,6 @@ pub fn run_interactive(
         }
 
         if last_frame.elapsed() >= FRAME_INTERVAL {
-            state.spinner_frame = state.spinner_frame.wrapping_add(1);
             terminal
                 .draw(|frame| render(frame, &mut state))
                 .context("绘制终端界面失败")?;
@@ -398,11 +398,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "查看或设置 effort",
     },
     SlashCommand {
-        name: "thinking",
-        accepts_argument: true,
-        description: "显示或隐藏思考过程",
-    },
-    SlashCommand {
         name: "search",
         accepts_argument: true,
         description: "查看或设置网页搜索模式",
@@ -535,19 +530,6 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                 }
             })
             .collect(),
-        "thinking" => [
-            ("show", "显示思考过程"),
-            ("hide", "隐藏思考过程"),
-            ("toggle", "切换显示状态"),
-        ]
-        .into_iter()
-        .filter(|(value, _)| value.starts_with(&query))
-        .map(|(value, description)| SlashSuggestion {
-            label: format!("/thinking {value}"),
-            replacement: format!("/thinking {value}"),
-            description: description.to_string(),
-        })
-        .collect(),
         "search" => WebSearchMode::ALL
             .into_iter()
             .filter(|mode| mode.as_str().starts_with(&query))
@@ -570,6 +552,7 @@ fn complete_slash_suggestion(state: &mut UiState) -> bool {
     ) else {
         return false;
     };
+    state.detach_input_history();
     state.editor.set_text(&suggestion.replacement);
     state.slash_selection = 0;
     true
@@ -683,6 +666,7 @@ fn handle_key(
                 return UiAction::Quit;
             }
             KeyCode::Char('j') => {
+                state.detach_input_history();
                 state.editor.insert('\n');
                 return UiAction::None;
             }
@@ -740,6 +724,7 @@ fn handle_key(
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 || key.modifiers.contains(KeyModifiers::ALT) =>
         {
+            state.detach_input_history();
             state.editor.insert('\n');
         }
         KeyCode::Enter if !state.running => {
@@ -750,6 +735,7 @@ fn handle_key(
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
+            state.detach_input_history();
             state.editor.insert(character);
             state.slash_selection = 0;
         }
@@ -759,11 +745,13 @@ fn handle_key(
                     state.status = attachment_status(state.pending_images.len());
                 }
             } else {
+                state.detach_input_history();
                 state.editor.backspace();
             }
             state.slash_selection = 0;
         }
         KeyCode::Delete => {
+            state.detach_input_history();
             state.editor.delete();
             state.slash_selection = 0;
         }
@@ -771,8 +759,8 @@ fn handle_key(
         KeyCode::Right => state.editor.move_right(),
         KeyCode::Home => state.editor.move_home(),
         KeyCode::End => state.editor.move_end(),
-        KeyCode::Up => state.scroll_lines_up(1),
-        KeyCode::Down => state.scroll_lines_down(1),
+        KeyCode::Up => state.previous_input(),
+        KeyCode::Down => state.next_input(),
         KeyCode::PageUp => state.scroll_up(),
         KeyCode::PageDown => state.scroll_down(),
         _ => {}
@@ -786,6 +774,7 @@ fn submit_editor(state: &mut UiState) -> UiAction {
     if prompt.trim().is_empty() {
         return UiAction::None;
     }
+    state.record_input(prompt.clone());
     let trimmed = prompt.trim();
     let Some(command) = trimmed.strip_prefix('/') else {
         state.delete_confirmation = DeleteConfirmation::None;
@@ -846,15 +835,6 @@ fn submit_editor(state: &mut UiState) -> UiAction {
             ));
             UiAction::None
         }
-        "thinking" => {
-            match argument.to_ascii_lowercase().as_str() {
-                "" | "toggle" => state.toggle_thinking(),
-                "show" => state.set_thinking_visible(true),
-                "hide" => state.set_thinking_visible(false),
-                _ => state.push_error("用法：/thinking、/thinking show 或 /thinking hide"),
-            }
-            UiAction::None
-        }
         "search" if argument.is_empty() => {
             state.push_notice(format!(
                 "网页搜索：{}\n使用 /search <disabled|cached|live> 选择。",
@@ -878,7 +858,7 @@ fn submit_editor(state: &mut UiState) -> UiAction {
         }
         "help" => {
             state.push_notice(
-                "命令：/model [ID]、/effort [级别]、/thinking [show|hide]、/search [模式]、/compact [说明]、/status、/new、/delete、/clear、/help、/exit",
+                "命令：/model [ID]、/effort [级别]、/search [模式]、/compact [说明]、/status、/new、/delete、/clear、/help、/exit",
             );
             UiAction::None
         }
@@ -957,6 +937,7 @@ fn read_limited(reader: impl io::Read, max_bytes: u64) -> io::Result<Vec<u8>> {
 }
 
 fn paste_text_or_image(state: &mut UiState, text: &str) {
+    state.detach_input_history();
     let image =
         pasted_image_path(text).and_then(|path| ImageAttachment::load(&path, &state.cwd).ok());
     if let Some(image) = image {
@@ -1048,7 +1029,7 @@ impl Editor {
             self.cursor,
             EditorItem::Paste {
                 content: text.to_string(),
-                label: format!("[已粘贴 {character_count} 个字符]"),
+                label: "…".to_string(),
             },
         );
         self.cursor += 1;
@@ -1104,6 +1085,17 @@ impl Editor {
             match item {
                 EditorItem::Character(character) => text.push(*character),
                 EditorItem::Paste { label, .. } => text.push_str(label),
+            }
+        }
+        text
+    }
+
+    fn content(&self) -> String {
+        let mut text = String::new();
+        for item in &self.items {
+            match item {
+                EditorItem::Character(character) => text.push(*character),
+                EditorItem::Paste { content, .. } => text.push_str(content),
             }
         }
         text
@@ -1195,13 +1187,6 @@ enum DeleteChoice {
     No,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum ThinkingDisplay {
-    #[default]
-    Hidden,
-    Shown,
-}
-
 #[derive(Debug)]
 struct ViewMessage {
     role: ViewRole,
@@ -1226,6 +1211,13 @@ enum ApprovalChoice {
     ApproveOnce,
     ApproveForSession,
     Deny,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ReasoningActivityState {
+    #[default]
+    Inactive,
+    Active,
 }
 
 impl ApprovalChoice {
@@ -1275,7 +1267,6 @@ struct UiState {
     context_window: u64,
     max_input_tokens: u64,
     usage_estimated: bool,
-    spinner_frame: usize,
     scroll: usize,
     max_scroll: usize,
     viewport_height: usize,
@@ -1283,7 +1274,14 @@ struct UiState {
     delete_confirmation: DeleteConfirmation,
     pending_images: Vec<ImageAttachment>,
     slash_selection: usize,
-    thinking_display: ThinkingDisplay,
+    input_history: Vec<String>,
+    input_history_index: Option<usize>,
+    input_history_draft: Option<String>,
+    reasoning_buffer: String,
+    reasoning_summary_parts: Vec<String>,
+    reasoning_header: Option<String>,
+    reasoning_activity_header: Option<String>,
+    reasoning_activity_state: ReasoningActivityState,
     mcp_server_count: usize,
     mcp_tool_count: usize,
     pending_approval: Option<ApprovalView>,
@@ -1313,7 +1311,6 @@ impl UiState {
             context_window: 128_000,
             max_input_tokens: 128_000,
             usage_estimated: false,
-            spinner_frame: 0,
             scroll: 0,
             max_scroll: 0,
             viewport_height: 1,
@@ -1321,7 +1318,14 @@ impl UiState {
             delete_confirmation: DeleteConfirmation::None,
             pending_images: Vec::new(),
             slash_selection: 0,
-            thinking_display: ThinkingDisplay::Hidden,
+            input_history: Vec::new(),
+            input_history_index: None,
+            input_history_draft: None,
+            reasoning_buffer: String::new(),
+            reasoning_summary_parts: Vec::new(),
+            reasoning_header: None,
+            reasoning_activity_header: None,
+            reasoning_activity_state: ReasoningActivityState::Inactive,
             mcp_server_count: 0,
             mcp_tool_count: 0,
             pending_approval: None,
@@ -1351,10 +1355,9 @@ impl UiState {
         match message.role {
             MessageRole::System => {}
             MessageRole::User => {
-                let content = sanitize_terminal_text(&format_user_content(
-                    message.content.unwrap_or_default(),
-                    &message.images,
-                ));
+                let prompt = message.content.unwrap_or_default();
+                self.record_input(prompt.clone());
+                let content = sanitize_terminal_text(&format_user_content(prompt, &message.images));
                 self.messages.push(ViewMessage {
                     role: ViewRole::User,
                     title: String::new(),
@@ -1366,9 +1369,18 @@ impl UiState {
                 });
             }
             MessageRole::Assistant => {
+                let reasoning = if self.api == ApiProtocol::Responses {
+                    let mut parts = response_reasoning_summary_parts(&message.response_items);
+                    if parts.is_empty()
+                        && let Some(summary) = message.reasoning_content.as_deref()
+                    {
+                        parts.push(summary.to_string());
+                    }
+                    visible_reasoning_summary(&parts).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let content = sanitize_terminal_text(&message.content.unwrap_or_default());
-                let reasoning =
-                    sanitize_terminal_text(&message.reasoning_content.unwrap_or_default());
                 if !content.is_empty() || !reasoning.is_empty() {
                     self.messages.push(ViewMessage {
                         role: ViewRole::Assistant,
@@ -1423,6 +1435,7 @@ impl UiState {
     }
 
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
+        self.record_input(prompt.clone());
         self.messages.push(ViewMessage {
             role: ViewRole::User,
             title: String::new(),
@@ -1492,6 +1505,119 @@ impl UiState {
         self.delete_confirmation = DeleteConfirmation::None;
         self.pending_images.clear();
         self.pending_approval = None;
+        self.input_history.clear();
+        self.detach_input_history();
+        self.reset_reasoning_summary();
+    }
+
+    fn start_reasoning_summary(&mut self) {
+        self.reset_reasoning_summary();
+        self.reasoning_activity_state = ReasoningActivityState::Active;
+    }
+
+    fn begin_reasoning_summary_part(&mut self) {
+        if !self.reasoning_buffer.is_empty() {
+            self.reasoning_summary_parts
+                .push(std::mem::take(&mut self.reasoning_buffer));
+        }
+        self.reasoning_header = None;
+        self.reasoning_activity_state = ReasoningActivityState::Active;
+    }
+
+    fn append_reasoning_summary(&mut self, text: &str) {
+        self.reasoning_activity_state = ReasoningActivityState::Active;
+        self.reasoning_buffer
+            .push_str(&sanitize_terminal_text(text));
+        if self.reasoning_header.is_none() {
+            self.reasoning_header = extract_first_bold(&self.reasoning_buffer);
+            if let Some(header) = &self.reasoning_header {
+                self.reasoning_activity_header = Some(header.clone());
+            }
+        }
+    }
+
+    fn finish_reasoning_summary(&mut self) {
+        if !self.reasoning_buffer.is_empty() {
+            self.reasoning_summary_parts
+                .push(std::mem::take(&mut self.reasoning_buffer));
+        }
+        let parts = std::mem::take(&mut self.reasoning_summary_parts);
+        if let Some(reasoning) = visible_reasoning_summary(&parts) {
+            let index = self.ensure_assistant_message();
+            if let Some(message) = self.messages.get_mut(index) {
+                message.reasoning = reasoning;
+            }
+        }
+        self.reasoning_header = None;
+        self.reasoning_activity_header = None;
+        self.reasoning_activity_state = ReasoningActivityState::Inactive;
+    }
+
+    fn reset_reasoning_summary(&mut self) {
+        self.reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
+        self.reasoning_header = None;
+        self.reasoning_activity_header = None;
+        self.reasoning_activity_state = ReasoningActivityState::Inactive;
+    }
+
+    fn reasoning_activity(&self) -> Option<String> {
+        (self.running && self.reasoning_activity_state == ReasoningActivityState::Active).then(
+            || {
+                self.reasoning_activity_header
+                    .clone()
+                    .unwrap_or_else(|| "正在思考…".to_string())
+            },
+        )
+    }
+
+    fn record_input(&mut self, input: String) {
+        self.detach_input_history();
+        if input.trim().is_empty() || self.input_history.last() == Some(&input) {
+            return;
+        }
+        if self.input_history.len() == MAX_INPUT_HISTORY {
+            self.input_history.remove(0);
+        }
+        self.input_history.push(input);
+    }
+
+    fn previous_input(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        if self.input_history_index.is_none() {
+            self.input_history_draft = Some(self.editor.content());
+        }
+        let index = self
+            .input_history_index
+            .map_or(self.input_history.len() - 1, |index| {
+                index.saturating_sub(1)
+            });
+        self.input_history_index = Some(index);
+        self.editor.set_text(&self.input_history[index]);
+        self.slash_selection = 0;
+    }
+
+    fn next_input(&mut self) {
+        let Some(index) = self.input_history_index else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            let next = index + 1;
+            self.input_history_index = Some(next);
+            self.editor.set_text(&self.input_history[next]);
+        } else {
+            self.input_history_index = None;
+            self.editor
+                .set_text(&self.input_history_draft.take().unwrap_or_default());
+        }
+        self.slash_selection = 0;
+    }
+
+    fn detach_input_history(&mut self) {
+        self.input_history_index = None;
+        self.input_history_draft = None;
     }
 
     fn model_list_notice(&self) -> String {
@@ -1575,25 +1701,6 @@ impl UiState {
         )
     }
 
-    fn toggle_thinking(&mut self) {
-        let visible = self.thinking_display == ThinkingDisplay::Hidden;
-        self.set_thinking_visible(visible);
-    }
-
-    fn set_thinking_visible(&mut self, visible: bool) {
-        self.thinking_display = if visible {
-            ThinkingDisplay::Shown
-        } else {
-            ThinkingDisplay::Hidden
-        };
-        self.follow_tail = true;
-        self.push_notice(if visible {
-            "已显示思考过程。"
-        } else {
-            "已隐藏思考过程。"
-        });
-    }
-
     fn status_notice(&self) -> String {
         let qualified_model = self.qualified_model();
         let estimate = if self.usage_estimated { "~" } else { "" };
@@ -1625,6 +1732,8 @@ impl UiState {
             AgentEvent::AssistantStarted => {
                 let index = self.start_assistant_message();
                 self.generation_start = Some(index);
+                self.start_reasoning_summary();
+                self.status = "正在思考".to_string();
             }
             AgentEvent::AssistantRetrying {
                 attempt,
@@ -1647,23 +1756,32 @@ impl UiState {
                     assistant.running = true;
                 }
                 self.current_assistant = Some(index);
+                self.start_reasoning_summary();
                 self.status = format!(
                     "正在重试响应（{attempt}/{max_attempts}）：{}",
                     sanitize_terminal_text(&message)
                 );
             }
             AgentEvent::TextDelta { text } => {
+                self.finish_reasoning_summary();
                 let index = self.ensure_assistant_message();
                 if let Some(message) = self.messages.get_mut(index) {
                     message.content.push_str(&sanitize_terminal_text(&text));
                 }
+                self.status = "正在生成回复".to_string();
             }
-            AgentEvent::ReasoningDelta { text } => {
-                let index = self.ensure_assistant_message();
-                if let Some(message) = self.messages.get_mut(index) {
-                    message.reasoning.push_str(&sanitize_terminal_text(&text));
+            AgentEvent::ReasoningSummaryDelta { text } => {
+                if self.api == ApiProtocol::Responses {
+                    self.append_reasoning_summary(&text);
+                }
+                self.status = "正在思考".to_string();
+            }
+            AgentEvent::ReasoningSummaryPartAdded { .. } => {
+                if self.api == ApiProtocol::Responses {
+                    self.begin_reasoning_summary_part();
                 }
             }
+            AgentEvent::ReasoningSummaryFinished => self.finish_reasoning_summary(),
             AgentEvent::ApprovalRequested {
                 id,
                 name,
@@ -1718,6 +1836,7 @@ impl UiState {
                 self.finish_current_assistant_for_tool();
                 let name = sanitize_terminal_text(&name);
                 let arguments = format_tool_input(&name, &arguments);
+                self.status = tool_running_status(&name);
                 if let Some(message) = self
                     .messages
                     .iter_mut()
@@ -1760,6 +1879,7 @@ impl UiState {
                         message.role = ViewRole::Error;
                     }
                 }
+                self.status = "处理中".to_string();
             }
             AgentEvent::WebSearchStarted { id } => {
                 self.finish_current_assistant_for_tool();
@@ -1862,9 +1982,16 @@ impl UiState {
                     ));
                 }
             }
-            AgentEvent::RunFinished => self.finish_run("就绪"),
-            AgentEvent::Cancelled => self.finish_run("已取消"),
+            AgentEvent::RunFinished => {
+                self.finish_reasoning_summary();
+                self.finish_run("就绪");
+            }
+            AgentEvent::Cancelled => {
+                self.reset_reasoning_summary();
+                self.finish_run("已取消");
+            }
             AgentEvent::Error { message } => {
+                self.reset_reasoning_summary();
                 self.finish_run("错误");
                 self.messages.push(ViewMessage {
                     role: ViewRole::Error,
@@ -1884,11 +2011,17 @@ impl UiState {
         for message in &mut self.messages {
             message.running = false;
         }
+        self.messages.retain(|message| {
+            message.role != ViewRole::Assistant
+                || !message.content.is_empty()
+                || !message.reasoning.is_empty()
+        });
         self.current_assistant = None;
         self.generation_start = None;
         self.running = false;
         self.status = status.to_string();
         self.pending_approval = None;
+        self.reset_reasoning_summary();
     }
 
     fn start_assistant_message(&mut self) -> usize {
@@ -1912,6 +2045,7 @@ impl UiState {
     }
 
     fn finish_current_assistant_for_tool(&mut self) {
+        self.finish_reasoning_summary();
         if let Some(index) = self.current_assistant {
             if self
                 .messages
@@ -1982,8 +2116,9 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     } else {
         slash_suggestions(state).len()
     };
-    let reserved_height = 1_u16
-        .saturating_add(3)
+    let activity_height = u16::from(state.reasoning_activity().is_some());
+    let reserved_height = 3_u16
+        .saturating_add(activity_height)
         .saturating_add(input_height)
         .saturating_add(1);
     let suggestion_height = u16::try_from(suggestion_count)
@@ -1993,54 +2128,50 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(suggestion_height),
+            Constraint::Length(activity_height),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .split(area);
-    render_header(frame, state, areas[0]);
-    render_conversation(frame, state, areas[1]);
-    render_slash_suggestions(frame, state, areas[2]);
+    render_conversation(frame, state, areas[0]);
+    render_slash_suggestions(frame, state, areas[1]);
+    render_reasoning_activity(frame, state, areas[2]);
     render_input(frame, state, areas[3]);
     render_footer(frame, state, areas[4]);
 }
 
-fn render_header(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
-    let spinner = ["-", "\\", "|", "/"][state.spinner_frame % 4];
-    let (activity, activity_color) = if state.running {
-        (spinner, Color::Yellow)
-    } else {
-        ("•", Color::Rgb(103, 232, 163))
+fn render_reasoning_activity(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    let Some(activity) = state.reasoning_activity() else {
+        return;
     };
-    let line = Line::from(vec![
-        Span::styled(
-            " MCode ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(103, 232, 163))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(activity, Style::default().fg(activity_color)),
-        Span::raw(" "),
-        Span::styled(
-            state.status.clone(),
-            Style::default().fg(if state.running {
-                Color::White
-            } else {
-                Color::Gray
-            }),
-        ),
-    ]);
+    let available = usize::from(area.width).saturating_sub(2);
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Color::Rgb(24, 27, 32))),
+        Paragraph::new(Line::from(vec![
+            Span::styled("• ", Style::default().fg(Color::Rgb(245, 190, 78))),
+            Span::styled(
+                truncate_width(&activity, available.saturating_add(1)),
+                Style::default().fg(Color::Gray),
+            ),
+        ])),
         area,
     );
 }
 
 fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
+    if state.messages.is_empty()
+        && !state.running
+        && state.pending_approval.is_none()
+        && state.delete_confirmation == DeleteConfirmation::None
+    {
+        state.viewport_height = usize::from(area.height.max(1));
+        state.max_scroll = 0;
+        state.scroll = 0;
+        state.follow_tail = true;
+        render_welcome(frame, state, area);
+        return;
+    }
     let lines = conversation_lines(state);
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total_height = paragraph.line_count(area.width);
@@ -2055,6 +2186,79 @@ fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
     }
     let scroll = u16::try_from(state.scroll).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), area);
+}
+
+fn render_welcome(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    let width = area.width.min(68);
+    let height = area.height.min(7);
+    let welcome_area = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 3),
+        width,
+        height,
+    );
+    let inner_width = usize::from(width.saturating_sub(2));
+    let model = format!(
+        "{}（{} 上下文） · effort {}",
+        state.qualified_model(),
+        format_tokens(state.max_input_tokens),
+        state.reasoning_effort
+    );
+    let cwd = friendly_project_path(&state.cwd);
+    let lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "欢迎回来！",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            truncate_width(&model, inner_width.saturating_add(1)),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            truncate_width(&cwd, inner_width.saturating_add(1)),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(vec![
+                    Span::styled(
+                        " MCode",
+                        Style::default()
+                            .fg(Color::Rgb(103, 232, 163))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" v{} ", env!("CARGO_PKG_VERSION")),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+                .border_style(Style::default().fg(Color::Rgb(103, 232, 163))),
+        ),
+        welcome_area,
+    );
+}
+
+fn friendly_project_path(path: &std::path::Path) -> String {
+    let display = dirs::home_dir()
+        .and_then(|home| {
+            path.strip_prefix(home).ok().map(|relative| {
+                if relative.as_os_str().is_empty() {
+                    "~".to_string()
+                } else {
+                    format!("~/{}", relative.display())
+                }
+            })
+        })
+        .unwrap_or_else(|| path.display().to_string());
+    sanitize_terminal_text(&display)
 }
 
 fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
@@ -2524,77 +2728,102 @@ fn display_width(text: &str) -> usize {
         .sum()
 }
 
+fn extract_first_bold(text: &str) -> Option<String> {
+    let (_, after_open) = text.split_once("**")?;
+    let (header, _) = after_open.split_once("**")?;
+    let header = header.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!header.is_empty()).then_some(header)
+}
+
+fn response_reasoning_summary_parts(items: &[serde_json::Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .flat_map(|item| {
+            item.get("summary")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("summary_text"))
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn visible_reasoning_summary(parts: &[String]) -> Option<String> {
+    let parts = parts
+        .iter()
+        .map(|part| sanitize_terminal_text(part))
+        .collect::<Vec<_>>();
+    let (header, content) = split_reasoning_summary_parts(&parts);
+    (!header.is_empty() && !content.trim().is_empty()).then(|| content.trim().to_string())
+}
+
+fn split_reasoning_summary_parts(parts: &[String]) -> (String, String) {
+    let mut placeholder_header = None;
+    let mut content_parts = Vec::with_capacity(parts.len());
+
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let header_end = part.strip_prefix("**").and_then(|after_open| {
+            after_open
+                .find("**")
+                .and_then(|close| (close > 0).then_some(close + 4))
+        });
+        let body = header_end.map_or(part, |header_end| &part[header_end..]);
+        if body.trim() == "<!-- -->" {
+            if content_parts.is_empty()
+                && placeholder_header.is_none()
+                && let Some(header_end) = header_end
+            {
+                placeholder_header = Some(part[..header_end].to_string());
+            }
+            continue;
+        }
+        content_parts.push(part);
+    }
+
+    let content = content_parts.join("\n\n");
+    if content.is_empty() {
+        return (placeholder_header.unwrap_or_default(), content);
+    }
+    if let Some(after_open) = content.strip_prefix("**")
+        && let Some(close) = after_open.find("**")
+    {
+        let after_close = 2 + close + 2;
+        if matches!(content[after_close..].chars().next(), Some('\n' | '\r')) {
+            return (
+                content[..after_close].to_string(),
+                content[after_close..].to_string(),
+            );
+        }
+    }
+    (placeholder_header.unwrap_or_default(), content)
+}
+
 fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for message in &state.messages {
         if message.role == ViewRole::Assistant {
+            if message.reasoning.is_empty() && message.content.is_empty() {
+                continue;
+            }
             if !message.reasoning.is_empty() {
-                let reasoning_in_progress = message.running && message.content.is_empty();
-                let show_reasoning = state.thinking_display == ThinkingDisplay::Shown;
-                if show_reasoning {
-                    let running = if reasoning_in_progress {
-                        "（思考中）"
-                    } else {
-                        ""
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "• 思考",
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(running, Style::default().fg(Color::DarkGray)),
-                    ]));
-                    for line in message.reasoning.lines() {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
-                        ]));
-                    }
-                } else {
-                    let line_count = message
-                        .reasoning
-                        .bytes()
-                        .filter(|byte| byte == &b'\n')
-                        .count()
-                        + 1;
-                    let character_count = message.reasoning.chars().count();
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "• 思考",
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("（已隐藏，{line_count} 行，{character_count} 个字符）"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                }
+                append_reasoning_summary(&mut lines, &message.reasoning);
                 if !message.content.is_empty() {
                     lines.push(Line::default());
                 }
             }
-            if !message.content.is_empty() || message.reasoning.is_empty() {
-                if message.content.is_empty() && message.running {
-                    lines.push(Line::from(Span::styled(
-                        "• 正在回复...",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                } else {
-                    append_markdown_lines(
-                        &mut lines,
-                        &message.content,
-                        Style::default().fg(Color::White),
-                    );
-                }
+            if !message.content.is_empty() {
+                append_markdown_lines(
+                    &mut lines,
+                    &message.content,
+                    Style::default().fg(Color::White),
+                );
             }
             lines.push(Line::default());
             continue;
@@ -2631,13 +2860,26 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
         append_markdown_lines(&mut lines, &message.content, content_style);
         lines.push(Line::default());
     }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "就绪。",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
     lines
+}
+
+fn append_reasoning_summary(lines: &mut Vec<Line<'static>>, reasoning: &str) {
+    for (index, mut line) in MarkdownRenderer::new(Style::default())
+        .render(reasoning)
+        .into_iter()
+        .enumerate()
+    {
+        for span in &mut line.spans {
+            span.style = span.style.fg(Color::Gray).add_modifier(Modifier::ITALIC);
+        }
+        let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
+        spans.push(Span::styled(
+            if index == 0 { "• " } else { "  " },
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
 }
 
 fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
@@ -2664,13 +2906,10 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
     let failed = message.role == ViewRole::Error;
     let color = if failed {
         Color::LightRed
-    } else {
+    } else if message.running {
         Color::Rgb(245, 190, 78)
-    };
-    let status = if message.running {
-        "（运行中）"
     } else {
-        ""
+        Color::Rgb(103, 232, 163)
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -2678,10 +2917,9 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            message.title.clone(),
+            tool_action_title(&message.title, message.running, failed),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(status, Style::default().fg(Color::DarkGray)),
     ]));
 
     if let Some(arguments) = message
@@ -2694,7 +2932,7 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
         } else {
             "  ↳ "
         };
-        append_collapsed_plain_lines(
+        append_preview_lines(
             lines,
             arguments,
             TOOL_ARGUMENT_PREVIEW_LINES,
@@ -2704,7 +2942,7 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
         );
     }
     if !message.content.is_empty() {
-        append_collapsed_plain_lines(
+        append_preview_lines(
             lines,
             &message.content,
             TOOL_OUTPUT_PREVIEW_LINES,
@@ -2719,7 +2957,43 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
     }
 }
 
-fn append_collapsed_plain_lines(
+fn tool_running_status(name: &str) -> String {
+    tool_action_title(name, true, false)
+}
+
+fn tool_action_title(name: &str, running: bool, failed: bool) -> String {
+    if name.starts_with("等待审批：") || name.starts_with("已允许") || name.starts_with("已拒绝：")
+    {
+        return name.to_string();
+    }
+    let labels = match name {
+        "shell" => ("正在运行命令", "已运行命令", "命令运行失败"),
+        "read_file" => ("正在读取文件", "已读取文件", "读取文件失败"),
+        "write_file" => ("正在写入文件", "已写入文件", "写入文件失败"),
+        "edit_file" => ("正在编辑文件", "已编辑文件", "编辑文件失败"),
+        "web_search" | "网页搜索" => ("正在搜索网页", "已搜索网页", "网页搜索失败"),
+        "fetch_content" => ("正在读取网页", "已读取网页", "读取网页失败"),
+        _ => {
+            return if failed {
+                format!("{name} 运行失败")
+            } else if running {
+                format!("正在运行 {name}")
+            } else {
+                format!("已运行 {name}")
+            };
+        }
+    };
+    if failed {
+        labels.2
+    } else if running {
+        labels.0
+    } else {
+        labels.1
+    }
+    .to_string()
+}
+
+fn append_preview_lines(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     limit: usize,
@@ -2736,18 +3010,17 @@ fn append_collapsed_plain_lines(
         };
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(truncate_tool_preview_line(line), style),
+            Span::styled(truncate_preview_line(line), style),
         ]));
     }
-    let hidden = content_lines.len().saturating_sub(limit);
-    if hidden > 0 {
+    if content_lines.len() > limit {
         lines.push(Line::from(vec![
             Span::styled(
                 continuation_prefix.to_string(),
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                format!("… 已折叠 {hidden} 行"),
+                "…",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -2756,11 +3029,11 @@ fn append_collapsed_plain_lines(
     }
 }
 
-fn truncate_tool_preview_line(line: &str) -> String {
+fn truncate_preview_line(line: &str) -> String {
     let mut characters = line.chars();
     let preview = characters
         .by_ref()
-        .take(TOOL_PREVIEW_LINE_CHARS)
+        .take(PREVIEW_LINE_CHARS)
         .collect::<String>();
     if characters.next().is_some() {
         format!("{preview}…")
@@ -3103,7 +3376,7 @@ fn truncate_for_ui(text: &str) -> String {
     let mut chars = text.chars();
     let prefix: String = chars.by_ref().take(LIMIT).collect();
     if chars.next().is_some() {
-        format!("{prefix}\n... 界面中的输出已截短；完整结果已发送给模型")
+        format!("{prefix}\n…")
     } else {
         prefix
     }
@@ -3193,10 +3466,7 @@ mod tests {
         editor.insert_paste(&pasted);
         editor.insert_str(" after");
 
-        assert_eq!(
-            editor.text(),
-            format!("before [已粘贴 {COLLAPSED_PASTE_CHAR_THRESHOLD} 个字符] after")
-        );
+        assert_eq!(editor.text(), "before … after");
         assert_eq!(editor.take(), format!("before {pasted} after"));
     }
 
@@ -3211,7 +3481,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         editor.insert_paste(&pasted);
-        assert!(editor.text().contains("[已粘贴 "));
+        assert!(editor.text().ends_with('…'));
         editor.backspace();
         assert_eq!(editor.text(), "short\npaste");
     }
@@ -3225,7 +3495,7 @@ mod tests {
             std::path::PathBuf::from("."),
         );
         state.editor.insert_paste(&pasted);
-        assert!(state.editor.text().starts_with("[已粘贴 "));
+        assert_eq!(state.editor.text(), "…");
 
         let action = handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -3236,6 +3506,46 @@ mod tests {
             action,
             UiAction::Submit { prompt, images } if prompt == pasted && images.is_empty()
         ));
+    }
+
+    #[test]
+    fn arrow_keys_restore_input_history_and_the_current_draft() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_history(ChatMessage::user("first prompt"));
+        state.push_history(ChatMessage::user("second prompt"));
+        state.editor.insert_str("current draft");
+        state.scroll = 4;
+        state.max_scroll = 10;
+
+        handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "second prompt");
+        assert_eq!(state.scroll, 4);
+        handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "first prompt");
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "second prompt");
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "current draft");
     }
 
     #[test]
@@ -3320,7 +3630,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.replace(' ', "").contains("[已粘贴"));
+        assert!(rendered.contains('…'));
         assert!(!rendered.contains("private-start"));
     }
 
@@ -3378,6 +3688,12 @@ mod tests {
             })
             .to_string(),
         });
+        let running = conversation_lines(&state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(running.contains("• 正在运行命令"));
         state.apply_agent_event(AgentEvent::ToolFinished {
             id: "call_shell".to_string(),
             name: "shell".to_string(),
@@ -3393,7 +3709,7 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("• shell"));
+        assert!(rendered.contains("• 已运行命令"));
         assert!(rendered.contains("$ first"));
         assert!(rendered.contains("second"));
         assert!(!rendered.contains("third"));
@@ -3401,8 +3717,11 @@ mod tests {
         assert!(rendered.contains("output 4"));
         assert!(!rendered.contains("output 5"));
         assert!(!rendered.contains("output 11"));
-        assert!(rendered.contains("已折叠 1 行"));
-        assert!(rendered.contains("已折叠 7 行"));
+        assert_eq!(
+            rendered.lines().filter(|line| line.trim() == "…").count(),
+            2
+        );
+        assert!(!rendered.contains("折叠"));
     }
 
     #[test]
@@ -3442,11 +3761,14 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("• read_file"));
+        assert!(rendered.contains("• 已读取文件"));
         assert!(rendered.contains("README.md"));
         assert!(rendered.contains("line 0"));
         assert!(!rendered.contains("line 7"));
-        assert!(rendered.contains("已折叠 3 行"));
+        assert_eq!(
+            rendered.lines().filter(|line| line.trim() == "…").count(),
+            1
+        );
     }
 
     #[test]
@@ -3488,11 +3810,11 @@ mod tests {
             rendered.push_str(cell.symbol());
         }
 
-        assert!(rendered.contains("MCode"));
+        assert!(!rendered.contains("MCode"));
         assert!(rendered.contains("test-model"));
         assert!(rendered.contains("Please inspect the project"));
         assert!(rendered.contains("I found the relevant module."));
-        assert!(rendered.replace(' ', "").contains("网页搜索"));
+        assert!(rendered.replace(' ', "").contains("已搜索网页"));
         assert!(rendered.contains("current release"));
         assert!(rendered.contains("The current release is available."));
         assert!(!rendered.contains("你"));
@@ -3528,90 +3850,150 @@ mod tests {
     }
 
     #[test]
-    fn hides_active_and_completed_thinking_by_default() {
+    fn renders_a_welcome_without_an_idle_status_label() {
         let mut state = UiState::new(
-            "reasoning-model".to_string(),
+            "test-model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
             std::path::PathBuf::from("/tmp/project"),
         );
-        state.reasoning_effort = ReasoningEffort::High;
-        state.apply_agent_event(AgentEvent::AssistantStarted);
-        state.apply_agent_event(AgentEvent::ReasoningDelta {
-            text: "Inspecting the request.\nChecking the implementation.".to_string(),
-        });
-
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let rendered = rendered_terminal(&terminal);
-        assert!(rendered.replace(' ', "").contains("思考（已隐藏，2行"));
-        assert!(!rendered.contains("Inspecting the request."));
-        assert!(!rendered.contains("Checking the implementation."));
-
-        state.apply_agent_event(AgentEvent::TextDelta {
-            text: "Final response.".to_string(),
-        });
-
-        let backend = TestBackend::new(100, 24);
+        let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rendered = rendered_terminal(&terminal);
         let compact = rendered.replace(' ', "");
-        assert!(compact.contains("思考"));
-        assert!(compact.contains("已隐藏，2行"));
-        assert!(!rendered.contains("Inspecting the request."));
-        assert!(!compact.contains("助手"));
-        assert!(rendered.contains("Final response."));
-        assert!(rendered.contains("effort high"));
+
+        assert!(compact.contains("欢迎回来！"));
+        assert!(rendered.contains("MCode"));
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+        assert!(rendered.contains("test-model"));
+        assert!(rendered.contains("/tmp/project"));
+        assert!(!rendered.contains("就绪"));
     }
 
     #[test]
-    fn thinking_command_shows_and_hides_reasoning() {
-        let mut state = UiState::new(
+    fn renders_codex_style_responses_summaries_without_raw_chat_reasoning() {
+        let mut chat_state = UiState::new(
             "reasoning-model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        chat_state.apply_agent_event(AgentEvent::RunStarted);
+        chat_state.apply_agent_event(AgentEvent::AssistantStarted);
+        chat_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+            text: "Private raw reasoning.".to_string(),
+        });
+        let active = conversation_lines(&chat_state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<String>();
+        assert!(active.is_empty());
+        assert_eq!(
+            chat_state.reasoning_activity().as_deref(),
+            Some("正在思考…")
+        );
+        assert!(!active.contains("Private raw reasoning."));
+
+        chat_state.apply_agent_event(AgentEvent::TextDelta {
+            text: "Final response.".to_string(),
+        });
+        let completed = conversation_lines(&chat_state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<String>();
+        assert!(completed.contains("Final response."));
+        assert!(!completed.contains("正在思考"));
+
+        let mut responses_state = UiState::new(
+            "reasoning-model".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
-        state.messages.push(ViewMessage {
-            role: ViewRole::Assistant,
-            title: "assistant".to_string(),
-            content: "Done.".to_string(),
-            reasoning: "Hidden reasoning.".to_string(),
-            tool_arguments: None,
-            tool_id: None,
-            running: false,
+        responses_state.api = ApiProtocol::Responses;
+        responses_state.apply_agent_event(AgentEvent::RunStarted);
+        responses_state.apply_agent_event(AgentEvent::AssistantStarted);
+        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryPartAdded { index: 0 });
+        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+            text: "**Inspecting files**\n\nReading the relevant modules.".to_string(),
         });
-
-        let lines = conversation_lines(&state);
-        let rendered = lines.iter().map(Line::to_string).collect::<String>();
-        assert!(rendered.contains("思考（已隐藏"));
-        assert!(!rendered.contains("Hidden reasoning."));
-
-        state.editor.insert_str("/thinking show");
-        assert!(matches!(
-            handle_key(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut state,
-                None,
-            ),
-            UiAction::None
-        ));
-        assert_eq!(state.thinking_display, ThinkingDisplay::Shown);
-        let lines = conversation_lines(&state);
-        let rendered = lines.iter().map(Line::to_string).collect::<String>();
-        assert!(rendered.contains("Hidden reasoning."));
-
-        state.editor.insert_str("/thinking hide");
-        handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut state,
-            None,
+        assert_eq!(
+            responses_state.reasoning_activity().as_deref(),
+            Some("Inspecting files")
         );
-        assert_eq!(state.thinking_display, ThinkingDisplay::Hidden);
-        let lines = conversation_lines(&state);
-        let rendered = lines.iter().map(Line::to_string).collect::<String>();
-        assert!(rendered.contains("已隐藏"));
-        assert!(!rendered.contains("Hidden reasoning."));
+        assert!(conversation_lines(&responses_state).is_empty());
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut responses_state))
+            .unwrap();
+        let active = rendered_terminal(&terminal);
+        assert!(active.contains("• Inspecting files"));
+        assert!(!active.contains("Reading the relevant modules."));
+
+        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryPartAdded { index: 1 });
+        assert_eq!(
+            responses_state.reasoning_activity().as_deref(),
+            Some("Inspecting files")
+        );
+        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+            text: "**Running".to_string(),
+        });
+        assert_eq!(
+            responses_state.reasoning_activity().as_deref(),
+            Some("Inspecting files")
+        );
+        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+            text: " checks**\n\nVerifying the behavior.".to_string(),
+        });
+        assert_eq!(
+            responses_state.reasoning_activity().as_deref(),
+            Some("Running checks")
+        );
+        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryFinished);
+
+        let summary = conversation_lines(&responses_state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(responses_state.reasoning_activity(), None);
+        assert!(summary.contains("• Reading the relevant modules."));
+        assert!(summary.contains("Running checks"));
+        assert!(summary.contains("Verifying the behavior."));
+        assert!(!summary.contains("Inspecting files"));
+        assert!(!summary.contains('…'));
+        assert!(!summary.contains("隐藏"));
+    }
+
+    #[test]
+    fn rebuilds_responses_reasoning_summaries_from_history() {
+        let mut state = UiState::new(
+            "reasoning-model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.api = ApiProtocol::Responses;
+        state.push_history(ChatMessage::assistant_with_response_items(
+            Some("Done.".to_string()),
+            Some("raw fallback should not win".to_string()),
+            Vec::new(),
+            vec![serde_json::json!({
+                "type": "reasoning",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": "**Reviewing history**\n\nRecovered summary."
+                }]
+            })],
+        ));
+
+        let rendered = conversation_lines(&state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("• Recovered summary."));
+        assert!(!rendered.contains("Reviewing history"));
+        assert!(!rendered.contains("raw fallback"));
+        assert!(rendered.contains("Done."));
     }
 
     #[test]
@@ -3636,7 +4018,7 @@ mod tests {
         assert!(compact.contains("/model"));
         assert!(compact.contains("查看或切换模型"));
         assert!(compact.contains("/effort"));
-        assert!(rendered.contains("/thinking"));
+        assert!(!rendered.contains("/thinking"));
         assert!(!rendered.contains("[提供商/模型]"));
         assert!(!rendered.contains("[show|hide|toggle]"));
 
@@ -3752,14 +4134,6 @@ mod tests {
             UiAction::SetWebSearch(WebSearchMode::Live)
         ));
         assert!(state.editor.is_empty());
-
-        state.editor.set_text("/thinking s");
-        handle_key(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &mut state,
-            None,
-        );
-        assert_eq!(state.editor.text(), "/thinking show");
 
         state.editor.set_text("/model gro");
         handle_key(

@@ -655,6 +655,7 @@ fn responses_tools(
 struct ResponsesAccumulator {
     content: String,
     reasoning: String,
+    reasoning_summary_index: Option<usize>,
     tool_calls: Vec<ToolCall>,
     response_items: Vec<serde_json::Value>,
     seen_output_item_ids: BTreeSet<String>,
@@ -672,6 +673,7 @@ struct ResponsesStreamEvent {
     response: Option<serde_json::Value>,
     item: Option<serde_json::Value>,
     delta: Option<String>,
+    summary_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -764,10 +766,18 @@ fn apply_responses_stream_event(
                 let _ = events.send(AgentEvent::TextDelta { text });
             }
         }
+        "response.reasoning_summary_part.added" => {
+            if let Some(index) = event.summary_index {
+                begin_reasoning_summary_part(index, state, events);
+            }
+        }
         "response.reasoning_summary_text.delta" => {
             if let Some(text) = event.delta {
+                if let Some(index) = event.summary_index {
+                    begin_reasoning_summary_part(index, state, events);
+                }
                 state.reasoning.push_str(&text);
-                let _ = events.send(AgentEvent::ReasoningDelta { text });
+                let _ = events.send(AgentEvent::ReasoningSummaryDelta { text });
             }
         }
         "response.output_item.added" => {
@@ -908,22 +918,45 @@ fn apply_responses_output_item(
             }
             append_citations(citations, state, events);
         }
-        ResponsesOutputItem::Reasoning { summary } if state.reasoning.is_empty() => {
-            let text = summary
+        ResponsesOutputItem::Reasoning { summary } => {
+            let parts = summary
                 .into_iter()
                 .filter_map(|part| match part {
                     ResponsesReasoningSummary::SummaryText { text } => Some(text),
                     ResponsesReasoningSummary::Other => None,
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                state.reasoning.push_str(&text);
-                let _ = events.send(AgentEvent::ReasoningDelta { text });
+                .collect::<Vec<_>>();
+            if state.reasoning.is_empty() {
+                for (index, text) in parts.into_iter().enumerate() {
+                    begin_reasoning_summary_part(index, state, events);
+                    state.reasoning.push_str(&text);
+                    let _ = events.send(AgentEvent::ReasoningSummaryDelta { text });
+                }
             }
+            state.reasoning_summary_index = None;
+            let _ = events.send(AgentEvent::ReasoningSummaryFinished);
         }
-        ResponsesOutputItem::Reasoning { .. } | ResponsesOutputItem::Other => {}
+        ResponsesOutputItem::Other => {}
     }
+}
+
+fn begin_reasoning_summary_part(
+    index: usize,
+    state: &mut ResponsesAccumulator,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    if state.reasoning_summary_index == Some(index) {
+        return;
+    }
+    if !state.reasoning.is_empty() && !state.reasoning.ends_with("\n\n") {
+        if state.reasoning.ends_with('\n') {
+            state.reasoning.push('\n');
+        } else {
+            state.reasoning.push_str("\n\n");
+        }
+    }
+    state.reasoning_summary_index = Some(index);
+    let _ = events.send(AgentEvent::ReasoningSummaryPartAdded { index });
 }
 
 fn start_web_search(
@@ -1227,7 +1260,6 @@ fn apply_stream_chunk(
         }
         if let Some(text) = choice.delta.reasoning_content.or(choice.delta.reasoning) {
             reasoning.push_str(&text);
-            let _ = events.send(AgentEvent::ReasoningDelta { text });
         }
         for delta in choice.delta.tool_calls {
             tool_calls.entry(delta.index).or_default().apply(delta);
@@ -1418,6 +1450,69 @@ mod tests {
             vec!["{\"choices\":[]}"]
         );
         assert_eq!(decoder.push(b"NE]\n\n").unwrap(), vec!["[DONE]"]);
+    }
+
+    #[test]
+    fn responses_reasoning_emits_summary_parts_and_completion() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = ResponsesAccumulator::default();
+        for event in [
+            r#"{"type":"response.reasoning_summary_part.added","summary_index":0}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"**Inspecting**\n\nReading files."}"#,
+            r#"{"type":"response.reasoning_summary_part.added","summary_index":1}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","summary_index":1,"delta":"**Testing**\n\nRunning checks."}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+        ] {
+            apply_responses_stream_event(event, &mut state, &tx).unwrap();
+        }
+
+        assert_eq!(
+            state.reasoning,
+            "**Inspecting**\n\nReading files.\n\n**Testing**\n\nRunning checks."
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ReasoningSummaryPartAdded { index: 0 }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ReasoningSummaryDelta { text } if text.starts_with("**Inspecting**")
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ReasoningSummaryPartAdded { index: 1 }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ReasoningSummaryDelta { text } if text.starts_with("**Testing**")
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ReasoningSummaryFinished
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn chat_completions_keeps_raw_reasoning_out_of_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls = BTreeMap::new();
+        let mut usage = None;
+
+        apply_stream_chunk(
+            r#"{"choices":[{"delta":{"reasoning_content":"private chain of thought"}}]}"#,
+            &mut content,
+            &mut reasoning,
+            &mut calls,
+            &mut usage,
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(reasoning, "private chain of thought");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

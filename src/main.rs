@@ -617,7 +617,9 @@ async fn run_exec(
             AgentEvent::RunStarted
             | AgentEvent::RunResumed
             | AgentEvent::AssistantStarted
-            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::ReasoningSummaryDelta { .. }
+            | AgentEvent::ReasoningSummaryPartAdded { .. }
+            | AgentEvent::ReasoningSummaryFinished
             | AgentEvent::Usage { .. }
             | AgentEvent::RunFinished
             | AgentEvent::Cancelled => {}

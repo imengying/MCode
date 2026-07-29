@@ -24,9 +24,13 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
-    ReasoningDelta {
+    ReasoningSummaryDelta {
         text: String,
     },
+    ReasoningSummaryPartAdded {
+        index: usize,
+    },
+    ReasoningSummaryFinished,
     ToolStarted {
         id: String,
         name: String,
