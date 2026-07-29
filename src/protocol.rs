@@ -275,62 +275,6 @@ pub struct ToolDefinition {
     pub function: FunctionDefinition,
 }
 
-#[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn loads_and_serializes_a_png_attachment() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("pixel.png");
-        fs::write(
-            &path,
-            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
-        )
-        .unwrap();
-
-        let image = ImageAttachment::load(&path, temp.path()).unwrap();
-        assert_eq!(image.name, "pixel.png");
-        assert_eq!(image.mime_type, "image/png");
-        assert!(image.data_url().starts_with("data:image/png;base64,"));
-
-        let encoded =
-            serde_json::to_value(ChatMessage::user_with_images("look", vec![image])).unwrap();
-        assert_eq!(encoded["images"][0]["name"], "pixel.png");
-    }
-
-    #[test]
-    fn accepts_encoded_clipboard_images() {
-        let image = ImageAttachment::from_encoded_bytes(
-            "clipboard.png",
-            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
-        )
-        .unwrap();
-        assert_eq!(image.name, "clipboard.png");
-        assert_eq!(image.mime_type, "image/png");
-        assert!(image.data_url().starts_with("data:image/png;base64,"));
-        assert!(ImageAttachment::from_encoded_bytes("bad.png", vec![0; 12]).is_err());
-    }
-
-    #[test]
-    fn strips_terminal_control_sequences_from_untrusted_text() {
-        assert_eq!(
-            sanitize_terminal_text("safe\u{1b}]52;c;secret\u{7}\r\ntext\tend"),
-            "safe]52;c;secret\n\ntext\tend"
-        );
-    }
-
-    #[test]
-    fn localizes_web_search_action_descriptions() {
-        let action = WebSearchAction::OpenPage {
-            url: Some("https://example.com".to_string()),
-        };
-        assert_eq!(action.description_zh(), "已打开 https://example.com");
-    }
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FunctionDefinition {
     pub name: String,

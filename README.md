@@ -1,7 +1,5 @@
 # MCode
 
-[![CI](https://github.com/imengying/MCode/actions/workflows/ci.yml/badge.svg)](https://github.com/imengying/MCode/actions/workflows/ci.yml)
-
 面向 Linux Wayland 的 Rust 终端 coding agent，提供 Codex 风格交互，支持 OpenAI-compatible
 Chat Completions 和 Responses API。
 
@@ -76,9 +74,9 @@ API key 可以省略，以连接不需要认证的端点。MCode 不会保存凭
 
 | 文件 | 作用域 |
 |---|---|
-| `~/.mcode/agent/settings.json` | 全局设置 |
+| `~/.mcode/settings.json` | 全局设置 |
 | `.mcode/settings.json` | 项目设置，覆盖全局设置 |
-| `~/.mcode/agent/models.json` | 模型与端点 |
+| `~/.mcode/models.json` | 模型与端点 |
 
 完整配置见 [settings.example.json](settings.example.json) 和
 [models.example.json](models.example.json)。优先级为：命令行、环境变量、项目设置、全局设置、
@@ -189,13 +187,6 @@ cargo test --all-targets --locked
 cargo build --release --locked
 ```
 
-默认测试不联网。真实 API 测试会产生费用，必须显式运行：
-
-```bash
-MCODE_REAL_API_MODEL=gpt-5.6-terra \
-  cargo test --test real_api -- --ignored --nocapture
-```
-
-GitHub Actions 在 Linux 上执行格式、Clippy、RustSec、测试和 release 构建。`v*` tag 只触发
-Release workflow，发布 Linux musl x86_64/ARM64 二进制归档，并用 tag 之间的 commit 生成更新
-日志；发布二进制的版本取自 tag，源码归档由 GitHub 自动提供。
+默认测试不联网。GitHub Actions 仅保留 Release workflow：`v*` tag 发布 Linux musl
+x86_64/ARM64 二进制归档，并用 tag 之间的 commit 生成更新日志；发布二进制的版本取自 tag，
+源码归档由 GitHub 自动提供。

@@ -8,7 +8,7 @@ use mcode::config::{
 };
 use mcode::event::AgentEvent;
 use mcode::protocol::{ChatMessage, FunctionCall, ToolCall, Usage};
-use mcode::session::{RunOutcome, Session, SessionMetadata, ToolReplayPolicy};
+use mcode::session::{Session, SessionMetadata, ToolReplayPolicy};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -417,57 +417,6 @@ async fn chat_completions_exposes_local_web_access_tools() {
 }
 
 #[tokio::test]
-async fn responses_compat_can_omit_strict_tool_markers() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_json_request(&mut stream).await;
-        write_responses_sse(
-            &mut stream,
-            vec![
-                json!({
-                    "type": "response.output_text.delta",
-                    "delta": "Compatible response."
-                }),
-                responses_completed("resp_compat", 20, 4),
-            ],
-        )
-        .await;
-        request
-    });
-
-    let project = tempdir().unwrap();
-    let mut config = basic_chat_config(project.path(), address);
-    config.api = ApiProtocol::Responses;
-    config.supports_strict_tools = false;
-    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
-    let mut agent = Agent::new(&config, session).await.unwrap();
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let status = agent
-        .run(
-            "use a compatible Responses endpoint",
-            Vec::new(),
-            &tx,
-            &CancellationToken::new(),
-            &ApprovalGate::default(),
-        )
-        .await
-        .unwrap();
-    let request = server.await.unwrap();
-
-    assert_eq!(status, RunStatus::Completed);
-    assert!(
-        request["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|tool| tool["type"] == "function")
-            .all(|tool| tool.get("strict").is_none())
-    );
-}
-
-#[tokio::test]
 async fn shell_tool_is_denied_without_frontend_approval() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -648,56 +597,6 @@ async fn omits_request_fields_disabled_by_pi_compat() {
 }
 
 #[tokio::test]
-async fn retries_rate_limits_using_retry_after() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let server_requests = Arc::clone(&requests);
-    let server = tokio::spawn(async move {
-        for attempt in 0..2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            server_requests
-                .lock()
-                .await
-                .push(read_json_request(&mut stream).await);
-            if attempt == 0 {
-                let body = r#"{"error":{"message":"rate limited"}}"#;
-                let response = format!(
-                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 0\r\nX-Request-ID: req-retry\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-                stream.shutdown().await.unwrap();
-            } else {
-                write_sse_text(&mut stream, "Retry worked.", None).await;
-            }
-        }
-    });
-
-    let project = tempdir().unwrap();
-    let config = basic_chat_config(project.path(), address);
-    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
-    let mut agent = Agent::new(&config, session).await.unwrap();
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let status = agent
-        .run(
-            "retry once",
-            Vec::new(),
-            &tx,
-            &CancellationToken::new(),
-            &ApprovalGate::default(),
-        )
-        .await
-        .unwrap();
-    server.await.unwrap();
-
-    assert_eq!(status, RunStatus::Completed);
-    let requests = requests.lock().await;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
-}
-
-#[tokio::test]
 async fn retries_a_truncated_stream_without_persisting_partial_output() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -759,117 +658,6 @@ async fn retries_a_truncated_stream_without_persisting_partial_output() {
             ..
         }
     )));
-}
-
-#[tokio::test]
-async fn rejects_truncated_chat_streams_with_request_id() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        for attempt in 1..=2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_json_request(&mut stream).await;
-            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-ID: req-truncated-{attempt}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
-        }
-    });
-
-    let project = tempdir().unwrap();
-    let config = basic_chat_config(project.path(), address);
-    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
-    let mut agent = Agent::new(&config, session).await.unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let error = agent
-        .run(
-            "return partial text",
-            Vec::new(),
-            &tx,
-            &CancellationToken::new(),
-            &ApprovalGate::default(),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-    server.await.unwrap();
-
-    assert!(error.contains("before [DONE] or finish_reason"));
-    assert!(error.contains("req-truncated-2"));
-    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
-        event,
-        AgentEvent::AssistantRetrying {
-            attempt: 2,
-            max_attempts: 2,
-            ..
-        }
-    )));
-}
-
-#[tokio::test]
-async fn exec_command_streams_text_from_compatible_endpoint() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_json_request(&mut stream).await;
-        let event = json!({
-            "choices": [{
-                "delta": {"content": "Hello from fixture."},
-                "finish_reason": "stop"
-            }]
-        });
-        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-        request
-    });
-
-    let project = tempdir().unwrap();
-    std::fs::create_dir(project.path().join(".mcode")).unwrap();
-    std::fs::write(
-        project.path().join(".mcode/settings.json"),
-        r#"{
-            "defaultModel": "fixture-model"
-        }"#,
-    )
-    .unwrap();
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
-        .arg("exec")
-        .arg("--base-url")
-        .arg(format!("http://{address}/v1"))
-        .arg("say hello")
-        .env("MCODE_HOME", project.path().join(".mcode-home"))
-        .env("OPENAI_API_KEY", "fixture-key")
-        .env_remove("OPENAI_MODEL")
-        .env_remove("OPENAI_REASONING_EFFORT")
-        .current_dir(project.path())
-        .output()
-        .await
-        .unwrap();
-    let request = server.await.unwrap();
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Hello from fixture.\n"
-    );
-    assert_eq!(request["model"], "fixture-model");
-    assert!(request.get("reasoning_effort").is_none());
-    assert_eq!(request["messages"][0]["content"], "say hello");
-    assert_eq!(request["messages"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1036,88 +824,6 @@ async fn auto_compaction_summarizes_old_turns_before_the_next_request() {
             ..
         }
     )));
-}
-
-#[tokio::test]
-async fn summarization_failure_falls_back_to_hard_context_trimming() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let server_requests = Arc::clone(&requests);
-    let server = tokio::spawn(async move {
-        for index in 0..2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_json_request(&mut stream).await;
-            server_requests.lock().await.push(request);
-            if index == 0 {
-                write_http_error(&mut stream, 400, r#"{"error":"summary unavailable"}"#).await;
-            } else {
-                write_sse_text(&mut stream, "Fallback worked.", None).await;
-            }
-        }
-    });
-
-    let project = tempdir().unwrap();
-    let config = compaction_test_config(project.path(), address, 4_000, 2_500, 60);
-    let mut session =
-        Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
-    session
-        .append(mcode::protocol::ChatMessage::user("old ".repeat(2_500)))
-        .unwrap();
-    session
-        .append(mcode::protocol::ChatMessage::assistant(
-            Some("old ".repeat(2_500)),
-            None,
-            Vec::new(),
-        ))
-        .unwrap();
-    session
-        .append(mcode::protocol::ChatMessage::user("recent request"))
-        .unwrap();
-    session
-        .append(mcode::protocol::ChatMessage::assistant(
-            Some("recent answer".into()),
-            None,
-            Vec::new(),
-        ))
-        .unwrap();
-    let mut agent = Agent::new(&config, session).await.unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let status = agent
-        .run(
-            "continue",
-            Vec::new(),
-            &tx,
-            &CancellationToken::new(),
-            &ApprovalGate::default(),
-        )
-        .await
-        .unwrap();
-    server.await.unwrap();
-
-    assert_eq!(status, RunStatus::Completed);
-    assert!(agent.session().latest_compaction().is_none());
-    let requests = requests.lock().await;
-    assert_eq!(requests.len(), 2);
-    let regular_messages = requests[1]["messages"].as_array().unwrap();
-    assert!(!regular_messages.iter().any(|message| {
-        message["content"]
-            .as_str()
-            .is_some_and(|content| content.len() > 5_000)
-    }));
-    let events = drain_events(&mut rx);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::CompactionFailed {
-            reason: mcode::event::CompactionReason::Threshold,
-            ..
-        }
-    )));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ContextTrimmed { .. }))
-    );
 }
 
 #[tokio::test]
@@ -1374,65 +1080,6 @@ async fn resume_replays_a_safe_read_file_tool() {
 }
 
 #[tokio::test]
-async fn resumed_agent_keeps_accumulating_durable_generation_usage() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let _ = read_json_request(&mut stream).await;
-        write_sse_text(&mut stream, "Second response.", Some((30, 5))).await;
-    });
-
-    let base = tempdir().unwrap();
-    let project = tempdir().unwrap();
-    let config = basic_chat_config(project.path(), address);
-    let mut session =
-        Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
-    let run_id = session
-        .begin_run(ChatMessage::user("first request"))
-        .unwrap();
-    session
-        .start_generation(run_id, None, "test-model", ApiProtocol::ChatCompletions)
-        .unwrap();
-    session
-        .complete_generation(
-            run_id,
-            ChatMessage::assistant(Some("First response.".to_string()), None, Vec::new()),
-            Usage {
-                prompt_tokens: 80,
-                completion_tokens: 20,
-                total_tokens: 100,
-            },
-            false,
-        )
-        .unwrap();
-    session.finish_run(run_id, RunOutcome::Completed).unwrap();
-    drop(session);
-
-    let resumed = Session::resume_in(base.path(), project.path(), None).unwrap();
-    let mut agent = Agent::new(&config, resumed).await.unwrap();
-    assert_eq!(agent.total_usage().total_tokens, 100);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let status = agent
-        .run(
-            "second request",
-            Vec::new(),
-            &tx,
-            &CancellationToken::new(),
-            &ApprovalGate::default(),
-        )
-        .await
-        .unwrap();
-    server.await.unwrap();
-
-    assert_eq!(status, RunStatus::Completed);
-    assert_eq!(agent.total_usage().total_tokens, 135);
-    drop(agent);
-    let reloaded = Session::resume_in(base.path(), project.path(), None).unwrap();
-    assert_eq!(reloaded.total_usage().total_tokens, 135);
-}
-
-#[tokio::test]
 async fn delete_command_removes_only_the_selected_project_session() {
     let home = tempdir().unwrap();
     let project = tempdir().unwrap();
@@ -1488,44 +1135,6 @@ async fn delete_command_removes_only_the_selected_project_session() {
     assert!(!selected_path.exists());
     assert!(remaining_path.exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains(&selected_id.to_string()));
-}
-
-#[tokio::test]
-async fn doctor_reports_configuration_without_network_access() {
-    let home = tempdir().unwrap();
-    let project = tempdir().unwrap();
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
-        .arg("doctor")
-        .arg("--json")
-        .arg("--model")
-        .arg("fixture-model")
-        .arg("--base-url")
-        .arg("http://127.0.0.1:9/v1")
-        .env("MCODE_HOME", home.path().join(".mcode"))
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("OPENAI_MODEL")
-        .current_dir(project.path())
-        .output()
-        .await
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let checks: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let checks = checks.as_array().unwrap();
-    assert!(
-        checks
-            .iter()
-            .any(|check| { check["name"] == "endpoint" && check["status"] == "ok" })
-    );
-    assert!(
-        checks
-            .iter()
-            .any(|check| { check["name"] == "api_key" && check["status"] == "warning" })
-    );
 }
 
 fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {

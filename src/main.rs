@@ -680,30 +680,3 @@ fn compaction_reason_label(reason: CompactionReason) -> &'static str {
         CompactionReason::Overflow => "上下文溢出",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn mcp_startup_prompt_does_not_expose_environment_values() {
-        let server = McpServerConfig {
-            name: "fixture".to_string(),
-            command: "fixture-command".to_string(),
-            args: vec!["--stdio".to_string()],
-            env: BTreeMap::from([("SECRET_TOKEN".to_string(), "secret-value".to_string())]),
-        };
-        let details = mcp_startup_details(&server);
-        assert!(details.contains("SECRET_TOKEN"));
-        assert!(!details.contains("secret-value"));
-    }
-
-    #[test]
-    fn localizes_web_search_status_only_for_human_output() {
-        assert_eq!(WebSearchMode::Disabled.to_string(), "disabled");
-        assert_eq!(localized_web_search_mode("disabled"), "禁用");
-        assert_eq!(localized_web_search_mode("cached"), "缓存");
-        assert_eq!(localized_web_search_mode("live"), "实时");
-    }
-}

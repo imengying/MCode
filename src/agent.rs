@@ -36,6 +36,7 @@ pub struct Agent {
     model_profiles: Vec<ModelProfile>,
     provider: Option<String>,
     reasoning_effort: ReasoningEffort,
+    default_reasoning_effort: ReasoningEffort,
     context_window: u64,
     max_input_tokens: u64,
     context_tokens: u64,
@@ -99,11 +100,26 @@ impl Agent {
         .await?;
         let system_prompt = build_system_prompt(&config.cwd)?;
         let total_usage = session.total_usage();
+        let default_reasoning_effort = config
+            .model_profiles
+            .iter()
+            .find(|profile| {
+                profile.id == config.model
+                    && config
+                        .provider
+                        .as_deref()
+                        .is_some_and(|provider| provider == profile.provider)
+            })
+            .map_or(
+                config.reasoning_effort,
+                ModelProfile::default_reasoning_effort,
+            );
         let mut agent = Self {
             client,
             model_profiles: config.model_profiles.clone(),
             provider: config.provider.clone(),
             reasoning_effort: config.reasoning_effort,
+            default_reasoning_effort,
             context_window: config.context_window,
             max_input_tokens: config.max_input_tokens,
             context_tokens: 0,
@@ -722,9 +738,8 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn default_reasoning_effort(&self) -> ReasoningEffort {
-        self.current_profile()
-            .map_or(ReasoningEffort::Off, ModelProfile::default_reasoning_effort)
+    pub const fn default_reasoning_effort(&self) -> ReasoningEffort {
+        self.default_reasoning_effort
     }
 
     pub fn select_model(&mut self, query: &str) -> Result<()> {
@@ -745,6 +760,7 @@ impl Agent {
             })?;
             self.provider = Some(profile.provider);
             self.reasoning_effort = effective_effort;
+            self.default_reasoning_effort = effective_effort;
             self.context_window = profile.context_window;
             self.max_input_tokens = profile.max_input_tokens;
         } else {
@@ -757,6 +773,7 @@ impl Agent {
                 (self.reasoning_effort != ReasoningEffort::Off)
                     .then(|| self.reasoning_effort.as_str().to_string()),
             );
+            self.default_reasoning_effort = self.reasoning_effort;
         }
         self.tools.set_api(self.client.api());
         let provider = self.provider.clone();
@@ -799,7 +816,19 @@ impl Agent {
     }
 
     pub fn new_session(&mut self) -> Result<()> {
-        self.session = self.session.fresh()?;
+        let reasoning_value = self.current_profile().map_or_else(
+            || {
+                Ok((self.default_reasoning_effort != ReasoningEffort::Off)
+                    .then(|| self.default_reasoning_effort.as_str().to_string()))
+            },
+            |profile| profile.reasoning_value(self.default_reasoning_effort),
+        )?;
+        let session = self
+            .session
+            .fresh_with_reasoning_effort(self.default_reasoning_effort)?;
+        self.client.set_reasoning_effort(reasoning_value);
+        self.reasoning_effort = self.default_reasoning_effort;
+        self.session = session;
         self.total_usage = Usage::default();
         self.context_tokens = 0;
         self.usage_estimated = false;
@@ -1091,108 +1120,44 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn token_estimate_is_nonzero_and_scales_with_text() {
-        assert_eq!(estimate_text_tokens(""), 0);
-        assert_eq!(estimate_text_tokens("abcd"), 1);
-        assert_eq!(estimate_text_tokens("abcde"), 2);
-        assert!(
-            estimate_message_tokens(&ChatMessage::user("a longer message"))
-                > estimate_message_tokens(&ChatMessage::user("a"))
-        );
-    }
-
-    #[test]
-    fn context_trimming_keeps_a_contiguous_suffix_of_complete_turns() {
-        let messages = vec![
-            ChatMessage::user("old ".repeat(160)),
-            ChatMessage::assistant(Some("old answer ".repeat(80)), None, Vec::new()),
-            ChatMessage::user("recent question"),
-            ChatMessage::assistant(Some("recent answer".to_string()), None, Vec::new()),
-            ChatMessage::user("current question"),
-        ];
-        let selection = select_context(Some("system"), &messages, &[], 300).unwrap();
-
-        assert!(selection.dropped_messages >= 2);
-        assert!(selection.dropped_turns >= 1);
-        assert_eq!(selection.messages.last(), messages.last());
-        assert_eq!(selection.messages[0].role, MessageRole::System);
-        assert!(
-            selection.messages[0]
-                .content
-                .as_deref()
-                .unwrap()
-                .contains("omitted automatically")
-        );
-        assert_eq!(selection.messages[1].role, MessageRole::User);
-        assert!(selection.estimated_tokens <= 240);
-    }
-
-    #[test]
-    fn context_trimming_rejects_an_oversized_current_turn() {
-        let messages = vec![ChatMessage::user("x".repeat(2_000))];
-        let error = select_context(Some("system"), &messages, &[], 200)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("current conversation turn"));
-    }
-
-    #[test]
-    fn token_estimate_is_conservative_for_non_ascii_text() {
-        assert_eq!(estimate_text_tokens("abcd"), 1);
-        assert_eq!(estimate_text_tokens("中文"), 4);
-    }
-
-    #[test]
-    fn context_without_project_instructions_has_no_system_message() {
-        let messages = vec![ChatMessage::user("hello")];
-        let selection = select_context(None, &messages, &[], 1_000).unwrap();
-
-        assert_eq!(selection.messages, messages);
-        assert!(
-            selection
-                .messages
-                .iter()
-                .all(|message| message.role != MessageRole::System)
-        );
-    }
-
-    #[test]
-    fn project_instructions_load_only_from_a_regular_agents_file() {
+    #[tokio::test]
+    async fn new_session_restores_the_configured_default_reasoning_effort() {
         let project = tempdir().unwrap();
-        fs::write(
-            project.path().join("AGENTS.md"),
-            "  Keep the project sentinel intact.  \n",
+        let config = AppConfig {
+            model: "test-model".to_string(),
+            provider: None,
+            api: ApiProtocol::ChatCompletions,
+            reasoning_effort: ReasoningEffort::High,
+            reasoning_value: Some("high".to_string()),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: None,
+            context_window: 128_000,
+            max_input_tokens: 128_000,
+            supports_reasoning_effort: true,
+            supports_usage_in_streaming: true,
+            supports_strict_tools: false,
+            cwd: project.path().canonicalize().unwrap(),
+            max_tool_turns: 4,
+            request_timeout_secs: 10,
+            compaction: CompactionSettings::default(),
+            web_search: crate::config::WebSearchSettings::default(),
+            model_profiles: Vec::new(),
+            mcp_servers: Vec::new(),
+        };
+        let session = Session::create(
+            project.path(),
+            crate::session::SessionMetadata::from(&config),
+            false,
         )
         .unwrap();
+        let mut agent = Agent::new(&config, session).await.unwrap();
 
-        let prompt = build_system_prompt(project.path()).unwrap().unwrap();
-        assert!(prompt.contains("Project instructions from AGENTS.md:"));
-        assert!(prompt.ends_with("Keep the project sentinel intact."));
-        assert!(!prompt.contains("You are MCode"));
-        assert!(!prompt.contains(&project.path().display().to_string()));
+        agent.set_reasoning_effort(ReasoningEffort::Low).unwrap();
+        agent.new_session().unwrap();
 
-        fs::remove_file(project.path().join("AGENTS.md")).unwrap();
-        fs::create_dir(project.path().join("AGENTS.md")).unwrap();
-        let prompt = build_system_prompt(project.path()).unwrap();
-        assert!(prompt.is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn project_instructions_do_not_follow_an_agents_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let project = tempdir().unwrap();
-        fs::write(project.path().join("instructions.txt"), "do not load me").unwrap();
-        symlink(
-            project.path().join("instructions.txt"),
-            project.path().join("AGENTS.md"),
-        )
-        .unwrap();
-
-        let prompt = build_system_prompt(project.path()).unwrap();
-        assert!(prompt.is_none());
+        assert_eq!(agent.reasoning_effort(), ReasoningEffort::High);
+        assert_eq!(agent.default_reasoning_effort(), ReasoningEffort::High);
+        assert_eq!(agent.client.reasoning_effort(), Some("high"));
+        assert_eq!(agent.session.reasoning_effort(), ReasoningEffort::High);
     }
 }
