@@ -26,6 +26,10 @@ pub struct ChatMessage {
     /// stateless multi-turn reasoning and tool calls.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub response_items: Vec<serde_json::Value>,
+    /// UI-only metadata for an applied built-in file change. API request
+    /// conversion intentionally ignores this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_change: Option<FileChangeSummary>,
 }
 
 impl ChatMessage {
@@ -49,6 +53,7 @@ impl ChatMessage {
             reasoning_content: None,
             images,
             response_items: Vec::new(),
+            file_change: None,
         }
     }
 
@@ -76,11 +81,21 @@ impl ChatMessage {
             reasoning_content,
             images: Vec::new(),
             response_items,
+            file_change: None,
         }
     }
 
     #[must_use]
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::tool_with_file_change(tool_call_id, content, None)
+    }
+
+    #[must_use]
+    pub fn tool_with_file_change(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        file_change: Option<FileChangeSummary>,
+    ) -> Self {
         Self {
             role: MessageRole::Tool,
             content: Some(content.into()),
@@ -89,6 +104,7 @@ impl ChatMessage {
             reasoning_content: None,
             images: Vec::new(),
             response_items: Vec::new(),
+            file_change,
         }
     }
 
@@ -101,8 +117,42 @@ impl ChatMessage {
             reasoning_content: None,
             images: Vec::new(),
             response_items: Vec::new(),
+            file_change: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Added,
+    Updated,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeLineKind {
+    Context,
+    Added,
+    Removed,
+    Omitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChangeLine {
+    pub kind: FileChangeLineKind,
+    pub line_number: usize,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChangeSummary {
+    pub path: String,
+    pub kind: FileChangeKind,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub preview: Vec<FileChangeLine>,
+    pub preview_truncated: bool,
 }
 
 /// Removes terminal control sequences from untrusted model, tool, MCP, and

@@ -132,19 +132,32 @@ async fn executes_a_tool_and_continues_the_model_turn() {
             .all(|tool| tool["function"].get("strict").is_none())
     );
 
-    let mut saw_tool = false;
+    let mut saw_file_change = false;
     let mut text = String::new();
     while let Ok(event) = rx.try_recv() {
         match event {
-            AgentEvent::ToolFinished { is_error, .. } => {
+            AgentEvent::ToolFinished {
+                is_error,
+                file_change,
+                ..
+            } => {
                 assert!(!is_error);
-                saw_tool = true;
+                let change = file_change.expect("write_file should report a structured change");
+                assert_eq!(change.path, "result.txt");
+                assert_eq!((change.added_lines, change.removed_lines), (1, 0));
+                saw_file_change = true;
             }
             AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
             _ => {}
         }
     }
-    assert!(saw_tool);
+    assert!(saw_file_change);
+    let persisted_change = agent
+        .messages()
+        .iter()
+        .find_map(|message| message.file_change.as_ref())
+        .expect("file change should be persisted with the tool message");
+    assert_eq!(persisted_change.path, "result.txt");
     assert_eq!(text, "Done.");
 }
 

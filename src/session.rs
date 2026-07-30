@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::config::{ApiProtocol, AppConfig, ReasoningEffort, WebSearchMode, mcode_home_dir};
 use crate::protocol::{ChatMessage, MessageRole, ToolCall, Usage};
 
-const SESSION_VERSION: u32 = 3;
+const SESSION_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMetadata {

@@ -265,6 +265,9 @@ impl Agent {
                         {
                             continue;
                         }
+                        if cancel.is_cancelled() {
+                            return Ok(RunStatus::Cancelled);
+                        }
                         return Err(error.into());
                     }
                     Err(error) => return Err(error.into()),
@@ -383,6 +386,7 @@ impl Agent {
                         name: call.function.name,
                         output,
                         is_error: true,
+                        file_change: None,
                     });
                     continue;
                 }
@@ -408,19 +412,25 @@ impl Agent {
                         call.function.name
                     ),
                     is_error: true,
+                    file_change: None,
                 }
             } else {
                 self.tools.execute(&call, cancel).await
             };
             self.session.complete_tool(
                 &intent,
-                ChatMessage::tool(call.id.clone(), execution.output.clone()),
+                ChatMessage::tool_with_file_change(
+                    call.id.clone(),
+                    execution.output.clone(),
+                    execution.file_change.clone(),
+                ),
             )?;
             let _ = events.send(AgentEvent::ToolFinished {
                 id: call.id,
                 name: call.function.name,
                 output: execution.output,
                 is_error: execution.is_error,
+                file_change: execution.file_change,
             });
 
             if cancel.is_cancelled() {
@@ -526,10 +536,16 @@ impl Agent {
                 Ok(result)
             }
             Err(error) => {
-                let _ = events.send(AgentEvent::CompactionFailed {
-                    reason,
-                    message: format!("{error:#}"),
-                });
+                if cancel.is_cancelled() {
+                    if reason == CompactionReason::Manual {
+                        let _ = events.send(AgentEvent::Cancelled);
+                    }
+                } else {
+                    let _ = events.send(AgentEvent::CompactionFailed {
+                        reason,
+                        message: format!("{error:#}"),
+                    });
+                }
                 Err(error)
             }
         }

@@ -35,7 +35,8 @@ use crate::config::{ApiProtocol, ReasoningEffort, WebSearchMode};
 use crate::event::{AgentEvent, CompactionReason};
 use crate::highlight::highlight_code;
 use crate::protocol::{
-    ChatMessage, ImageAttachment, MAX_IMAGE_BYTES, MessageRole, Usage, sanitize_terminal_text,
+    ChatMessage, FileChangeKind, FileChangeLineKind, FileChangeSummary, ImageAttachment,
+    MAX_IMAGE_BYTES, MessageRole, Usage, sanitize_terminal_text,
 };
 
 const APPROVAL_HEIGHT: u16 = 6;
@@ -51,6 +52,7 @@ const PREVIEW_LINE_CHARS: usize = 240;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const THEME_BASE: Color = Color::Rgb(30, 30, 46);
 const THEME_MANTLE: Color = Color::Rgb(24, 24, 37);
 const THEME_SURFACE: Color = Color::Rgb(49, 50, 68);
@@ -61,6 +63,8 @@ const THEME_BLUE: Color = Color::Rgb(137, 180, 250);
 const THEME_GREEN: Color = Color::Rgb(166, 227, 161);
 const THEME_YELLOW: Color = Color::Rgb(249, 226, 175);
 const THEME_RED: Color = Color::Rgb(243, 139, 168);
+const THEME_DIFF_ADD_BG: Color = Color::Rgb(33, 58, 43);
+const THEME_DIFF_REMOVE_BG: Color = Color::Rgb(74, 34, 29);
 const THEME_MAUVE: Color = Color::Rgb(203, 166, 247);
 const THEME_TEAL: Color = Color::Rgb(148, 226, 213);
 const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
@@ -193,6 +197,9 @@ pub fn run_interactive(
 
         let history_inserted = flush_finalized_history(&mut terminal, &mut state)?;
         needs_draw |= history_inserted;
+        if state.run_started_at.is_some() && last_frame.elapsed() >= ELAPSED_REFRESH_INTERVAL {
+            needs_draw = true;
+        }
         if needs_draw && (history_inserted || last_frame.elapsed() >= FRAME_INTERVAL) {
             terminal
                 .draw(|frame| render(frame, &mut state))
@@ -470,8 +477,7 @@ fn start_resume(
     state: &mut UiState,
     active_cancel: &mut Option<CancellationToken>,
 ) {
-    state.running = true;
-    state.status = "正在恢复中断任务".to_string();
+    state.begin_run("正在恢复中断任务");
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
     let tx = event_tx.clone();
@@ -499,7 +505,7 @@ fn start_run(
     active_cancel: &mut Option<CancellationToken>,
 ) {
     state.push_user(prompt.clone(), &images);
-    state.running = true;
+    state.begin_run("处理中");
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
     let tx = event_tx.clone();
@@ -524,8 +530,7 @@ fn start_compaction(
     state: &mut UiState,
     active_cancel: &mut Option<CancellationToken>,
 ) {
-    state.running = true;
-    state.status = "正在压缩上下文".to_string();
+    state.begin_run("正在压缩上下文");
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
     let tx = event_tx.clone();
@@ -1353,6 +1358,9 @@ enum ViewRole {
     Tool,
     Notice,
     Error,
+    RunCompleted,
+    RunCancelled,
+    RunFailed,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1377,6 +1385,7 @@ struct ViewMessage {
     reasoning: String,
     tool_arguments: Option<String>,
     tool_id: Option<String>,
+    file_change: Option<FileChangeSummary>,
     running: bool,
 }
 
@@ -1441,6 +1450,8 @@ struct UiState {
     messages: Vec<ViewMessage>,
     editor: Editor,
     running: bool,
+    run_started_at: Option<Instant>,
+    run_elapsed_before_pause: Duration,
     current_assistant: Option<usize>,
     generation_start: Option<usize>,
     status: String,
@@ -1482,6 +1493,8 @@ impl UiState {
             messages: Vec::new(),
             editor: Editor::default(),
             running: false,
+            run_started_at: None,
+            run_elapsed_before_pause: Duration::ZERO,
             current_assistant: None,
             generation_start: None,
             status: "就绪".to_string(),
@@ -1527,6 +1540,44 @@ impl UiState {
         self.mcp_tool_count = agent.mcp_tool_count();
     }
 
+    fn begin_run(&mut self, status: impl Into<String>) {
+        if !self.running {
+            self.run_elapsed_before_pause = Duration::ZERO;
+            self.run_started_at = Some(Instant::now());
+        }
+        self.running = true;
+        self.status = status.into();
+    }
+
+    fn run_elapsed(&self) -> Duration {
+        self.run_elapsed_before_pause.saturating_add(
+            self.run_started_at
+                .map_or(Duration::ZERO, |started_at| started_at.elapsed()),
+        )
+    }
+
+    fn pause_run_timer(&mut self) {
+        if let Some(started_at) = self.run_started_at.take() {
+            self.run_elapsed_before_pause = self
+                .run_elapsed_before_pause
+                .saturating_add(started_at.elapsed());
+        }
+    }
+
+    fn resume_run_timer(&mut self) {
+        if self.running && self.run_started_at.is_none() {
+            self.run_started_at = Some(Instant::now());
+        }
+    }
+
+    fn activity_label(&self) -> Option<String> {
+        if !self.running || self.pending_approval.is_some() {
+            return None;
+        }
+        self.reasoning_activity()
+            .or_else(|| (!self.status.is_empty()).then(|| self.status.clone()))
+    }
+
     fn push_history(&mut self, message: ChatMessage) {
         self.show_welcome = false;
         match message.role {
@@ -1542,6 +1593,7 @@ impl UiState {
                     reasoning: String::new(),
                     tool_arguments: None,
                     tool_id: None,
+                    file_change: None,
                     running: false,
                 });
             }
@@ -1566,6 +1618,7 @@ impl UiState {
                         reasoning,
                         tool_arguments: None,
                         tool_id: None,
+                        file_change: None,
                         running: false,
                     });
                 }
@@ -1578,12 +1631,14 @@ impl UiState {
                         reasoning: String::new(),
                         tool_arguments: Some(format_tool_input(&name, &call.function.arguments)),
                         tool_id: Some(call.id),
+                        file_change: None,
                         running: false,
                     });
                 }
             }
             MessageRole::Tool => {
                 let tool_id = message.tool_call_id;
+                let file_change = message.file_change;
                 let content = truncate_for_ui(&sanitize_terminal_text(
                     &message.content.unwrap_or_default(),
                 ));
@@ -1594,6 +1649,7 @@ impl UiState {
                         .find(|view| view.tool_id.as_deref() == Some(id))
                 }) {
                     existing.content = content;
+                    existing.file_change = file_change;
                 } else {
                     self.messages.push(ViewMessage {
                         role: ViewRole::Tool,
@@ -1602,6 +1658,7 @@ impl UiState {
                         reasoning: String::new(),
                         tool_arguments: None,
                         tool_id,
+                        file_change,
                         running: false,
                     });
                 }
@@ -1620,6 +1677,7 @@ impl UiState {
             reasoning: String::new(),
             tool_arguments: None,
             tool_id: None,
+            file_change: None,
             running: false,
         });
     }
@@ -1636,6 +1694,7 @@ impl UiState {
             reasoning: String::new(),
             tool_arguments: None,
             tool_id: None,
+            file_change: None,
             running: false,
         });
     }
@@ -1648,11 +1707,13 @@ impl UiState {
             reasoning: String::new(),
             tool_arguments: None,
             tool_id: None,
+            file_change: None,
             running: false,
         });
     }
 
     fn set_pending_approval(&mut self, request: &ApprovalRequest) {
+        self.pause_run_timer();
         let name = sanitize_terminal_text(&request.name);
         self.pending_approval = Some(ApprovalView {
             arguments: format_tool_input(&name, &request.arguments),
@@ -1667,10 +1728,13 @@ impl UiState {
         if self.running && self.status == "等待审批" {
             self.status = "处理中".to_string();
         }
+        self.resume_run_timer();
     }
 
     fn reset_session(&mut self) {
         self.messages.clear();
+        self.run_started_at = None;
+        self.run_elapsed_before_pause = Duration::ZERO;
         self.current_assistant = None;
         self.generation_start = None;
         self.usage = Usage::default();
@@ -1960,8 +2024,7 @@ impl UiState {
     fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::RunStarted | AgentEvent::RunResumed => {
-                self.status = "处理中".to_string();
-                self.running = true;
+                self.begin_run("处理中");
             }
             AgentEvent::AssistantStarted => {
                 let index = self.start_assistant_message();
@@ -2030,6 +2093,7 @@ impl UiState {
                     reasoning: String::new(),
                     tool_arguments: Some(format_tool_input(&name, &arguments)),
                     tool_id: Some(id),
+                    file_change: None,
                     running: true,
                 });
                 self.status = "等待审批".to_string();
@@ -2081,6 +2145,7 @@ impl UiState {
                     message.title = name;
                     message.content.clear();
                     message.tool_arguments = Some(arguments);
+                    message.file_change = None;
                     message.running = true;
                 } else {
                     self.messages.push(ViewMessage {
@@ -2090,6 +2155,7 @@ impl UiState {
                         reasoning: String::new(),
                         tool_arguments: Some(arguments),
                         tool_id: Some(id),
+                        file_change: None,
                         running: true,
                     });
                 }
@@ -2099,6 +2165,7 @@ impl UiState {
                 name,
                 output,
                 is_error,
+                file_change,
             } => {
                 if let Some(message) = self
                     .messages
@@ -2108,6 +2175,7 @@ impl UiState {
                 {
                     message.title = sanitize_terminal_text(&name);
                     message.content = truncate_for_ui(&sanitize_terminal_text(&output));
+                    message.file_change = file_change;
                     message.running = false;
                     if is_error {
                         message.role = ViewRole::Error;
@@ -2124,6 +2192,7 @@ impl UiState {
                     reasoning: String::new(),
                     tool_arguments: None,
                     tool_id: Some(id),
+                    file_change: None,
                     running: true,
                 });
                 self.status = "正在搜索网页".to_string();
@@ -2200,15 +2269,17 @@ impl UiState {
                     format_tokens(tokens_after)
                 ));
                 if reason == CompactionReason::Manual {
-                    self.finish_run("就绪");
+                    let elapsed = self.finish_run();
+                    self.push_run_summary(ViewRole::RunCompleted, elapsed);
                 } else {
                     self.status = "处理中".to_string();
                 }
             }
             AgentEvent::CompactionFailed { reason, message } => {
                 if reason == CompactionReason::Manual {
-                    self.finish_run("错误");
+                    let elapsed = self.finish_run();
                     self.push_error(format!("上下文压缩失败：{message}"));
+                    self.push_run_summary(ViewRole::RunFailed, elapsed);
                 } else {
                     self.status = "处理中".to_string();
                     self.push_error(format!(
@@ -2218,15 +2289,17 @@ impl UiState {
             }
             AgentEvent::RunFinished => {
                 self.finish_reasoning_summary();
-                self.finish_run("就绪");
+                let elapsed = self.finish_run();
+                self.push_run_summary(ViewRole::RunCompleted, elapsed);
             }
             AgentEvent::Cancelled => {
                 self.reset_reasoning_summary();
-                self.finish_run("已取消");
+                let elapsed = self.finish_run();
+                self.push_run_summary(ViewRole::RunCancelled, elapsed);
             }
             AgentEvent::Error { message } => {
                 self.reset_reasoning_summary();
-                self.finish_run("错误");
+                let elapsed = self.finish_run();
                 self.messages.push(ViewMessage {
                     role: ViewRole::Error,
                     title: "错误".to_string(),
@@ -2234,13 +2307,18 @@ impl UiState {
                     reasoning: String::new(),
                     tool_arguments: None,
                     tool_id: None,
+                    file_change: None,
                     running: false,
                 });
+                self.push_run_summary(ViewRole::RunFailed, elapsed);
             }
         }
     }
 
-    fn finish_run(&mut self, status: &str) {
+    fn finish_run(&mut self) -> Duration {
+        let elapsed = self.run_elapsed();
+        self.run_started_at = None;
+        self.run_elapsed_before_pause = Duration::ZERO;
         for message in &mut self.messages {
             message.running = false;
         }
@@ -2252,9 +2330,26 @@ impl UiState {
         self.current_assistant = None;
         self.generation_start = None;
         self.running = false;
-        self.status = status.to_string();
         self.pending_approval = None;
         self.reset_reasoning_summary();
+        elapsed
+    }
+
+    fn push_run_summary(&mut self, role: ViewRole, elapsed: Duration) {
+        debug_assert!(matches!(
+            role,
+            ViewRole::RunCompleted | ViewRole::RunCancelled | ViewRole::RunFailed
+        ));
+        self.messages.push(ViewMessage {
+            role,
+            title: String::new(),
+            content: format_elapsed_compact(elapsed.as_secs()),
+            reasoning: String::new(),
+            tool_arguments: None,
+            tool_id: None,
+            file_change: None,
+            running: false,
+        });
     }
 
     fn start_assistant_message(&mut self) -> usize {
@@ -2265,6 +2360,7 @@ impl UiState {
             reasoning: String::new(),
             tool_arguments: None,
             tool_id: None,
+            file_change: None,
             running: true,
         });
         let index = self.messages.len() - 1;
@@ -2327,7 +2423,7 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         .split(area);
     render_conversation(frame, state, areas[0]);
     render_slash_suggestions(frame, state, areas[1]);
-    render_reasoning_activity(frame, state, areas[2]);
+    render_activity_status(frame, state, areas[2]);
     render_input(frame, state, areas[3]);
     render_footer(frame, state, areas[4]);
 }
@@ -2359,7 +2455,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
     } else {
         slash_suggestions(state).len()
     };
-    let activity = u16::from(state.reasoning_activity().is_some());
+    let activity = u16::from(state.activity_label().is_some());
     let reserved_height = 3_u16
         .saturating_add(activity)
         .saturating_add(input)
@@ -2381,18 +2477,25 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
     }
 }
 
-fn render_reasoning_activity(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
-    let Some(activity) = state.reasoning_activity() else {
+fn render_activity_status(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    let Some(activity) = state.activity_label() else {
         return;
     };
-    let available = usize::from(area.width).saturating_sub(2);
+    let elapsed = format_elapsed_compact(state.run_elapsed().as_secs());
+    let suffix = format!(" ({elapsed} · Esc 取消)");
+    let available = usize::from(area.width)
+        .saturating_sub(2)
+        .saturating_sub(display_width(&suffix));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("• ", Style::default().fg(THEME_YELLOW)),
             Span::styled(
                 truncate_width(&activity, available.saturating_add(1)),
-                Style::default().fg(THEME_SUBTEXT),
+                Style::default()
+                    .fg(THEME_SUBTEXT)
+                    .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(suffix, Style::default().fg(THEME_MUTED)),
         ])),
         area,
     );
@@ -2891,6 +2994,21 @@ fn context_usage_color(tokens: u64, limit: u64) -> Color {
     }
 }
 
+fn format_elapsed_compact(elapsed_secs: u64) -> String {
+    if elapsed_secs < 60 {
+        return format!("{elapsed_secs}s");
+    }
+    if elapsed_secs < 3_600 {
+        return format!("{}m {:02}s", elapsed_secs / 60, elapsed_secs % 60);
+    }
+    format!(
+        "{}h {:02}m {:02}s",
+        elapsed_secs / 3_600,
+        (elapsed_secs % 3_600) / 60,
+        elapsed_secs % 60
+    )
+}
+
 fn format_tokens(count: u64) -> String {
     if count < 1_000 {
         return count.to_string();
@@ -3021,6 +3139,15 @@ fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
 fn conversation_lines_for_messages(messages: &[ViewMessage]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for message in messages {
+        if matches!(
+            message.role,
+            ViewRole::RunCompleted | ViewRole::RunCancelled | ViewRole::RunFailed
+        ) {
+            append_run_summary(&mut lines, message);
+            lines.push(Line::default());
+            continue;
+        }
+
         if message.role == ViewRole::Assistant {
             if message.reasoning.is_empty() && message.content.is_empty() {
                 continue;
@@ -3058,7 +3185,11 @@ fn conversation_lines_for_messages(messages: &[ViewMessage]) -> Vec<Line<'static
             ViewRole::Tool => (THEME_YELLOW, Style::default().fg(THEME_SUBTEXT)),
             ViewRole::Notice => (THEME_TEAL, Style::default().fg(THEME_SUBTEXT)),
             ViewRole::Error => (THEME_RED, Style::default().fg(THEME_RED)),
-            ViewRole::User | ViewRole::Assistant => unreachable!(),
+            ViewRole::User
+            | ViewRole::Assistant
+            | ViewRole::RunCompleted
+            | ViewRole::RunCancelled
+            | ViewRole::RunFailed => unreachable!(),
         };
         let running = if message.running { "  运行中" } else { "" };
         lines.push(Line::from(vec![
@@ -3074,6 +3205,24 @@ fn conversation_lines_for_messages(messages: &[ViewMessage]) -> Vec<Line<'static
         lines.push(Line::default());
     }
     lines
+}
+
+fn append_run_summary(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
+    let (label, color) = match message.role {
+        ViewRole::RunCompleted => ("已完成", THEME_GREEN),
+        ViewRole::RunCancelled => ("已取消", THEME_YELLOW),
+        ViewRole::RunFailed => ("失败", THEME_RED),
+        _ => return,
+    };
+    lines.push(Line::from(vec![
+        Span::styled("─ ", Style::default().fg(THEME_MUTED)),
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · 用时 ", Style::default().fg(THEME_MUTED)),
+        Span::styled(message.content.clone(), Style::default().fg(THEME_SUBTEXT)),
+    ]));
 }
 
 fn append_reasoning_summary(lines: &mut Vec<Line<'static>>, reasoning: &str) {
@@ -3115,6 +3264,13 @@ fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
 
 fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
     let failed = message.role == ViewRole::Error;
+    if !failed
+        && !message.running
+        && let Some(change) = &message.file_change
+    {
+        append_file_change(lines, change);
+        return;
+    }
     let color = if failed {
         THEME_RED
     } else if message.running {
@@ -3176,6 +3332,101 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
                 Style::default().fg(THEME_MUTED)
             },
         );
+    }
+}
+
+fn append_file_change(lines: &mut Vec<Line<'static>>, change: &FileChangeSummary) {
+    let action = match change.kind {
+        FileChangeKind::Added => "已新增",
+        FileChangeKind::Updated => "已编辑",
+    };
+    lines.push(Line::from(vec![
+        Span::styled("• ", Style::default().fg(THEME_MUTED)),
+        Span::styled(
+            action,
+            Style::default()
+                .fg(THEME_GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            sanitize_terminal_text(&change.path),
+            Style::default().fg(THEME_TEXT),
+        ),
+        Span::raw(" ("),
+        Span::styled(
+            format!("+{}", change.added_lines),
+            Style::default().fg(THEME_GREEN),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("-{}", change.removed_lines),
+            Style::default().fg(THEME_RED),
+        ),
+        Span::raw(")"),
+    ]));
+
+    let highlighted = std::path::Path::new(&change.path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(|extension| {
+            let source = change
+                .preview
+                .iter()
+                .filter(|line| line.kind != FileChangeLineKind::Omitted)
+                .map(|line| truncate_preview_line(&sanitize_terminal_text(&line.content)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            highlight_code(&source, extension)
+        })
+        .unwrap_or_default();
+    let mut highlighted_index = 0usize;
+    for line in &change.preview {
+        if line.kind == FileChangeLineKind::Omitted {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("⋮", Style::default().fg(THEME_MUTED)),
+            ]));
+            continue;
+        }
+        let (sign, color, background) = match line.kind {
+            FileChangeLineKind::Context => (' ', THEME_SUBTEXT, None),
+            FileChangeLineKind::Added => ('+', THEME_GREEN, Some(THEME_DIFF_ADD_BG)),
+            FileChangeLineKind::Removed => ('-', THEME_RED, Some(THEME_DIFF_REMOVE_BG)),
+            FileChangeLineKind::Omitted => unreachable!(),
+        };
+        let style = background.map_or_else(
+            || Style::default().fg(color),
+            |background| Style::default().fg(color).bg(background),
+        );
+        let content = sanitize_terminal_text(&line.content);
+        let mut spans = vec![
+            Span::styled(
+                format!("  {:>3} ", line.line_number),
+                Style::default().fg(THEME_MUTED),
+            ),
+            Span::styled(sign.to_string(), style),
+        ];
+        if let Some(highlighted_line) = highlighted.get(highlighted_index) {
+            spans.extend(highlighted_line.spans.iter().cloned().map(|mut span| {
+                if let Some(background) = background {
+                    span.style = span.style.bg(background);
+                }
+                span
+            }));
+        } else {
+            spans.push(Span::styled(truncate_preview_line(&content), style));
+        }
+        highlighted_index = highlighted_index.saturating_add(1);
+        lines.push(Line::from(spans).style(
+            background.map_or_else(Style::default, |background| Style::default().bg(background)),
+        ));
+    }
+    if change.preview_truncated {
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled("…", Style::default().fg(THEME_MUTED)),
+        ]));
     }
 }
 
@@ -3773,6 +4024,41 @@ mod tests {
     }
 
     #[test]
+    fn renders_live_elapsed_time_and_a_final_run_status() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.begin_run("处理中");
+        state.run_started_at = Instant::now().checked_sub(Duration::from_secs(322));
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let active = rendered_terminal(&terminal);
+        assert!(active.contains("5m 22s"));
+        assert!(active.contains("Esc"));
+
+        state.pause_run_timer();
+        assert!(state.run_started_at.is_none());
+        assert!((322..=323).contains(&state.run_elapsed().as_secs()));
+        state.resume_run_timer();
+        assert!(state.run_started_at.is_some());
+
+        state.apply_agent_event(AgentEvent::RunFinished);
+        let completed = conversation_lines(&state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(completed.contains("已完成"));
+        assert!(completed.contains("5m 22s"));
+        assert_eq!(format_elapsed_compact(3_723), "1h 02m 03s");
+    }
+
+    #[test]
     fn renders_a_welcome_card_for_a_new_session() {
         let mut state = UiState::new(
             "gpt-test".to_string(),
@@ -3940,6 +4226,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
             is_error: false,
+            file_change: None,
         });
 
         let rendered = conversation_lines(&state)
@@ -3960,6 +4247,55 @@ mod tests {
             2
         );
         assert!(!rendered.contains("折叠"));
+    }
+
+    #[test]
+    fn renders_file_changes_with_counts_and_colored_diff_lines() {
+        let message = ViewMessage {
+            role: ViewRole::Tool,
+            title: "edit_file".to_string(),
+            content: "updated 1 replacement in src/lib.rs".to_string(),
+            reasoning: String::new(),
+            tool_arguments: Some("src/lib.rs".to_string()),
+            tool_id: Some("call_edit".to_string()),
+            file_change: Some(FileChangeSummary {
+                path: "src/lib.rs".to_string(),
+                kind: FileChangeKind::Updated,
+                added_lines: 1,
+                removed_lines: 1,
+                preview: vec![
+                    crate::protocol::FileChangeLine {
+                        kind: FileChangeLineKind::Removed,
+                        line_number: 7,
+                        content: "let old = true;".to_string(),
+                    },
+                    crate::protocol::FileChangeLine {
+                        kind: FileChangeLineKind::Added,
+                        line_number: 7,
+                        content: "let new = true;".to_string(),
+                    },
+                ],
+                preview_truncated: true,
+            }),
+            running: false,
+        };
+
+        let lines = conversation_lines_for_messages(&[message]);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("已编辑 src/lib.rs (+1 -1)"));
+        assert!(rendered.contains("7 -let old = true;"));
+        assert!(rendered.contains("7 +let new = true;"));
+        assert!(rendered.contains('…'));
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.starts_with('-') && span.style.bg == Some(THEME_DIFF_REMOVE_BG)
+        }));
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.starts_with('+') && span.style.bg == Some(THEME_DIFF_ADD_BG)
+        }));
     }
 
     #[test]
@@ -4262,6 +4598,7 @@ mod tests {
             reasoning: String::new(),
             tool_arguments: Some("cargo check".to_string()),
             tool_id: Some("tool-1".to_string()),
+            file_change: None,
             running: false,
         });
 
@@ -4276,6 +4613,7 @@ mod tests {
             name: "shell".to_string(),
             output: "完成".to_string(),
             is_error: false,
+            file_change: None,
         });
         assert!(resumed_state.take_finalized_messages(80, 1).is_empty());
         assert_eq!(resumed_state.messages.len(), 1);

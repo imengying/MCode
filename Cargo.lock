@@ -509,6 +509,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "diffy"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10aec8f7f9393bd6a4f2762be0ceb012d3cbe2478987258cc9960de148561914"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1389,6 +1398,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "diffy",
  "dirs",
  "dom_query",
  "dom_smoothie",

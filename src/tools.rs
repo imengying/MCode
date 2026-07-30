@@ -17,11 +17,15 @@ use tokio::process::{ChildStderr, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ApiProtocol, McpServerConfig, WebSearchMode, WebSearchSettings};
-use crate::protocol::{FunctionDefinition, ToolCall, ToolDefinition};
+use crate::protocol::{
+    FileChangeKind, FileChangeLine, FileChangeLineKind, FileChangeSummary, FunctionDefinition,
+    ToolCall, ToolDefinition,
+};
 use crate::session::ToolReplayPolicy;
 use crate::web_access::WebAccess;
 
 const MAX_TOOL_OUTPUT_CHARS: usize = 60_000;
+const MAX_FILE_CHANGE_PREVIEW_LINES: usize = 5;
 const MCP_CALL_TIMEOUT: Duration = Duration::from_mins(2);
 const MAX_MCP_STDERR_BYTES: usize = 16_000;
 
@@ -53,6 +57,7 @@ pub struct McpStartupFailure {
 pub struct ToolExecution {
     pub output: String,
     pub is_error: bool,
+    pub file_change: Option<FileChangeSummary>,
 }
 
 impl ToolExecution {
@@ -60,6 +65,15 @@ impl ToolExecution {
         Self {
             output: output.into(),
             is_error: false,
+            file_change: None,
+        }
+    }
+
+    fn success_with_file_change(output: impl Into<String>, file_change: FileChangeSummary) -> Self {
+        Self {
+            output: output.into(),
+            is_error: false,
+            file_change: Some(file_change),
         }
     }
 
@@ -67,6 +81,7 @@ impl ToolExecution {
         Self {
             output: format!("tool error: {error}"),
             is_error: true,
+            file_change: None,
         }
     }
 }
@@ -280,12 +295,26 @@ impl ToolRegistry {
                 Err(error) => Err(error),
             },
             "write_file" => match parse_args(&call.function.arguments) {
-                Ok(args) => self.write_file(args).await,
-                Err(error) => Err(error),
+                Ok(args) => {
+                    return match self.write_file(args).await {
+                        Ok((output, change)) => {
+                            ToolExecution::success_with_file_change(output, change)
+                        }
+                        Err(error) => ToolExecution::error(error),
+                    };
+                }
+                Err(error) => return ToolExecution::error(error),
             },
             "edit_file" => match parse_args(&call.function.arguments) {
-                Ok(args) => self.edit_file(args).await,
-                Err(error) => Err(error),
+                Ok(args) => {
+                    return match self.edit_file(args).await {
+                        Ok((output, change)) => {
+                            ToolExecution::success_with_file_change(output, change)
+                        }
+                        Err(error) => ToolExecution::error(error),
+                    };
+                }
+                Err(error) => return ToolExecution::error(error),
             },
             "shell" => match parse_args(&call.function.arguments) {
                 Ok(args) => self.shell(args, cancel).await,
@@ -408,8 +437,17 @@ impl ToolRegistry {
         Ok(output)
     }
 
-    async fn write_file(&self, args: WriteFileArgs) -> Result<String> {
+    async fn write_file(&self, args: WriteFileArgs) -> Result<(String, FileChangeSummary)> {
         let path = self.resolve_path(&args.path)?;
+        let previous = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read {}", display_relative(&self.root, &path))
+                });
+            }
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -418,14 +456,15 @@ impl ToolRegistry {
         atomic_write(&path, args.content.as_bytes())
             .await
             .with_context(|| format!("failed to write {}", display_relative(&self.root, &path)))?;
-        Ok(format!(
-            "wrote {} bytes to {}",
-            args.content.len(),
-            display_relative(&self.root, &path)
+        let display_path = display_relative(&self.root, &path);
+        let change = summarize_file_change(&display_path, previous.as_deref(), &args.content);
+        Ok((
+            format!("wrote {} bytes to {display_path}", args.content.len()),
+            change,
         ))
     }
 
-    async fn edit_file(&self, args: EditFileArgs) -> Result<String> {
+    async fn edit_file(&self, args: EditFileArgs) -> Result<(String, FileChangeSummary)> {
         if args.old_text.is_empty() {
             bail!("old_text cannot be empty");
         }
@@ -454,15 +493,19 @@ impl ToolRegistry {
         atomic_write(&path, updated.as_bytes())
             .await
             .with_context(|| format!("failed to write {}", display_relative(&self.root, &path)))?;
-        Ok(format!(
-            "updated {} replacement{} in {}",
-            if args.replace_all { matches } else { 1 },
-            if args.replace_all && matches != 1 {
-                "s"
-            } else {
-                ""
-            },
-            display_relative(&self.root, &path)
+        let replacement_count = if args.replace_all { matches } else { 1 };
+        let display_path = display_relative(&self.root, &path);
+        let change = summarize_file_change(&display_path, Some(&text), &updated);
+        Ok((
+            format!(
+                "updated {replacement_count} replacement{} in {display_path}",
+                if args.replace_all && matches != 1 {
+                    "s"
+                } else {
+                    ""
+                }
+            ),
+            change,
         ))
     }
 
@@ -738,6 +781,87 @@ fn mcp_result_to_execution(result: CallToolResult) -> ToolExecution {
     ToolExecution {
         output: truncate_output(&parts.join("\n")),
         is_error,
+        file_change: None,
+    }
+}
+
+fn summarize_file_change(path: &str, old: Option<&str>, new: &str) -> FileChangeSummary {
+    let difference = diffy::create_patch(old.unwrap_or_default(), new);
+    let mut added_lines = 0usize;
+    let mut removed_lines = 0usize;
+    let mut preview = Vec::new();
+    let mut preview_truncated = false;
+
+    for (hunk_index, hunk) in difference.hunks().iter().enumerate() {
+        if hunk_index > 0 {
+            push_file_change_preview_line(
+                &mut preview,
+                &mut preview_truncated,
+                FileChangeLine {
+                    kind: FileChangeLineKind::Omitted,
+                    line_number: 0,
+                    content: String::new(),
+                },
+            );
+        }
+        let mut old_line = hunk.old_range().start();
+        let mut new_line = hunk.new_range().start();
+        for line in hunk.lines() {
+            let (kind, line_number, content) = match line {
+                diffy::Line::Context(content) => {
+                    let line_number = new_line;
+                    old_line = old_line.saturating_add(1);
+                    new_line = new_line.saturating_add(1);
+                    (FileChangeLineKind::Context, line_number, *content)
+                }
+                diffy::Line::Delete(content) => {
+                    let line_number = old_line;
+                    old_line = old_line.saturating_add(1);
+                    removed_lines = removed_lines.saturating_add(1);
+                    (FileChangeLineKind::Removed, line_number, *content)
+                }
+                diffy::Line::Insert(content) => {
+                    let line_number = new_line;
+                    new_line = new_line.saturating_add(1);
+                    added_lines = added_lines.saturating_add(1);
+                    (FileChangeLineKind::Added, line_number, *content)
+                }
+            };
+            push_file_change_preview_line(
+                &mut preview,
+                &mut preview_truncated,
+                FileChangeLine {
+                    kind,
+                    line_number,
+                    content: content.trim_end_matches('\n').to_string(),
+                },
+            );
+        }
+    }
+
+    FileChangeSummary {
+        path: path.to_string(),
+        kind: if old.is_some() {
+            FileChangeKind::Updated
+        } else {
+            FileChangeKind::Added
+        },
+        added_lines,
+        removed_lines,
+        preview,
+        preview_truncated,
+    }
+}
+
+fn push_file_change_preview_line(
+    preview: &mut Vec<FileChangeLine>,
+    preview_truncated: &mut bool,
+    line: FileChangeLine,
+) {
+    if preview.len() < MAX_FILE_CHANGE_PREVIEW_LINES {
+        preview.push(line);
+    } else {
+        *preview_truncated = true;
     }
 }
 
@@ -833,4 +957,38 @@ fn shell_command(command: &str) -> Command {
     let mut process = Command::new(shell);
     process.arg("-lc").arg(command);
     process
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarizes_added_and_removed_lines_for_the_ui() {
+        let change = summarize_file_change(
+            "src/lib.rs",
+            Some("fn old() {}\nunchanged\n"),
+            "fn new() {}\nunchanged\nextra\n",
+        );
+
+        assert_eq!(change.kind, FileChangeKind::Updated);
+        assert_eq!(change.added_lines, 2);
+        assert_eq!(change.removed_lines, 1);
+        assert!(
+            change
+                .preview
+                .iter()
+                .any(|line| line.kind == FileChangeLineKind::Added)
+        );
+        assert!(
+            change
+                .preview
+                .iter()
+                .any(|line| line.kind == FileChangeLineKind::Removed)
+        );
+
+        let added = summarize_file_change("new.rs", None, "one\ntwo\n");
+        assert_eq!(added.kind, FileChangeKind::Added);
+        assert_eq!((added.added_lines, added.removed_lines), (2, 0));
+    }
 }

@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::protocol::{Usage, WebSearchAction};
+use crate::protocol::{FileChangeSummary, Usage, WebSearchAction};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +52,7 @@ pub enum AgentEvent {
         name: String,
         output: String,
         is_error: bool,
+        file_change: Option<FileChangeSummary>,
     },
     WebSearchStarted {
         id: String,
