@@ -212,7 +212,16 @@ pub fn run_interactive(
                 needs_draw = true;
                 match handle_key(key, &mut state, active_cancel.as_ref()) {
                     UiAction::None => {}
-                    UiAction::Quit => break,
+                    UiAction::Quit => {
+                        if let Some(cancel) = active_cancel.take() {
+                            cancel.cancel();
+                        }
+                        if let Some(request) = pending_approval.take() {
+                            request.resolve(ApprovalDecision::Deny);
+                        }
+                        state.clear_pending_approval();
+                        break;
+                    }
                     UiAction::Submit { prompt, images } => {
                         start_run(
                             Arc::clone(&agent),
@@ -402,18 +411,23 @@ impl Backend for UiBackend {
 type UiTerminal = Terminal<UiBackend>;
 
 fn flush_finalized_history(terminal: &mut UiTerminal, state: &mut UiState) -> Result<bool> {
-    let width = terminal.size().context("读取终端尺寸失败")?.width;
-    if width < 24 {
+    let size = terminal.size().context("读取终端尺寸失败")?;
+    if size.width < 24 || size.height < INLINE_VIEWPORT_HEIGHT {
         return Ok(false);
     }
+    let heights = ui_section_heights(state, size.width, INLINE_VIEWPORT_HEIGHT);
 
-    let messages = state.take_finalized_messages();
+    let messages = state.take_finalized_messages(size.width, heights.conversation);
     if messages.is_empty() {
         return Ok(false);
     }
 
     for message in messages {
-        insert_history_lines(terminal, conversation_lines_for_messages(&[message]), width)?;
+        insert_history_lines(
+            terminal,
+            conversation_lines_for_messages(&[message]),
+            size.width,
+        )?;
     }
     Ok(true)
 }
@@ -735,6 +749,16 @@ fn handle_key(
     state: &mut UiState,
     active_cancel: Option<&CancellationToken>,
 ) -> UiAction {
+    if matches!(key.code, KeyCode::Enter)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+        && state.editor.text().trim().eq_ignore_ascii_case("/exit")
+    {
+        state.editor.set_text("");
+        return UiAction::Quit;
+    }
+
     if state.pending_approval.is_some() {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(cancel) = active_cancel {
@@ -1439,6 +1463,7 @@ struct UiState {
     mcp_server_count: usize,
     mcp_tool_count: usize,
     pending_approval: Option<ApprovalView>,
+    show_welcome: bool,
 }
 
 impl UiState {
@@ -1479,6 +1504,7 @@ impl UiState {
             mcp_server_count: 0,
             mcp_tool_count: 0,
             pending_approval: None,
+            show_welcome: true,
         }
     }
 
@@ -1502,6 +1528,7 @@ impl UiState {
     }
 
     fn push_history(&mut self, message: ChatMessage) {
+        self.show_welcome = false;
         match message.role {
             MessageRole::System => {}
             MessageRole::User => {
@@ -1584,6 +1611,7 @@ impl UiState {
     }
 
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
+        self.show_welcome = false;
         self.record_input(prompt.clone());
         self.messages.push(ViewMessage {
             role: ViewRole::User,
@@ -1652,6 +1680,7 @@ impl UiState {
         self.delete_confirmation = DeleteConfirmation::None;
         self.pending_images.clear();
         self.pending_approval = None;
+        self.show_welcome = true;
         self.input_history.clear();
         self.detach_input_history();
         self.reset_reasoning_summary();
@@ -1665,12 +1694,35 @@ impl UiState {
         self.reset_reasoning_summary();
     }
 
-    fn take_finalized_messages(&mut self) -> Vec<ViewMessage> {
-        let count = self
+    fn take_finalized_messages(&mut self, width: u16, visible_height: u16) -> Vec<ViewMessage> {
+        let first_running = self
             .messages
             .iter()
             .position(|message| message.running)
             .unwrap_or(self.messages.len());
+        if first_running == 0 || self.messages.is_empty() {
+            return Vec::new();
+        }
+
+        let mut retained_height = 0usize;
+        let mut keep_from = first_running;
+        for index in (0..self.messages.len()).rev() {
+            let message_height = Paragraph::new(Text::from(conversation_lines_for_messages(
+                std::slice::from_ref(&self.messages[index]),
+            )))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+            let must_keep = index >= first_running || keep_from == self.messages.len();
+            if !must_keep
+                && retained_height.saturating_add(message_height) > usize::from(visible_height)
+            {
+                break;
+            }
+            retained_height = retained_height.saturating_add(message_height);
+            keep_from = index;
+        }
+
+        let count = keep_from.min(first_running);
         if count == 0 {
             return Vec::new();
         }
@@ -2262,14 +2314,41 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         return;
     }
 
-    let input_height = if state.pending_approval.is_some() {
+    let heights = ui_section_heights(state, area.width, area.height);
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(heights.conversation),
+            Constraint::Length(heights.suggestions),
+            Constraint::Length(heights.activity),
+            Constraint::Length(heights.input),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    render_conversation(frame, state, areas[0]);
+    render_slash_suggestions(frame, state, areas[1]);
+    render_reasoning_activity(frame, state, areas[2]);
+    render_input(frame, state, areas[3]);
+    render_footer(frame, state, areas[4]);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiSectionHeights {
+    conversation: u16,
+    suggestions: u16,
+    activity: u16,
+    input: u16,
+}
+
+fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeights {
+    let input = if state.pending_approval.is_some() {
         APPROVAL_HEIGHT
     } else if state.delete_confirmation != DeleteConfirmation::None {
         DELETE_CONFIRMATION_HEIGHT
     } else {
         let editor_height = state
             .editor
-            .rendered_height(area.width.saturating_sub(INPUT_PREFIX_WIDTH))
+            .rendered_height(width.saturating_sub(INPUT_PREFIX_WIDTH))
             .clamp(1, MAX_INPUT_HEIGHT);
         editor_height.saturating_add(u16::from(!state.pending_images.is_empty()))
     };
@@ -2280,30 +2359,26 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     } else {
         slash_suggestions(state).len()
     };
-    let activity_height = u16::from(state.reasoning_activity().is_some());
+    let activity = u16::from(state.reasoning_activity().is_some());
     let reserved_height = 3_u16
-        .saturating_add(activity_height)
-        .saturating_add(input_height)
+        .saturating_add(activity)
+        .saturating_add(input)
         .saturating_add(1);
-    let suggestion_height = u16::try_from(suggestion_count)
+    let suggestions = u16::try_from(suggestion_count)
         .unwrap_or(u16::MAX)
         .min(MAX_SLASH_SUGGESTIONS)
-        .min(area.height.saturating_sub(reserved_height));
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(suggestion_height),
-            Constraint::Length(activity_height),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    render_conversation(frame, state, areas[0]);
-    render_slash_suggestions(frame, state, areas[1]);
-    render_reasoning_activity(frame, state, areas[2]);
-    render_input(frame, state, areas[3]);
-    render_footer(frame, state, areas[4]);
+        .min(height.saturating_sub(reserved_height));
+    let conversation = height
+        .saturating_sub(suggestions)
+        .saturating_sub(activity)
+        .saturating_sub(input)
+        .saturating_sub(1);
+    UiSectionHeights {
+        conversation,
+        suggestions,
+        activity,
+        input,
+    }
 }
 
 fn render_reasoning_activity(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
@@ -2324,15 +2399,88 @@ fn render_reasoning_activity(frame: &mut Frame<'_>, state: &UiState, area: Rect)
 }
 
 fn render_conversation(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
-    if state.messages.is_empty() {
+    let mut lines = Vec::new();
+    if state.show_welcome {
+        lines.extend(welcome_lines(state, area.width));
+        if !state.messages.is_empty() {
+            lines.push(Line::default());
+        }
+    }
+    lines.extend(conversation_lines(state));
+    if lines.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
-    let lines = conversation_lines(state);
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total_height = paragraph.line_count(area.width);
-    let scroll =
-        u16::try_from(total_height.saturating_sub(usize::from(area.height))).unwrap_or(u16::MAX);
-    frame.render_widget(paragraph.scroll((scroll, 0)), area);
+    let visible_height = total_height.min(usize::from(area.height));
+    let render_area = Rect::new(
+        area.x,
+        area.bottom()
+            .saturating_sub(u16::try_from(visible_height).unwrap_or(area.height)),
+        area.width,
+        u16::try_from(visible_height).unwrap_or(area.height),
+    );
+    let scroll = u16::try_from(total_height.saturating_sub(visible_height)).unwrap_or(u16::MAX);
+    frame.render_widget(paragraph.scroll((scroll, 0)), render_area);
+}
+
+fn welcome_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
+    let Some(inner_width) = usize::from(width).checked_sub(4).map(|width| width.min(56)) else {
+        return Vec::new();
+    };
+    let title = format!(">_ MCode (v{})", crate::VERSION);
+    let model = format!(
+        "model: {} {}   /model 切换",
+        state.qualified_model(),
+        state.reasoning_effort
+    );
+    let title = truncate_width(&title, inner_width.saturating_add(1));
+    let model = truncate_width(&model, inner_width.saturating_add(1));
+    let bordered = [
+        Line::from(vec![
+            Span::styled(">_ ", Style::default().fg(THEME_MUTED)),
+            Span::styled(
+                title.strip_prefix(">_ ").unwrap_or(&title).to_string(),
+                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("model: ", Style::default().fg(THEME_MUTED)),
+            Span::styled(
+                model.strip_prefix("model: ").unwrap_or(&model).to_string(),
+                Style::default().fg(THEME_BLUE),
+            ),
+        ]),
+    ];
+    let mut lines = Vec::with_capacity(bordered.len().saturating_add(4));
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(inner_width.saturating_add(2))),
+        Style::default().fg(THEME_MUTED),
+    )));
+    for line in bordered {
+        let used = line
+            .spans
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum::<usize>();
+        let mut spans = Vec::with_capacity(line.spans.len().saturating_add(3));
+        spans.push(Span::styled("│ ", Style::default().fg(THEME_MUTED)));
+        spans.extend(line.spans);
+        spans.push(Span::raw(" ".repeat(inner_width.saturating_sub(used))));
+        spans.push(Span::styled(" │", Style::default().fg(THEME_MUTED)));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner_width.saturating_add(2))),
+        Style::default().fg(THEME_MUTED),
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  描述任务，或输入 / 查看命令",
+        Style::default().fg(THEME_MUTED),
+    )));
+    lines
 }
 
 fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
@@ -3604,6 +3752,79 @@ mod tests {
     }
 
     #[test]
+    fn slash_exit_quits_immediately_while_an_agent_is_running() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.running = true;
+        state.editor.insert_str("/exit");
+
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                None,
+            ),
+            UiAction::Quit
+        ));
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn renders_a_welcome_card_for_a_new_session() {
+        let mut state = UiState::new(
+            "gpt-test".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.provider = Some("openai".to_string());
+        state.reasoning_effort = ReasoningEffort::High;
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let rendered = rendered_terminal(&terminal);
+        assert!(rendered.contains("MCode"));
+        assert!(rendered.contains("openai/gpt-test high"));
+        assert!(rendered.contains("描"));
+        assert!(rendered.contains("命"));
+        assert!(rendered.contains("╭"));
+    }
+
+    #[test]
+    fn aligns_a_short_conversation_directly_above_the_input() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_user("紧凑布局".to_string(), &[]);
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let message_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "紧").then_some(index / 80))
+            .unwrap();
+        let input_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == ">").then_some(index / 80))
+            .unwrap();
+        assert!(input_y.saturating_sub(message_y) <= 2);
+        assert!(message_y > 0);
+    }
+
+    #[test]
     fn pasted_image_paths_become_removable_attachments() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4007,7 +4228,7 @@ mod tests {
         state.apply_agent_event(AgentEvent::TextDelta {
             text: "正在处理".to_string(),
         });
-        let finalized = state.take_finalized_messages();
+        let finalized = state.take_finalized_messages(80, 3);
         assert_eq!(finalized.len(), 1);
         assert_eq!(finalized[0].role, ViewRole::User);
         assert_eq!(state.messages.len(), 1);
@@ -4019,7 +4240,7 @@ mod tests {
             name: "shell".to_string(),
             arguments: r#"{"command":"cargo check"}"#.to_string(),
         });
-        let finalized = state.take_finalized_messages();
+        let finalized = state.take_finalized_messages(80, 3);
         assert_eq!(finalized.len(), 1);
         assert_eq!(finalized[0].role, ViewRole::Assistant);
         assert_eq!(state.messages.len(), 1);
@@ -4045,7 +4266,7 @@ mod tests {
         });
 
         resumed_state.hold_pending_tools(&["tool-1".to_string()]);
-        let finalized = resumed_state.take_finalized_messages();
+        let finalized = resumed_state.take_finalized_messages(80, 3);
         assert_eq!(finalized.len(), 1);
         assert_eq!(resumed_state.messages.len(), 1);
         assert!(resumed_state.messages[0].running);
@@ -4056,8 +4277,8 @@ mod tests {
             output: "完成".to_string(),
             is_error: false,
         });
-        assert_eq!(resumed_state.take_finalized_messages().len(), 1);
-        assert!(resumed_state.messages.is_empty());
+        assert!(resumed_state.take_finalized_messages(80, 1).is_empty());
+        assert_eq!(resumed_state.messages.len(), 1);
     }
 
     #[test]
