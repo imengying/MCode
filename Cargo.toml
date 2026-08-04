@@ -49,6 +49,7 @@ unicode-width = "0.2"
 url = "2.5"
 uuid = { version = "1.12", features = ["serde", "v7"] }
 wl-clipboard-rs = "0.9.3"
+x11-clipboard = "0.9.3"
 
 [dev-dependencies]
 tempfile = "3.15"

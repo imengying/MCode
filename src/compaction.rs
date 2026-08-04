@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::config::CompactionSettings;
-use crate::protocol::{ChatMessage, MessageRole, Usage};
+use crate::protocol::{ChatMessage, MessageRole};
 use crate::session::Session;
 
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
@@ -147,12 +147,10 @@ pub fn prepare_compaction(
     let boundary_start = previous.map_or(0, |checkpoint| {
         checkpoint.first_kept_message_index.min(messages.len())
     });
-    let cut_point = find_cut_point(
-        messages,
-        boundary_start,
-        messages.len(),
-        settings.keep_recent_tokens,
-    );
+    let context_indices = (boundary_start..messages.len())
+        .filter(|index| session.message_is_in_context(*index))
+        .collect::<Vec<_>>();
+    let cut_point = find_cut_point(messages, &context_indices, settings.keep_recent_tokens);
     let history_end = if cut_point.is_split_turn {
         cut_point
             .turn_start_index
@@ -160,9 +158,15 @@ pub fn prepare_compaction(
     } else {
         cut_point.first_kept_message_index
     };
-    let messages_to_summarize = messages[boundary_start..history_end].to_vec();
+    let messages_to_summarize = (boundary_start..history_end)
+        .filter(|index| session.message_is_in_context(*index))
+        .map(|index| messages[index].clone())
+        .collect::<Vec<_>>();
     let turn_prefix_messages = if cut_point.is_split_turn {
-        messages[history_end..cut_point.first_kept_message_index].to_vec()
+        (history_end..cut_point.first_kept_message_index)
+            .filter(|index| session.message_is_in_context(*index))
+            .map(|index| messages[index].clone())
+            .collect()
     } else {
         Vec::new()
     };
@@ -258,11 +262,6 @@ pub fn append_file_operations(
         summary.push_str("\n</modified-files>");
     }
     summary
-}
-
-#[must_use]
-pub fn combine_usage(first: Usage, second: Usage) -> Usage {
-    first.saturating_add(second)
 }
 
 #[must_use]
@@ -375,16 +374,17 @@ pub fn estimate_text_tokens(text: &str) -> u64 {
 
 fn find_cut_point(
     messages: &[ChatMessage],
-    start_index: usize,
-    end_index: usize,
+    context_indices: &[usize],
     keep_recent_tokens: u64,
 ) -> CutPoint {
-    let cut_points = (start_index..end_index)
+    let cut_points = context_indices
+        .iter()
+        .copied()
         .filter(|index| is_cut_point(&messages[*index]))
         .collect::<Vec<_>>();
     let Some(default_cut) = cut_points.first().copied() else {
         return CutPoint {
-            first_kept_message_index: start_index,
+            first_kept_message_index: context_indices.first().copied().unwrap_or(messages.len()),
             turn_start_index: None,
             is_split_turn: false,
         };
@@ -392,7 +392,7 @@ fn find_cut_point(
 
     let mut accumulated_tokens = 0_u64;
     let mut cut_index = default_cut;
-    for index in (start_index..end_index).rev() {
+    for &index in context_indices.iter().rev() {
         accumulated_tokens =
             accumulated_tokens.saturating_add(estimate_message_tokens(&messages[index]));
         if accumulated_tokens >= keep_recent_tokens {
@@ -405,9 +405,11 @@ fn find_cut_point(
 
     let starts_turn = messages[cut_index].role == MessageRole::User;
     let turn_start_index = (!starts_turn).then(|| {
-        (start_index..=cut_index)
+        context_indices
+            .iter()
+            .copied()
             .rev()
-            .find(|index| messages[*index].role == MessageRole::User)
+            .find(|index| *index <= cut_index && messages[*index].role == MessageRole::User)
     });
     let turn_start_index = turn_start_index.flatten();
     CutPoint {

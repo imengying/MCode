@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -58,6 +58,7 @@ const PREVIEW_LINE_CHARS: usize = 240;
 const TRANSCRIPT_SCROLL_LINES: usize = 3;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
+const X11_CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(500);
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const THEME_BASE: Color = Color::Rgb(30, 30, 46);
@@ -211,9 +212,6 @@ pub fn run_interactive(
             continue;
         }
         match event::read().context("读取终端事件失败")? {
-            Event::Key(key)
-                if key.kind != KeyEventKind::Release
-                    && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) => {}
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 needs_draw = true;
                 match handle_key(key, &mut state, active_cancel.as_ref()) {
@@ -344,7 +342,7 @@ pub fn run_interactive(
                 let outcome = handle_mouse(mouse, &mut state);
                 needs_draw |= outcome.redraw;
                 if let Some(text) = outcome.copy_text
-                    && let Err(error) = copy_text_to_clipboard(text)
+                    && let Err(error) = copy_text_to_clipboard(&mut state, text)
                 {
                     state.push_error(format!("无法复制选中文本：{error}"));
                     needs_draw = true;
@@ -659,8 +657,7 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                     return None;
                 }
                 let qualified = sanitize_terminal_text(&qualified);
-                let current = choice.id == state.model
-                    && state.provider.as_deref() == Some(choice.provider.as_str());
+                let current = choice.id == state.model && state.provider == choice.provider;
                 let detail = choice
                     .name
                     .as_deref()
@@ -1032,56 +1029,111 @@ fn submit_editor(state: &mut UiState) -> UiAction {
 }
 
 fn paste_from_clipboard(state: &mut UiState) {
+    let content = match read_wayland_clipboard() {
+        Ok(content) => content,
+        Err(wayland_error) => match read_x11_clipboard(state) {
+            Ok(content) => content,
+            Err(x11_error) => {
+                state.push_error(format!(
+                    "无法读取剪贴板：Wayland：{wayland_error:#}；X11：{x11_error:#}"
+                ));
+                return;
+            }
+        },
+    };
+    match content {
+        ClipboardContent::Image { extension, bytes } => {
+            let name = format!("clipboard-{}.{}", state.pending_images.len() + 1, extension);
+            match ImageAttachment::from_encoded_bytes(name, bytes) {
+                Ok(image) => attach_image(state, image),
+                Err(error) => state.push_error(format!("无法附加剪贴板图片：{error:#}")),
+            }
+        }
+        ClipboardContent::Text(text) => paste_text_or_image(state, &text),
+    }
+}
+
+enum ClipboardContent {
+    Image {
+        extension: &'static str,
+        bytes: Vec<u8>,
+    },
+    Text(String),
+}
+
+fn read_wayland_clipboard() -> Result<ClipboardContent> {
     let clipboard = ClipboardType::Regular;
     let seat = Seat::Unspecified;
-    let mime_types = match get_mime_types(clipboard, seat) {
-        Ok(mime_types) => mime_types,
-        Err(error) => {
-            state.push_error(format!("无法访问 Wayland 剪贴板：{error}"));
-            return;
-        }
-    };
+    let mime_types = get_mime_types(clipboard, seat).context("无法访问 Wayland 剪贴板")?;
 
     if let Some(&(mime_type, extension)) = CLIPBOARD_IMAGE_TYPES
         .iter()
         .find(|(mime_type, _)| mime_types.contains(*mime_type))
     {
-        let (reader, _) = match get_contents(clipboard, seat, MimeType::Specific(mime_type)) {
-            Ok(contents) => contents,
-            Err(error) => {
-                state.push_error(format!("无法读取 Wayland 剪贴板图片：{error}"));
-                return;
-            }
-        };
-        let bytes = match read_limited(reader, MAX_IMAGE_BYTES) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                state.push_error(format!("无法读取 Wayland 剪贴板图片：{error}"));
-                return;
-            }
-        };
-        let name = format!("clipboard-{}.{}", state.pending_images.len() + 1, extension);
-        match ImageAttachment::from_encoded_bytes(name, bytes) {
-            Ok(image) => attach_image(state, image),
-            Err(error) => state.push_error(format!("无法附加剪贴板图片：{error:#}")),
-        }
-        return;
+        let (reader, _) = get_contents(clipboard, seat, MimeType::Specific(mime_type))
+            .context("无法读取 Wayland 剪贴板图片")?;
+        let bytes = read_limited(reader, MAX_IMAGE_BYTES).context("无法读取 Wayland 剪贴板图片")?;
+        return Ok(ClipboardContent::Image { extension, bytes });
     }
 
-    let (reader, _) = match get_contents(clipboard, seat, MimeType::Text) {
-        Ok(contents) => contents,
-        Err(error) => {
-            state.push_error(format!("Wayland 剪贴板中没有可粘贴的图片或文本：{error}"));
-            return;
-        }
-    };
-    match read_limited(reader, MAX_IMAGE_BYTES).and_then(|bytes| {
+    let (reader, _) = get_contents(clipboard, seat, MimeType::Text)
+        .context("Wayland 剪贴板中没有可粘贴的图片或文本")?;
+    let text = read_limited(reader, MAX_IMAGE_BYTES).and_then(|bytes| {
         String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-    }) {
-        Ok(text) if !text.is_empty() => paste_text_or_image(state, &text),
-        Ok(_) => state.push_error("Wayland 剪贴板为空。"),
-        Err(error) => state.push_error(format!("无法读取 Wayland 剪贴板文本：{error}")),
+    })?;
+    if text.is_empty() {
+        bail!("Wayland 剪贴板为空");
     }
+    Ok(ClipboardContent::Text(text))
+}
+
+fn read_x11_clipboard(state: &mut UiState) -> Result<ClipboardContent> {
+    let clipboard = x11_clipboard(state)?;
+    let selection = clipboard.getter.atoms.clipboard;
+    let property = clipboard.getter.atoms.property;
+    let mut last_error = None;
+
+    for &(mime_type, extension) in &CLIPBOARD_IMAGE_TYPES {
+        let target = clipboard
+            .getter
+            .get_atom(mime_type)
+            .with_context(|| format!("无法查询 X11 剪贴板格式 {mime_type}"))?;
+        match clipboard.load(selection, target, property, X11_CLIPBOARD_TIMEOUT) {
+            Ok(bytes) if !bytes.is_empty() => {
+                ensure_clipboard_size(&bytes)?;
+                return Ok(ClipboardContent::Image { extension, bytes });
+            }
+            Ok(_) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+
+    for target in [
+        clipboard.getter.atoms.utf8_string,
+        clipboard.getter.atoms.string,
+    ] {
+        match clipboard.load(selection, target, property, X11_CLIPBOARD_TIMEOUT) {
+            Ok(bytes) if !bytes.is_empty() => {
+                ensure_clipboard_size(&bytes)?;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                return Ok(ClipboardContent::Text(text));
+            }
+            Ok(_) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+
+    if let Some(error) = last_error {
+        bail!("X11 剪贴板中没有可粘贴的图片或文本：{error}");
+    }
+    bail!("X11 剪贴板为空");
+}
+
+fn ensure_clipboard_size(bytes: &[u8]) -> Result<()> {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_IMAGE_BYTES {
+        bail!("剪贴板内容超过 20 MiB 限制");
+    }
+    Ok(())
 }
 
 fn read_limited(reader: impl io::Read, max_bytes: u64) -> io::Result<Vec<u8>> {
@@ -1519,10 +1571,18 @@ impl ApprovalChoice {
     }
 }
 
+struct X11Clipboard(x11_clipboard::Clipboard);
+
+impl std::fmt::Debug for X11Clipboard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("X11Clipboard(..)")
+    }
+}
+
 #[derive(Debug)]
 struct UiState {
     model: String,
-    provider: Option<String>,
+    provider: String,
     api: ApiProtocol,
     reasoning_effort: ReasoningEffort,
     default_reasoning_effort: ReasoningEffort,
@@ -1569,13 +1629,14 @@ struct UiState {
     transcript_tail_state: TranscriptTailState,
     transcript_selection: TranscriptSelectionState,
     transcript_rows: BTreeMap<usize, TranscriptRenderedRow>,
+    x11_clipboard: Option<X11Clipboard>,
 }
 
 impl UiState {
     fn new(model: String, endpoint: String, cwd: std::path::PathBuf) -> Self {
         Self {
             model,
-            provider: None,
+            provider: "xai".to_string(),
             api: ApiProtocol::ChatCompletions,
             reasoning_effort: ReasoningEffort::Off,
             default_reasoning_effort: ReasoningEffort::Off,
@@ -1622,12 +1683,13 @@ impl UiState {
             transcript_tail_state: TranscriptTailState::Following,
             transcript_selection: TranscriptSelectionState::None,
             transcript_rows: BTreeMap::new(),
+            x11_clipboard: None,
         }
     }
 
     fn sync_from_agent(&mut self, agent: &Agent) {
         self.model = sanitize_terminal_text(agent.model());
-        self.provider = agent.provider().map(sanitize_terminal_text);
+        self.provider = sanitize_terminal_text(agent.provider());
         self.api = agent.api();
         self.reasoning_effort = agent.reasoning_effort();
         self.default_reasoning_effort = agent.default_reasoning_effort();
@@ -2219,9 +2281,7 @@ impl UiState {
         }
         let mut lines = vec!["已配置的模型：".to_string()];
         for choice in &self.model_choices {
-            let selected = if choice.id == self.model
-                && self.provider.as_deref() == Some(choice.provider.as_str())
-            {
+            let selected = if choice.id == self.model && self.provider == choice.provider {
                 "*"
             } else {
                 " "
@@ -2285,10 +2345,7 @@ impl UiState {
     }
 
     fn qualified_model(&self) -> String {
-        self.provider.as_deref().map_or_else(
-            || self.model.clone(),
-            |provider| format!("{provider}/{}", self.model),
-        )
+        format!("{}/{}", self.provider, self.model)
     }
 
     fn status_notice(&self) -> String {
@@ -2734,13 +2791,39 @@ fn handle_mouse(mouse: MouseEvent, state: &mut UiState) -> MouseOutcome {
     }
 }
 
-fn copy_text_to_clipboard(text: String) -> Result<()> {
-    CopyOptions::new()
-        .copy(
-            CopySource::Bytes(text.into_bytes().into_boxed_slice()),
-            CopyMimeType::Text,
+fn copy_text_to_clipboard(state: &mut UiState, text: String) -> Result<()> {
+    let wayland_error = match CopyOptions::new().copy(
+        CopySource::Bytes(text.as_bytes().to_vec().into_boxed_slice()),
+        CopyMimeType::Text,
+    ) {
+        Ok(()) => {
+            state.x11_clipboard = None;
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+    let clipboard = x11_clipboard(state)
+        .map_err(|x11_error| anyhow!("Wayland：{wayland_error}；X11：{x11_error:#}"))?;
+    clipboard
+        .store(
+            clipboard.setter.atoms.clipboard,
+            clipboard.setter.atoms.utf8_string,
+            text.into_bytes(),
         )
-        .context("写入 Wayland 剪贴板失败")
+        .map_err(|x11_error| anyhow!("Wayland：{wayland_error}；X11：{x11_error}"))
+}
+
+fn x11_clipboard(state: &mut UiState) -> Result<&x11_clipboard::Clipboard> {
+    if state.x11_clipboard.is_none() {
+        state.x11_clipboard = Some(X11Clipboard(
+            x11_clipboard::Clipboard::new().context("无法连接 X11 剪贴板")?,
+        ));
+    }
+    Ok(&state
+        .x11_clipboard
+        .as_ref()
+        .expect("X11 clipboard was initialized above")
+        .0)
 }
 
 fn render(frame: &mut Frame<'_>, state: &mut UiState) {
@@ -3256,17 +3339,18 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         return;
     }
 
-    let mut editor_area = area;
-    if !state.pending_images.is_empty() {
+    let editor_area = if state.pending_images.is_empty() {
+        area
+    } else {
         let attachment_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
         render_pending_images(frame, state, attachment_area);
-        editor_area = Rect::new(
+        Rect::new(
             area.x,
             area.y.saturating_add(1),
             area.width,
             area.height.saturating_sub(1),
-        );
-    }
+        )
+    };
 
     let prompt_color = if state.running {
         THEME_YELLOW
@@ -4751,7 +4835,6 @@ mod tests {
             "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
-        state.provider = Some("xai".to_string());
         state.reasoning_effort = ReasoningEffort::High;
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -5175,7 +5258,6 @@ mod tests {
             "http://localhost/v1/chat/completions".to_string(),
             std::path::PathBuf::from("."),
         );
-        state.provider = Some("xai".to_string());
         state.reasoning_effort = ReasoningEffort::Medium;
         state.default_reasoning_effort = ReasoningEffort::High;
         state.reasoning_choices = vec![

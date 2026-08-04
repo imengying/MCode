@@ -173,6 +173,7 @@ pub struct ModelProfile {
     pub api_key: Option<String>,
     pub context_window: u64,
     pub max_input_tokens: u64,
+    pub max_output_tokens: Option<u64>,
     pub reasoning: bool,
     pub supports_images: bool,
     pub compat: ModelCompat,
@@ -181,9 +182,11 @@ pub struct ModelProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ModelCompat {
     pub reasoning_effort: bool,
     pub usage_in_streaming: bool,
+    pub finish_reason: bool,
     pub strict_tools: bool,
 }
 
@@ -258,7 +261,7 @@ impl ModelProfile {
 #[derive(Clone)]
 pub struct AppConfig {
     pub model: String,
-    pub provider: Option<String>,
+    pub provider: String,
     pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
     pub reasoning_value: Option<String>,
@@ -266,9 +269,8 @@ pub struct AppConfig {
     pub api_key: Option<String>,
     pub context_window: u64,
     pub max_input_tokens: u64,
-    pub supports_reasoning_effort: bool,
-    pub supports_usage_in_streaming: bool,
-    pub supports_strict_tools: bool,
+    pub max_output_tokens: Option<u64>,
+    pub compat: ModelCompat,
     pub cwd: PathBuf,
     pub request_timeout_secs: u64,
     pub compaction: CompactionSettings,
@@ -294,6 +296,7 @@ pub struct ConfigOverrides {
     pub api_key_env: Option<String>,
     pub context_window: Option<u64>,
     pub max_input_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
     pub cwd: Option<PathBuf>,
     pub request_timeout_secs: Option<u64>,
     pub web_search: Option<WebSearchMode>,
@@ -337,52 +340,73 @@ struct WebSearchSettingsFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct McpServerFile {
     command: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
     enabled: Option<bool>,
+}
+
+impl McpServerFile {
+    fn overlay(&mut self, other: Self) {
+        overlay_option(&mut self.command, other.command);
+        overlay_option(&mut self.args, other.args);
+        overlay_option(&mut self.enabled, other.enabled);
+        if let Some(env) = other.env {
+            self.env.get_or_insert_default().extend(env);
+        }
+    }
 }
 
 impl SettingsFile {
     fn overlay(&mut self, other: Self) {
-        if other.provider.is_some() {
-            self.provider = other.provider;
+        overlay_option(&mut self.provider, other.provider);
+        overlay_option(&mut self.model, other.model);
+        overlay_option(&mut self.compaction.enabled, other.compaction.enabled);
+        overlay_option(
+            &mut self.compaction.reserve_tokens,
+            other.compaction.reserve_tokens,
+        );
+        overlay_option(
+            &mut self.compaction.keep_recent_tokens,
+            other.compaction.keep_recent_tokens,
+        );
+        overlay_option(&mut self.web_search, other.web_search);
+        overlay_option(
+            &mut self.web_search_config.provider,
+            other.web_search_config.provider,
+        );
+        overlay_option(
+            &mut self.web_search_config.allowed_domains,
+            other.web_search_config.allowed_domains,
+        );
+        overlay_option(
+            &mut self.web_search_config.exa_api_key,
+            other.web_search_config.exa_api_key,
+        );
+        overlay_option(
+            &mut self.web_search_config.brave_api_key,
+            other.web_search_config.brave_api_key,
+        );
+        overlay_option(
+            &mut self.web_search_config.searxng_base_url,
+            other.web_search_config.searxng_base_url,
+        );
+        overlay_option(
+            &mut self.web_search_config.trust_env_proxy,
+            other.web_search_config.trust_env_proxy,
+        );
+        for (name, server) in other.mcp_servers {
+            if let Some(current) = self.mcp_servers.get_mut(&name) {
+                current.overlay(server);
+            } else {
+                self.mcp_servers.insert(name, server);
+            }
         }
-        if other.model.is_some() {
-            self.model = other.model;
-        }
-        if other.compaction.enabled.is_some() {
-            self.compaction.enabled = other.compaction.enabled;
-        }
-        if other.compaction.reserve_tokens.is_some() {
-            self.compaction.reserve_tokens = other.compaction.reserve_tokens;
-        }
-        if other.compaction.keep_recent_tokens.is_some() {
-            self.compaction.keep_recent_tokens = other.compaction.keep_recent_tokens;
-        }
-        if other.web_search.is_some() {
-            self.web_search = other.web_search;
-        }
-        if other.web_search_config.provider.is_some() {
-            self.web_search_config.provider = other.web_search_config.provider;
-        }
-        if other.web_search_config.allowed_domains.is_some() {
-            self.web_search_config.allowed_domains = other.web_search_config.allowed_domains;
-        }
-        if other.web_search_config.exa_api_key.is_some() {
-            self.web_search_config.exa_api_key = other.web_search_config.exa_api_key;
-        }
-        if other.web_search_config.brave_api_key.is_some() {
-            self.web_search_config.brave_api_key = other.web_search_config.brave_api_key;
-        }
-        if other.web_search_config.searxng_base_url.is_some() {
-            self.web_search_config.searxng_base_url = other.web_search_config.searxng_base_url;
-        }
-        if other.web_search_config.trust_env_proxy.is_some() {
-            self.web_search_config.trust_env_proxy = other.web_search_config.trust_env_proxy;
-        }
-        self.mcp_servers.extend(other.mcp_servers);
+    }
+}
+
+fn overlay_option<T>(current: &mut Option<T>, overlay: Option<T>) {
+    if let Some(value) = overlay {
+        *current = Some(value);
     }
 }
 
@@ -415,6 +439,7 @@ struct ModelFile {
     default: Option<ReasoningEffort>,
     context_window: Option<u64>,
     max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
     #[serde(default)]
     compat: CompatFile,
     #[serde(default)]
@@ -434,6 +459,8 @@ struct CompatFile {
     reasoning_effort: Option<bool>,
     #[serde(rename = "supportsUsageInStreaming")]
     usage_in_streaming: Option<bool>,
+    #[serde(rename = "supportsFinishReason")]
+    finish_reason: Option<bool>,
     #[serde(rename = "supportsStrictTools")]
     strict_tools: Option<bool>,
 }
@@ -443,13 +470,10 @@ impl CompatFile {
         Self {
             reasoning_effort: model.reasoning_effort.or(self.reasoning_effort),
             usage_in_streaming: model.usage_in_streaming.or(self.usage_in_streaming),
+            finish_reason: model.finish_reason.or(self.finish_reason),
             strict_tools: model.strict_tools.or(self.strict_tools),
         }
     }
-}
-
-struct LoadedModelCatalog {
-    profiles: Vec<ModelProfile>,
 }
 
 impl AppConfig {
@@ -477,9 +501,7 @@ impl AppConfig {
             settings.overlay(read_json(&project_path)?);
         }
 
-        let LoadedModelCatalog {
-            profiles: model_profiles,
-        } = load_model_catalog(overrides)?;
+        let model_profiles = load_model_profiles(overrides)?;
 
         if model_profiles.is_empty() {
             bail!("~/.mcode/models.json 中没有可用模型；请配置 xai（Grok）、deepseek、glm 或 kimi");
@@ -505,23 +527,24 @@ impl AppConfig {
         let selected_profile = find_model_profile(&model_profiles, preferred_provider, &model)?
             .with_context(|| format!("模型 {model:?} 不在 ~/.mcode/models.json 中"))?;
         let selected_model = selected_profile.id.clone();
-        let provider = Some(selected_profile.provider.clone());
+        let provider = selected_profile.provider.clone();
         let configured_web_search = overrides.web_search.or(settings.web_search);
         let api = selected_profile.api;
 
         let environment_reasoning = env_reasoning("MCODE_REASONING_EFFORT").transpose()?;
         let requested_reasoning_effort = overrides.reasoning_effort.or(environment_reasoning);
-        let reasoning_effort =
-            resolve_initial_reasoning_effort(Some(selected_profile), requested_reasoning_effort);
+        let reasoning_effort = requested_reasoning_effort.map_or_else(
+            || selected_profile.default_reasoning_effort(),
+            |requested| selected_profile.clamp_reasoning_effort(requested),
+        );
         let reasoning_value = selected_profile.reasoning_value(reasoning_effort)?;
 
         let base_url = selected_profile.base_url.clone();
         let api_key = selected_profile.api_key.clone();
         let context_window = selected_profile.context_window;
         let max_input_tokens = selected_profile.max_input_tokens;
-        let supports_reasoning_effort = selected_profile.compat.reasoning_effort;
-        let supports_usage_in_streaming = selected_profile.compat.usage_in_streaming;
-        let supports_strict_tools = selected_profile.compat.strict_tools;
+        let max_output_tokens = selected_profile.max_output_tokens;
+        let compat = selected_profile.compat;
         let request_timeout_secs = overrides.request_timeout_secs.unwrap_or(300);
         let defaults = CompactionSettings::default();
         let compaction = CompactionSettings {
@@ -558,7 +581,7 @@ impl AppConfig {
                 .or_else(|| env_non_empty("SEARXNG_BASE_URL")),
             trust_env_proxy: settings.web_search_config.trust_env_proxy.unwrap_or(false),
         };
-        let mcp_servers = build_mcp_servers(&settings.mcp_servers)?;
+        let mcp_servers = build_mcp_servers(settings.mcp_servers)?;
 
         if selected_model.trim().is_empty() {
             bail!("model cannot be empty");
@@ -569,6 +592,11 @@ impl AppConfig {
         if max_input_tokens == 0 || max_input_tokens > context_window {
             bail!(
                 "max input tokens must be between 1 and the {context_window}-token context window"
+            );
+        }
+        if max_output_tokens.is_some_and(|tokens| tokens == 0 || tokens > context_window) {
+            bail!(
+                "max output tokens must be between 1 and the {context_window}-token context window"
             );
         }
         if request_timeout_secs == 0 {
@@ -592,9 +620,8 @@ impl AppConfig {
             api_key,
             context_window,
             max_input_tokens,
-            supports_reasoning_effort,
-            supports_usage_in_streaming,
-            supports_strict_tools,
+            max_output_tokens,
+            compat,
             cwd,
             request_timeout_secs,
             compaction,
@@ -606,32 +633,26 @@ impl AppConfig {
     }
 
     pub fn select_model(&mut self, query: &str) -> Result<()> {
-        let profile = find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?
+        let profile = find_model_profile(&self.model_profiles, Some(&self.provider), query)?
             .with_context(|| format!("模型 {query:?} 不在 ~/.mcode/models.json 中"))?
             .clone();
         self.reasoning_effort = profile.clamp_reasoning_effort(self.reasoning_effort);
         self.reasoning_value = profile.reasoning_value(self.reasoning_effort)?;
         self.model = profile.id;
-        self.provider = Some(profile.provider);
+        self.provider = profile.provider;
         self.api = profile.api;
         self.base_url = profile.base_url;
         self.api_key = profile.api_key;
         self.context_window = profile.context_window;
         self.max_input_tokens = profile.max_input_tokens;
-        self.supports_reasoning_effort = profile.compat.reasoning_effort;
-        self.supports_usage_in_streaming = profile.compat.usage_in_streaming;
-        self.supports_strict_tools = profile.compat.strict_tools;
+        self.max_output_tokens = profile.max_output_tokens;
+        self.compat = profile.compat;
         Ok(())
     }
 
-    pub fn reload_model_profiles(overrides: &ConfigOverrides) -> Result<Vec<ModelProfile>> {
-        Ok(load_model_catalog(overrides)?.profiles)
-    }
-
     pub fn select_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
-        let profile =
-            find_model_profile(&self.model_profiles, self.provider.as_deref(), &self.model)?
-                .with_context(|| format!("模型 {:?} 不在 ~/.mcode/models.json 中", self.model))?;
+        let profile = find_model_profile(&self.model_profiles, Some(&self.provider), &self.model)?
+            .with_context(|| format!("模型 {:?} 不在 ~/.mcode/models.json 中", self.model))?;
         let effective_effort = profile.clamp_reasoning_effort(effort);
         self.reasoning_value = profile.reasoning_value(effective_effort)?;
         self.reasoning_effort = effective_effort;
@@ -655,25 +676,35 @@ impl AppConfig {
     }
 }
 
-fn load_model_catalog(overrides: &ConfigOverrides) -> Result<LoadedModelCatalog> {
+pub(crate) fn load_model_profiles(overrides: &ConfigOverrides) -> Result<Vec<ModelProfile>> {
     let base_url_override = overrides
         .base_url
         .clone()
         .or_else(|| env_non_empty("MCODE_BASE_URL"));
-    let forced_api_key = overrides.api_key_env.as_deref().and_then(env_non_empty);
+    let api_key_override = overrides
+        .api_key_env
+        .as_deref()
+        .map(|name| {
+            env_non_empty(name)
+                .with_context(|| format!("环境变量 {name} 未配置或为空，无法用作 API 密钥"))
+        })
+        .transpose()?;
     let environment_context = env_u64("MCODE_CONTEXT_WINDOW").transpose()?;
     let context_window_override = overrides.context_window.or(environment_context);
     let environment_max_input = env_u64("MCODE_MAX_INPUT_TOKENS").transpose()?;
     let max_input_tokens_override = overrides.max_input_tokens.or(environment_max_input);
+    let environment_max_output = env_u64("MCODE_MAX_OUTPUT_TOKENS").transpose()?;
+    let max_output_tokens_override = overrides.max_output_tokens.or(environment_max_output);
     let mut profiles = if let Some(home) = mcode_home_dir() {
         let models_path = home.join("models.json");
         if models_path.is_file() {
             build_model_profiles(
                 read_json::<ModelsFile>(&models_path)?,
                 base_url_override.as_deref(),
-                overrides.api_key_env.as_ref().map(|_| &forced_api_key),
+                api_key_override.as_deref(),
                 context_window_override,
                 max_input_tokens_override,
+                max_output_tokens_override,
             )?
         } else {
             Vec::new()
@@ -682,18 +713,7 @@ fn load_model_catalog(overrides: &ConfigOverrides) -> Result<LoadedModelCatalog>
         Vec::new()
     };
     profiles.sort_by(|left, right| (&left.provider, &left.id).cmp(&(&right.provider, &right.id)));
-    Ok(LoadedModelCatalog { profiles })
-}
-
-fn resolve_initial_reasoning_effort(
-    profile: Option<&ModelProfile>,
-    requested: Option<ReasoningEffort>,
-) -> ReasoningEffort {
-    match (profile, requested) {
-        (Some(profile), Some(requested)) => profile.clamp_reasoning_effort(requested),
-        (Some(profile), None) => profile.default_reasoning_effort(),
-        (None, requested) => requested.unwrap_or_default(),
-    }
+    Ok(profiles)
 }
 
 #[must_use]
@@ -704,7 +724,7 @@ pub fn mcode_home_dir() -> Option<PathBuf> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".mcode")))
 }
 
-fn build_mcp_servers(servers: &BTreeMap<String, McpServerFile>) -> Result<Vec<McpServerConfig>> {
+fn build_mcp_servers(servers: BTreeMap<String, McpServerFile>) -> Result<Vec<McpServerConfig>> {
     let mut configured = Vec::new();
     for (name, server) in servers {
         if server.enabled == Some(false) {
@@ -715,30 +735,29 @@ fn build_mcp_servers(servers: &BTreeMap<String, McpServerFile>) -> Result<Vec<Mc
         }
         let command = server
             .command
-            .as_deref()
             .filter(|command| !command.trim().is_empty())
             .with_context(|| format!("MCP server {name:?} is missing command"))?;
-        let args = server.args.clone();
         let env = server
             .env
-            .iter()
+            .unwrap_or_default()
+            .into_iter()
             .map(|(key, value)| {
                 if key.trim().is_empty() {
                     bail!("MCP server {name:?} contains an empty environment variable name");
                 }
-                let value = interpolate_environment(value, |variable| env::var(variable).ok())
+                let value = interpolate_environment(&value, |variable| env::var(variable).ok())
                     .with_context(|| {
                         format!(
                             "MCP server {name:?} environment value {key:?} references a missing variable"
                         )
                     })?;
-                Ok((key.clone(), value))
+                Ok((key, value))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         configured.push(McpServerConfig {
-            name: name.clone(),
-            command: command.to_string(),
-            args,
+            name,
+            command,
+            args: server.args.unwrap_or_default(),
             env,
         });
     }
@@ -881,9 +900,10 @@ pub fn find_model_profile<'a>(
 fn build_model_profiles(
     file: ModelsFile,
     base_url_override: Option<&str>,
-    forced_api_key: Option<&Option<String>>,
+    api_key_override: Option<&str>,
     context_window_override: Option<u64>,
     max_input_tokens_override: Option<u64>,
+    max_output_tokens_override: Option<u64>,
 ) -> Result<Vec<ModelProfile>> {
     let mut profiles = Vec::new();
     for (provider_name, provider) in file.providers {
@@ -907,12 +927,14 @@ fn build_model_profiles(
                     format!("provider {provider_name:?} is missing baseUrl in models.json")
                 })?;
             validate_http_base_url(&base_url, &format!("provider {provider_name} baseUrl"))?;
-            let api_key = forced_api_key.map_or_else(
-                || match provider.api_key.as_deref() {
-                    Some(value) => resolve_static_config_value(value),
-                    None => None,
+            let api_key = api_key_override.map_or_else(
+                || {
+                    provider
+                        .api_key
+                        .as_deref()
+                        .and_then(resolve_static_config_value)
                 },
-                |value| (*value).clone(),
+                |value| Some(value.to_string()),
             );
             let mut thinking_level_map = BTreeMap::new();
             for (level, value) in model.thinking_level_map {
@@ -931,6 +953,7 @@ fn build_model_profiles(
                 .or(context_window_override)
                 .or(model.max_input_tokens)
                 .unwrap_or(context_window);
+            let max_output_tokens = max_output_tokens_override.or(model.max_output_tokens);
             let compat = provider.compat.merge(model.compat);
             let reasoning = model.reasoning.unwrap_or(false);
             let input = model.input.unwrap_or_else(|| vec![InputModality::Text]);
@@ -962,6 +985,13 @@ fn build_model_profiles(
                     model.id
                 );
             }
+            if max_output_tokens.is_some_and(|tokens| tokens == 0 || tokens > context_window) {
+                bail!(
+                    "model {}/{} has maxOutputTokens outside its 1..={context_window} context window",
+                    provider_name,
+                    model.id
+                );
+            }
             let supports_strict_tools = compat.strict_tools.unwrap_or(false);
             let profile = ModelProfile {
                 provider: provider_name.clone(),
@@ -972,11 +1002,13 @@ fn build_model_profiles(
                 api_key,
                 context_window,
                 max_input_tokens,
+                max_output_tokens,
                 reasoning,
                 supports_images,
                 compat: ModelCompat {
                     reasoning_effort: compat.reasoning_effort.unwrap_or(true),
                     usage_in_streaming: compat.usage_in_streaming.unwrap_or(true),
+                    finish_reason: compat.finish_reason.unwrap_or(true),
                     strict_tools: supports_strict_tools,
                 },
                 default_reasoning_effort,
@@ -1113,7 +1145,7 @@ mod tests {
     #[test]
     fn model_catalog_allows_only_the_supported_four() {
         let file = serde_json::from_str(include_str!("../models.example.json")).unwrap();
-        let profiles = build_model_profiles(file, None, None, None, None).unwrap();
+        let profiles = build_model_profiles(file, None, None, None, None, None).unwrap();
         let providers = profiles
             .iter()
             .map(|profile| profile.provider.as_str())
@@ -1133,7 +1165,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = build_model_profiles(file, None, None, None, None)
+        let error = build_model_profiles(file, None, None, None, None, None)
             .err()
             .unwrap();
         assert!(
@@ -1141,5 +1173,39 @@ mod tests {
                 .to_string()
                 .contains("仅支持 xai（Grok）、deepseek、glm 和 kimi")
         );
+    }
+
+    #[test]
+    fn project_mcp_settings_merge_each_server_field() {
+        let mut settings: SettingsFile = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "docs": {
+                    "command": "npx",
+                    "args": ["server"],
+                    "env": {"TOKEN": "global", "KEEP": "yes"}
+                }
+            }
+        }))
+        .unwrap();
+        let project: SettingsFile = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "docs": {
+                    "env": {"TOKEN": "project"},
+                    "enabled": true
+                }
+            }
+        }))
+        .unwrap();
+
+        settings.overlay(project);
+        let server = settings.mcp_servers.get("docs").unwrap();
+        assert_eq!(server.command.as_deref(), Some("npx"));
+        assert_eq!(server.args.as_deref().unwrap(), ["server"]);
+        assert_eq!(
+            server.env.as_ref().unwrap().get("TOKEN").unwrap(),
+            "project"
+        );
+        assert_eq!(server.env.as_ref().unwrap().get("KEEP").unwrap(), "yes");
+        assert_eq!(server.enabled, Some(true));
     }
 }

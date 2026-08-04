@@ -277,27 +277,6 @@ pub enum WebSearchAction {
 
 impl WebSearchAction {
     #[must_use]
-    pub fn description(&self) -> String {
-        match self {
-            Self::Search { query, queries } => query
-                .clone()
-                .or_else(|| (!queries.is_empty()).then(|| queries.join(", ")))
-                .unwrap_or_else(|| "search completed".to_string()),
-            Self::OpenPage { url } => url.as_deref().map_or_else(
-                || "opened a page".to_string(),
-                |url| format!("opened {url}"),
-            ),
-            Self::FindInPage { url, pattern } => match (pattern, url) {
-                (Some(pattern), Some(url)) => format!("found {pattern:?} in {url}"),
-                (Some(pattern), None) => format!("found {pattern:?} in page"),
-                (None, Some(url)) => format!("searched within {url}"),
-                (None, None) => "searched within a page".to_string(),
-            },
-            Self::Other => "web search completed".to_string(),
-        }
-    }
-
-    #[must_use]
     pub fn description_zh(&self) -> String {
         match self {
             Self::Search { query, queries } => query

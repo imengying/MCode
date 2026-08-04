@@ -1,17 +1,17 @@
 # MCode
 
-面向 Linux Wayland 的 Rust 终端 coding agent，提供 Codex 风格交互，支持 Grok、DeepSeek、
-GLM 和 Kimi。
+面向 Linux 的 Rust 终端 coding agent，提供 Codex 风格交互，支持 Grok、DeepSeek、GLM 和
+Kimi。
 
 ## 功能
 
 - 交互式 TUI 与非交互 `exec`
 - `read_file`、`write_file`、`edit_file`、`shell` 内置工具
 - Responses 托管搜索，兼容端点本地 Web Search 与网页正文提取
-- 图片输入和本地 stdio MCP
+- 图片输入、Wayland/X11 剪贴板和本地 stdio MCP
 - shell/MCP 执行审批
 - Pi 风格自动上下文压缩和溢出恢复
-- JSONL v3 会话、崩溃恢复、累计 token 与缓存命中统计
+- JSONL 会话、崩溃恢复、累计 token 与缓存命中统计
 - 模型、effort 和搜索模式独立切换
 - 当前正式支持 Linux x86_64 与 ARM64
 
@@ -91,21 +91,24 @@ MCode 不会把 API 密钥写入配置或会话。
 常用配置：
 
 - `api`：`openai-completions` 或 `openai-responses`
-- `contextWindow` / `maxInputTokens`：上下文窗口与最大输入
+- `contextWindow` / `maxInputTokens` / `maxOutputTokens`：上下文窗口、最大输入和可选输出上限；
+  配置输出上限后可精确判断是否需要压缩重试
 - `input`：模型输入模态；文本模型使用 `["text"]`
 - `default`：每个模型必填，指定默认 effort；非推理模型使用 `off`
 - `thinkingLevelMap`：当前推理模型可选的 effort，`default` 必须是其中的非 `null` 等级
-- `compat`：控制 reasoning effort、流式 usage 和 strict tools
+- `compat`：控制 reasoning effort、流式 usage、`finish_reason` 和 strict tools；仅当端点确实
+  省略结束原因时将 `supportsFinishReason` 设为 `false`
 - `webSearch`：`disabled`、`cached` 或 `live`
 - `compaction`：自动压缩开关、预留 token 和最近历史预算
-- `mcpServers`：本地 stdio MCP；项目配置按名称覆盖全局配置
+- `mcpServers`：本地 stdio MCP；项目配置按服务名称逐字段合并全局配置
 
 `models.example.json` 只包含 Grok、DeepSeek、Kimi 和 GLM。对应密钥环境变量为
 `XAI_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和 `ZHIPUAI_API_KEY`。DeepSeek
 V4 Flash 与 V4 Pro 均使用 Responses API。未知 provider 会被拒绝。
 
-`MCODE_MODEL`、`MCODE_REASONING_EFFORT`、`MCODE_BASE_URL`、`MCODE_CONTEXT_WINDOW` 和
-`MCODE_MAX_INPUT_TOKENS` 可覆盖当前选择；`--api-key-env` 可临时指定密钥环境变量。
+`MCODE_MODEL`、`MCODE_REASONING_EFFORT`、`MCODE_BASE_URL`、`MCODE_CONTEXT_WINDOW`、
+`MCODE_MAX_INPUT_TOKENS` 和 `MCODE_MAX_OUTPUT_TOKENS` 可覆盖当前选择；`--api-key-env`
+可临时指定密钥环境变量。
 
 Web Search 依 API 协议分流：
 
@@ -163,9 +166,10 @@ TUI 命令：
 | `/exit` | 退出 |
 
 输入 `/` 后可用方向键选择，Tab 补全，Enter 补全并立即执行命令。Enter 提交，Shift+Enter
-或 Alt+Enter 换行，Escape 取消当前任务。使用 `Ctrl+V` 粘贴 Wayland 剪贴板中的图片或文本，
-也可将单个图片文件拖入终端；启动时可用 `-i/--image` 附加图片。使用上下方向键恢复历史
-输入；对话记录使用终端原生回滚，可直接用鼠标选择、复制和滚动。
+或 Alt+Enter 换行，Escape 取消当前任务。使用 `Ctrl+V` 粘贴系统剪贴板中的图片或文本；
+Wayland 不可用或报错时自动回退 X11。也可将单个图片文件拖入终端；启动时可用
+`-i/--image` 附加图片。使用上下方向键恢复历史输入；对话记录使用终端原生回滚，可直接用
+鼠标选择、复制和滚动。
 删除确认默认选择 No，
 使用方向键切换并按 Enter 确认。审批提示中 `y` 允许一次，`a` 在当前会话允许同名工具，
 `n` 拒绝。

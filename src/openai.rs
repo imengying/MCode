@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::config::{ApiProtocol, WebSearchMode, WebSearchSettings};
+use crate::config::{ApiProtocol, ModelCompat, WebSearchMode, WebSearchSettings};
 use crate::event::AgentEvent;
 use crate::protocol::{
     ChatMessage, FunctionCall, MessageRole, ToolCall, ToolDefinition, Usage, WebSearchAction,
@@ -73,10 +73,9 @@ pub(crate) struct OpenAiModelConfig {
     pub api_key: Option<String>,
     pub model: String,
     pub api: ApiProtocol,
+    pub max_output_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
-    pub supports_reasoning_effort: bool,
-    pub supports_usage_in_streaming: bool,
-    pub supports_strict_tools: bool,
+    pub compat: ModelCompat,
 }
 
 #[derive(Debug, Clone)]
@@ -86,10 +85,9 @@ pub struct OpenAiClient {
     api_key: Option<String>,
     model: String,
     api: ApiProtocol,
+    max_output_tokens: Option<u64>,
     reasoning_effort: Option<String>,
-    supports_reasoning_effort: bool,
-    supports_usage_in_streaming: bool,
-    supports_strict_tools: bool,
+    compat: ModelCompat,
     web_search: WebSearchSettings,
     timeout: Duration,
 }
@@ -125,10 +123,9 @@ impl OpenAiClient {
             api_key: config.api_key,
             model: config.model,
             api: config.api,
+            max_output_tokens: config.max_output_tokens,
             reasoning_effort: config.reasoning_effort,
-            supports_reasoning_effort: config.supports_reasoning_effort,
-            supports_usage_in_streaming: config.supports_usage_in_streaming,
-            supports_strict_tools: config.supports_strict_tools,
+            compat: config.compat,
             web_search,
             timeout,
         })
@@ -149,6 +146,11 @@ impl OpenAiClient {
         self.api
     }
 
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
+    }
+
     pub(crate) fn reconfigure(&mut self, config: OpenAiModelConfig) -> Result<()> {
         let endpoint = api_endpoint_url(&config.base_url, config.api)?;
         self.http = build_http_client(&endpoint)?;
@@ -156,15 +158,10 @@ impl OpenAiClient {
         self.api_key = config.api_key;
         self.model = config.model;
         self.api = config.api;
+        self.max_output_tokens = config.max_output_tokens;
         self.reasoning_effort = config.reasoning_effort;
-        self.supports_reasoning_effort = config.supports_reasoning_effort;
-        self.supports_usage_in_streaming = config.supports_usage_in_streaming;
-        self.supports_strict_tools = config.supports_strict_tools;
+        self.compat = config.compat;
         Ok(())
-    }
-
-    pub fn set_model(&mut self, model: impl Into<String>) {
-        self.model = model.into();
     }
 
     pub fn set_reasoning_effort(&mut self, reasoning_effort: Option<String>) {
@@ -186,7 +183,7 @@ impl OpenAiClient {
         self.web_search.mode
     }
 
-    async fn send_stream_request<T: Serialize + ?Sized>(
+    async fn send_stream_request<T: Serialize + Sync + ?Sized>(
         &self,
         body: &T,
         cancel: &CancellationToken,
@@ -248,8 +245,15 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<AssistantTurn> {
-        self.stream_chat_with_max_tokens(messages, tools, events, cancel, None)
-            .await
+        self.stream_chat_with_options(
+            messages,
+            tools,
+            events,
+            cancel,
+            self.max_output_tokens,
+            true,
+        )
+        .await
     }
 
     pub async fn stream_chat_with_max_tokens(
@@ -260,9 +264,29 @@ impl OpenAiClient {
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
     ) -> Result<AssistantTurn> {
+        self.stream_chat_with_options(messages, tools, events, cancel, max_tokens, false)
+            .await
+    }
+
+    async fn stream_chat_with_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+        max_tokens: Option<u64>,
+        allow_hosted_web_search: bool,
+    ) -> Result<AssistantTurn> {
         for attempt in 0..MAX_STREAM_ATTEMPTS {
             let result = self
-                .stream_chat_once_with_max_tokens(messages, tools, events, cancel, max_tokens)
+                .stream_chat_once_with_max_tokens(
+                    messages,
+                    tools,
+                    events,
+                    cancel,
+                    max_tokens,
+                    allow_hosted_web_search,
+                )
                 .await;
             match result {
                 Ok(turn) => return Ok(turn),
@@ -289,16 +313,24 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
+        allow_hosted_web_search: bool,
     ) -> Result<AssistantTurn> {
         let mut api_tools = tools.to_vec();
-        if !self.supports_strict_tools {
+        if !self.compat.strict_tools {
             for tool in &mut api_tools {
                 tool.function.strict = None;
             }
         }
         if self.api == ApiProtocol::Responses {
             return self
-                .stream_responses(messages, &api_tools, events, cancel, max_tokens)
+                .stream_responses(
+                    messages,
+                    &api_tools,
+                    events,
+                    cancel,
+                    max_tokens,
+                    allow_hosted_web_search,
+                )
                 .await;
         }
         let api_messages: Vec<ApiMessage<'_>> = messages.iter().map(ApiMessage::from).collect();
@@ -309,10 +341,10 @@ impl OpenAiClient {
             reasoning_effort: self
                 .reasoning_effort
                 .as_deref()
-                .filter(|_| self.supports_reasoning_effort),
+                .filter(|_| self.compat.reasoning_effort),
             max_tokens,
             stream: true,
-            stream_options: self.supports_usage_in_streaming.then_some(StreamOptions {
+            stream_options: self.compat.usage_in_streaming.then_some(StreamOptions {
                 include_usage: true,
             }),
         };
@@ -378,21 +410,18 @@ impl OpenAiClient {
             }
         }
 
-        let stop_reason = finish_reason.ok_or_else(|| {
-            stream_error(
-                if done {
-                    "Chat Completions stream reached [DONE] without finish_reason"
-                } else {
-                    "Chat Completions stream ended without finish_reason"
-                },
-                request_id.as_deref(),
-            )
-        })?;
         let tool_calls = tool_calls
             .into_values()
             .map(ToolCallBuilder::finish)
             .collect::<Result<Vec<_>>>()
             .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
+        let stop_reason = resolve_chat_stop_reason(
+            finish_reason,
+            self.compat.finish_reason,
+            !tool_calls.is_empty(),
+            done,
+            request_id.as_deref(),
+        )?;
 
         Ok(AssistantTurn {
             content: (!content.is_empty()).then_some(content),
@@ -411,10 +440,11 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
+        allow_hosted_web_search: bool,
     ) -> Result<AssistantTurn> {
         let (instructions, input) = responses_input(messages)?;
         let response_tools =
-            responses_tools(tools, max_tokens.is_none().then_some(&self.web_search));
+            responses_tools(tools, allow_hosted_web_search.then_some(&self.web_search));
         let has_tools = !response_tools.is_empty();
         let body = ResponsesRequest {
             model: &self.model,
@@ -426,7 +456,7 @@ impl OpenAiClient {
             reasoning: self
                 .reasoning_effort
                 .as_deref()
-                .filter(|_| self.supports_reasoning_effort)
+                .filter(|_| self.compat.reasoning_effort)
                 .map(|effort| ResponsesReasoning {
                     effort,
                     summary: "auto",
@@ -481,7 +511,7 @@ impl OpenAiClient {
         }
         if !state.completed {
             return Err(stream_error(
-                "Responses stream ended before response.completed",
+                "Responses stream ended before a terminal response event",
                 request_id.as_deref(),
             ));
         }
@@ -491,11 +521,13 @@ impl OpenAiClient {
         } else {
             state.raw_reasoning
         };
-        let stop_reason = if state.tool_calls.is_empty() {
-            AssistantStopReason::Stop
-        } else {
-            AssistantStopReason::ToolUse
-        };
+        let stop_reason = state.stop_reason.unwrap_or({
+            if state.tool_calls.is_empty() {
+                AssistantStopReason::Stop
+            } else {
+                AssistantStopReason::ToolUse
+            }
+        });
         Ok(AssistantTurn {
             content: (!state.content.is_empty()).then_some(state.content),
             reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
@@ -700,6 +732,7 @@ struct ResponsesAccumulator {
     cited_urls: BTreeSet<String>,
     usage: Option<Usage>,
     completed: bool,
+    stop_reason: Option<AssistantStopReason>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -785,10 +818,16 @@ enum ResponsesReasoningContent {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponsesCompleted {
+struct ResponsesTerminal {
     usage: Option<ResponsesUsage>,
     #[serde(default)]
     output: Vec<serde_json::Value>,
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesIncompleteDetails {
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -856,27 +895,36 @@ fn apply_responses_stream_event(
             let response = event.response.ok_or_else(|| {
                 OpenAiError::Protocol("response.completed is missing response".to_string())
             })?;
-            let completed: ResponsesCompleted =
+            let completed: ResponsesTerminal =
                 serde_json::from_value(response).map_err(|error| {
                     OpenAiError::Protocol(format!("invalid response.completed payload: {error}"))
                 })?;
-            for item in &completed.output {
-                apply_raw_responses_output_item(item.clone(), state, events)?;
-            }
-            if !completed.output.is_empty() {
-                state.response_items = completed.output;
-            }
-            state.usage = completed.usage.map(|usage| Usage {
-                prompt_tokens: usage.input,
-                completion_tokens: usage.output,
-                total_tokens: usage.total,
-                cached_prompt_tokens: usage
-                    .input_tokens_details
-                    .and_then(|details| details.cached_tokens),
-            });
+            apply_responses_terminal(completed, state, events)?;
             state.completed = true;
         }
-        "response.failed" | "response.incomplete" | "error" => {
+        "response.incomplete" => {
+            let response = event.response.ok_or_else(|| {
+                OpenAiError::Protocol("response.incomplete is missing response".to_string())
+            })?;
+            let incomplete: ResponsesTerminal =
+                serde_json::from_value(response).map_err(|error| {
+                    OpenAiError::Protocol(format!("invalid response.incomplete payload: {error}"))
+                })?;
+            let reason = incomplete
+                .incomplete_details
+                .as_ref()
+                .and_then(|details| details.reason.as_deref());
+            if reason != Some("max_output_tokens") {
+                return Err(OpenAiError::Protocol(match reason {
+                    Some(reason) => format!("provider returned incomplete response: {reason}"),
+                    None => "provider returned incomplete response without a reason".to_string(),
+                }));
+            }
+            apply_responses_terminal(incomplete, state, events)?;
+            state.stop_reason = Some(AssistantStopReason::Length);
+            state.completed = true;
+        }
+        "response.failed" | "error" => {
             let detail = event
                 .response
                 .map_or_else(|| data.to_string(), |response| response.to_string());
@@ -887,6 +935,28 @@ fn apply_responses_stream_event(
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn apply_responses_terminal(
+    terminal: ResponsesTerminal,
+    state: &mut ResponsesAccumulator,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) -> Result<()> {
+    for item in &terminal.output {
+        apply_raw_responses_output_item(item.clone(), state, events)?;
+    }
+    if !terminal.output.is_empty() {
+        state.response_items = terminal.output;
+    }
+    state.usage = terminal.usage.map(|usage| Usage {
+        prompt_tokens: usage.input,
+        completion_tokens: usage.output,
+        total_tokens: usage.total,
+        cached_prompt_tokens: usage
+            .input_tokens_details
+            .and_then(|details| details.cached_tokens),
+    });
     Ok(())
 }
 
@@ -1399,6 +1469,33 @@ fn apply_stream_chunk(
     Ok(())
 }
 
+fn resolve_chat_stop_reason(
+    finish_reason: Option<AssistantStopReason>,
+    supports_finish_reason: bool,
+    has_tool_calls: bool,
+    reached_done: bool,
+    request_id: Option<&str>,
+) -> Result<AssistantStopReason> {
+    if let Some(reason) = finish_reason {
+        return Ok(reason);
+    }
+    if !supports_finish_reason {
+        return Ok(if has_tool_calls {
+            AssistantStopReason::ToolUse
+        } else {
+            AssistantStopReason::Stop
+        });
+    }
+    Err(stream_error(
+        if reached_done {
+            "Chat Completions stream reached [DONE] without finish_reason"
+        } else {
+            "Chat Completions stream ended without finish_reason"
+        },
+        request_id,
+    ))
+}
+
 fn map_chat_finish_reason(reason: &str) -> Result<AssistantStopReason> {
     match reason {
         "stop" | "end" | "end_turn" => Ok(AssistantStopReason::Stop),
@@ -1553,6 +1650,43 @@ mod tests {
         );
         assert!(map_chat_finish_reason("content_filter").is_err());
         assert!(map_chat_finish_reason("unexpected").is_err());
+    }
+
+    #[test]
+    fn infers_chat_stop_only_when_finish_reasons_are_disabled() {
+        assert_eq!(
+            resolve_chat_stop_reason(None, false, false, true, None).unwrap(),
+            AssistantStopReason::Stop
+        );
+        assert_eq!(
+            resolve_chat_stop_reason(None, false, true, false, None).unwrap(),
+            AssistantStopReason::ToolUse
+        );
+        assert!(resolve_chat_stop_reason(None, true, false, true, None).is_err());
+    }
+
+    #[test]
+    fn classifies_only_max_output_responses_as_length_stops() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let mut state = ResponsesAccumulator::default();
+        apply_responses_stream_event(
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":200,"output_tokens":30,"total_tokens":230},"output":[]}}"#,
+            &mut state,
+            &events,
+        )
+        .unwrap();
+        assert!(state.completed);
+        assert_eq!(state.stop_reason, Some(AssistantStopReason::Length));
+        assert_eq!(state.usage.unwrap().completion_tokens, 30);
+
+        let mut state = ResponsesAccumulator::default();
+        let error = apply_responses_stream_event(
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"},"output":[]}}"#,
+            &mut state,
+            &events,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content_filter"));
     }
 
     #[test]

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use mcode::agent::{Agent, RunStatus};
 use mcode::approval::ApprovalGate;
 use mcode::config::{
-    ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ReasoningEffort, WebSearchMode,
-    WebSearchSettings,
+    ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ModelCompat, ReasoningEffort,
+    WebSearchMode, WebSearchSettings,
 };
 use mcode::event::AgentEvent;
 use mcode::protocol::{ChatMessage, FunctionCall, ToolCall, Usage};
@@ -68,7 +68,7 @@ async fn executes_a_tool_and_continues_the_model_turn() {
     let project = tempdir().unwrap();
     let config = AppConfig {
         model: "test-model".to_string(),
-        provider: None,
+        provider: "xai".to_string(),
         api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::High,
         reasoning_value: Some("high".to_string()),
@@ -76,9 +76,13 @@ async fn executes_a_tool_and_continues_the_model_turn() {
         api_key: Some("test-key".to_string()),
         context_window: 200_000,
         max_input_tokens: 200_000,
-        supports_reasoning_effort: true,
-        supports_usage_in_streaming: true,
-        supports_strict_tools: false,
+        max_output_tokens: None,
+        compat: ModelCompat {
+            reasoning_effort: true,
+            usage_in_streaming: true,
+            finish_reason: true,
+            strict_tools: false,
+        },
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -279,7 +283,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
     .unwrap();
     let config = AppConfig {
         model: "deepseek-test".to_string(),
-        provider: None,
+        provider: "deepseek".to_string(),
         api: ApiProtocol::Responses,
         reasoning_effort: ReasoningEffort::Low,
         reasoning_value: Some("low".to_string()),
@@ -287,9 +291,13 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
         api_key: Some("test-key".to_string()),
         context_window: 200_000,
         max_input_tokens: 200_000,
-        supports_reasoning_effort: true,
-        supports_usage_in_streaming: true,
-        supports_strict_tools: true,
+        max_output_tokens: None,
+        compat: ModelCompat {
+            reasoning_effort: true,
+            usage_in_streaming: true,
+            finish_reason: true,
+            strict_tools: true,
+        },
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -385,8 +393,13 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::WebSearchFinished { action, .. }
-            if action.description() == "current Rust release"
+        AgentEvent::WebSearchFinished {
+            action: mcode::protocol::WebSearchAction::Search {
+                query: Some(query),
+                ..
+            },
+            ..
+        } if query == "current Rust release"
     )));
     let streamed = events
         .iter()
@@ -514,7 +527,7 @@ async fn shell_tool_is_denied_without_frontend_approval() {
     let project = tempdir().unwrap();
     let config = AppConfig {
         model: "test-model".to_string(),
-        provider: None,
+        provider: "xai".to_string(),
         api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
         reasoning_value: None,
@@ -522,9 +535,13 @@ async fn shell_tool_is_denied_without_frontend_approval() {
         api_key: None,
         context_window: 128_000,
         max_input_tokens: 128_000,
-        supports_reasoning_effort: true,
-        supports_usage_in_streaming: true,
-        supports_strict_tools: false,
+        max_output_tokens: None,
+        compat: ModelCompat {
+            reasoning_effort: true,
+            usage_in_streaming: true,
+            finish_reason: true,
+            strict_tools: false,
+        },
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -604,7 +621,7 @@ async fn omits_request_fields_disabled_by_pi_compat() {
     let project = tempdir().unwrap();
     let config = AppConfig {
         model: "compat-model".to_string(),
-        provider: None,
+        provider: "xai".to_string(),
         api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::High,
         reasoning_value: Some("high".to_string()),
@@ -612,9 +629,13 @@ async fn omits_request_fields_disabled_by_pi_compat() {
         api_key: None,
         context_window: 128_000,
         max_input_tokens: 128_000,
-        supports_reasoning_effort: false,
-        supports_usage_in_streaming: false,
-        supports_strict_tools: false,
+        max_output_tokens: None,
+        compat: ModelCompat {
+            reasoning_effort: false,
+            usage_in_streaming: false,
+            finish_reason: true,
+            strict_tools: false,
+        },
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -977,6 +998,120 @@ async fn context_overflow_compacts_and_retries_once() {
 }
 
 #[tokio::test]
+async fn responses_length_stop_compacts_and_retries_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_requests
+                .lock()
+                .await
+                .push(read_json_request(&mut stream).await);
+            let events = match index {
+                0 => vec![json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "usage": {
+                            "input_tokens": 5_000,
+                            "output_tokens": 12,
+                            "total_tokens": 5_012
+                        },
+                        "output": []
+                    }
+                })],
+                1 => vec![
+                    json!({
+                        "type": "response.output_text.delta",
+                        "delta": "## Goal\nRecover the interrupted response"
+                    }),
+                    responses_completed("resp_summary", 120, 20),
+                ],
+                _ => vec![
+                    json!({
+                        "type": "response.output_text.delta",
+                        "delta": "Recovered response."
+                    }),
+                    responses_completed("resp_final", 300, 20),
+                ],
+            };
+            write_responses_sse(&mut stream, events).await;
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let mut config = compaction_test_config(project.path(), address, 100_000, 1_000, 60);
+    config.provider = "deepseek".to_string();
+    config.api = ApiProtocol::Responses;
+    config.max_output_tokens = Some(100);
+    config.compat.strict_tools = true;
+    let mut session =
+        Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    session
+        .append(ChatMessage::user("old ".repeat(500)))
+        .unwrap();
+    session
+        .append(ChatMessage::assistant(
+            Some("old ".repeat(500)),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    session
+        .append(ChatMessage::user("recent question ".repeat(8)))
+        .unwrap();
+    session
+        .append(ChatMessage::assistant(
+            Some("recent answer ".repeat(8)),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "continue",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["max_output_tokens"], 100);
+    assert_eq!(requests[1]["max_output_tokens"], 800);
+    assert_eq!(requests[2]["max_output_tokens"], 100);
+    let retry_input = requests[2]["input"].to_string();
+    assert!(retry_input.contains("Recover the interrupted response"));
+    assert!(agent.messages().iter().any(|message| {
+        message.role == mcode::protocol::MessageRole::Assistant && message.content.is_none()
+    }));
+    assert_eq!(agent.total_usage().total_tokens, 5_472);
+    let events = drain_events(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ResponseTruncated { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactionFinished {
+            reason: mcode::event::CompactionReason::Overflow,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn resume_does_not_replay_a_dangerous_tool_with_an_unknown_result() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -995,9 +1130,7 @@ async fn resume_does_not_replay_a_dangerous_tool_with_an_unknown_result() {
     let run_id = session
         .begin_run(ChatMessage::user("create interrupted.txt"))
         .unwrap();
-    session
-        .start_generation(run_id, None, "test-model", ApiProtocol::ChatCompletions)
-        .unwrap();
+    session.start_generation(run_id).unwrap();
     let call = tool_call(
         "call_interrupted_write",
         "write_file",
@@ -1013,7 +1146,6 @@ async fn resume_does_not_replay_a_dangerous_tool_with_an_unknown_result() {
                 total_tokens: 50,
                 cached_prompt_tokens: None,
             },
-            false,
         )
         .unwrap();
     session
@@ -1074,9 +1206,7 @@ async fn resume_replays_a_safe_read_file_tool() {
     let run_id = session
         .begin_run(ChatMessage::user("read fixture.txt"))
         .unwrap();
-    session
-        .start_generation(run_id, None, "test-model", ApiProtocol::ChatCompletions)
-        .unwrap();
+    session.start_generation(run_id).unwrap();
     let call = tool_call(
         "call_interrupted_read",
         "read_file",
@@ -1092,7 +1222,6 @@ async fn resume_replays_a_safe_read_file_tool() {
                 total_tokens: 38,
                 cached_prompt_tokens: None,
             },
-            false,
         )
         .unwrap();
     session
@@ -1144,18 +1273,10 @@ async fn delete_command_removes_only_the_selected_project_session() {
     let mcode_home = home.path().join(".mcode");
     write_test_model_catalog(&mcode_home, "test-model", false);
     let base = mcode_home.join("sessions");
-    let selected = Session::create_in(
-        &base,
-        project.path(),
-        SessionMetadata::local("test-model", ReasoningEffort::Off),
-    )
-    .unwrap();
-    let remaining = Session::create_in(
-        &base,
-        project.path(),
-        SessionMetadata::local("test-model", ReasoningEffort::Off),
-    )
-    .unwrap();
+    let selected =
+        Session::create_in(&base, project.path(), test_session_metadata("test-model")).unwrap();
+    let remaining =
+        Session::create_in(&base, project.path(), test_session_metadata("test-model")).unwrap();
     let selected_path = selected.path().unwrap().to_path_buf();
     let remaining_path = remaining.path().unwrap().to_path_buf();
     let selected_id = selected.id();
@@ -1205,6 +1326,16 @@ fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
             name: name.to_string(),
             arguments: arguments.to_string(),
         },
+    }
+}
+
+fn test_session_metadata(model: &str) -> SessionMetadata {
+    SessionMetadata {
+        provider: "xai".to_string(),
+        model: model.to_string(),
+        api: ApiProtocol::ChatCompletions,
+        reasoning_effort: ReasoningEffort::Off,
+        web_search_mode: WebSearchMode::Disabled,
     }
 }
 
@@ -1259,7 +1390,7 @@ fn compaction_test_config(
 ) -> AppConfig {
     AppConfig {
         model: "test-model".to_string(),
-        provider: None,
+        provider: "xai".to_string(),
         api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
         reasoning_value: None,
@@ -1267,9 +1398,13 @@ fn compaction_test_config(
         api_key: None,
         context_window,
         max_input_tokens: context_window,
-        supports_reasoning_effort: true,
-        supports_usage_in_streaming: true,
-        supports_strict_tools: false,
+        max_output_tokens: None,
+        compat: ModelCompat {
+            reasoning_effort: true,
+            usage_in_streaming: true,
+            finish_reason: true,
+            strict_tools: false,
+        },
         cwd: project.canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings {
@@ -1287,7 +1422,7 @@ fn compaction_test_config(
 fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -> AppConfig {
     AppConfig {
         model: "test-model".to_string(),
-        provider: None,
+        provider: "xai".to_string(),
         api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
         reasoning_value: None,
@@ -1295,9 +1430,13 @@ fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -
         api_key: None,
         context_window: 128_000,
         max_input_tokens: 128_000,
-        supports_reasoning_effort: true,
-        supports_usage_in_streaming: true,
-        supports_strict_tools: false,
+        max_output_tokens: None,
+        compat: ModelCompat {
+            reasoning_effort: true,
+            usage_in_streaming: true,
+            finish_reason: true,
+            strict_tools: false,
+        },
         cwd: project.canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),

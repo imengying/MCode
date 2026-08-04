@@ -11,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval::{ApprovalDecision, ApprovalGate};
 use crate::compaction::{
-    CompactionPreparation, SUMMARIZATION_SYSTEM_PROMPT, append_file_operations, combine_usage,
+    CompactionPreparation, SUMMARIZATION_SYSTEM_PROMPT, append_file_operations,
     estimate_message_tokens, estimate_text_tokens, history_summary_request, prepare_compaction,
     should_compact, turn_prefix_summary_request,
 };
 use crate::config::{
     ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ModelProfile, ReasoningEffort,
-    WebSearchMode, find_model_profile,
+    WebSearchMode, find_model_profile, load_model_profiles,
 };
 use crate::event::{AgentEvent, CompactionReason};
 use crate::openai::{
@@ -37,7 +37,7 @@ pub struct Agent {
     client: OpenAiClient,
     model_profiles: Vec<ModelProfile>,
     reload_overrides: ConfigOverrides,
-    provider: Option<String>,
+    provider: String,
     reasoning_effort: ReasoningEffort,
     default_reasoning_effort: ReasoningEffort,
     context_window: u64,
@@ -77,7 +77,7 @@ pub struct CompactionResult {
 
 impl Agent {
     pub async fn new(config: &AppConfig, mut session: Session) -> Result<Self> {
-        session.set_model(config.provider.as_deref(), &config.model, config.api)?;
+        session.set_model(&config.provider, &config.model, config.api)?;
         session.set_reasoning_effort(config.reasoning_effort)?;
         session.set_web_search_mode(config.web_search.mode)?;
         let client = OpenAiClient::new(
@@ -86,10 +86,9 @@ impl Agent {
                 api_key: config.api_key.clone(),
                 model: config.model.clone(),
                 api: config.api,
+                max_output_tokens: config.max_output_tokens,
                 reasoning_effort: config.reasoning_value.clone(),
-                supports_reasoning_effort: config.supports_reasoning_effort,
-                supports_usage_in_streaming: config.supports_usage_in_streaming,
-                supports_strict_tools: config.supports_strict_tools,
+                compat: config.compat,
             },
             config.web_search.clone(),
             Duration::from_secs(config.request_timeout_secs),
@@ -103,13 +102,10 @@ impl Agent {
         .await?;
         let system_prompt = build_system_prompt(&config.cwd)?;
         let total_usage = session.total_usage();
-        let selected_profile = config.model_profiles.iter().find(|profile| {
-            profile.id == config.model
-                && config
-                    .provider
-                    .as_deref()
-                    .is_some_and(|provider| provider == profile.provider)
-        });
+        let selected_profile = config
+            .model_profiles
+            .iter()
+            .find(|profile| profile.id == config.model && config.provider == profile.provider);
         let default_reasoning_effort = selected_profile.map_or(
             config.reasoning_effort,
             ModelProfile::default_reasoning_effort,
@@ -249,12 +245,7 @@ impl Agent {
                 }
                 self.last_context_dropped = selection.dropped_messages;
                 let context = selection.messages;
-                self.session.start_generation(
-                    run_id,
-                    self.provider.as_deref(),
-                    self.client.model(),
-                    self.client.api(),
-                )?;
+                self.session.start_generation(run_id)?;
                 let _ = events.send(AgentEvent::AssistantStarted);
                 match self
                     .client
@@ -282,9 +273,8 @@ impl Agent {
             };
 
             let stop_reason = turn.stop_reason;
-            let reasoning_only_truncation =
-                stop_reason == AssistantStopReason::Length && turn.reasoning_content.is_some();
-            if turn.content.is_none() && turn.tool_calls.is_empty() && !reasoning_only_truncation {
+            let length_truncation = stop_reason == AssistantStopReason::Length;
+            if turn.content.is_none() && turn.tool_calls.is_empty() && !length_truncation {
                 return Err(anyhow!("provider completed without text or tool calls"));
             }
             let (usage, estimated) = turn.usage.map_or_else(
@@ -292,18 +282,51 @@ impl Agent {
                 |usage| (normalize_usage(usage), false),
             );
             let tool_calls = turn.tool_calls.clone();
-            self.session.complete_generation(
-                run_id,
-                ChatMessage::assistant_with_response_items(
-                    turn.content,
-                    turn.reasoning_content,
-                    turn.tool_calls,
-                    turn.response_items,
-                ),
-                usage,
-                estimated,
-            )?;
-            add_usage(&mut self.total_usage, usage);
+            let assistant_message = ChatMessage::assistant_with_response_items(
+                turn.content,
+                turn.reasoning_content,
+                turn.tool_calls,
+                turn.response_items,
+            );
+            if stop_reason == AssistantStopReason::Length {
+                let had_tool_calls = !tool_calls.is_empty();
+                let _ = events.send(AgentEvent::ResponseTruncated { had_tool_calls });
+                if !overflow_recovery_attempted
+                    && is_recoverable_length(
+                        usage,
+                        estimated,
+                        self.client.max_output_tokens(),
+                        self.max_input_tokens,
+                    )
+                {
+                    overflow_recovery_attempted = true;
+                    if self
+                        .compact_for_reason(None, CompactionReason::Overflow, events, cancel)
+                        .await
+                        .is_ok()
+                    {
+                        self.session
+                            .discard_generation(run_id, assistant_message, usage)?;
+                        self.total_usage = self.total_usage.saturating_add(usage);
+                        self.context_tokens = self.estimated_context_tokens();
+                        self.usage_estimated = true;
+                        let _ = events.send(AgentEvent::Usage {
+                            usage,
+                            context_tokens: self.context_tokens,
+                            context_window: self.context_window,
+                            max_input_tokens: self.max_input_tokens,
+                            estimated,
+                        });
+                        continue;
+                    }
+                    if cancel.is_cancelled() {
+                        return Ok(RunStatus::Cancelled);
+                    }
+                }
+            }
+            self.session
+                .complete_generation(run_id, assistant_message, usage)?;
+            self.total_usage = self.total_usage.saturating_add(usage);
             self.context_tokens = usage.total_tokens;
             self.usage_estimated = estimated;
             let _ = events.send(AgentEvent::Usage {
@@ -316,7 +339,6 @@ impl Agent {
 
             if stop_reason == AssistantStopReason::Length {
                 let had_tool_calls = !tool_calls.is_empty();
-                let _ = events.send(AgentEvent::ResponseTruncated { had_tool_calls });
                 if had_tool_calls {
                     self.reject_truncated_tool_calls(run_id, tool_calls, events)?;
                     continue;
@@ -640,7 +662,7 @@ impl Agent {
             preparation.read_files,
             preparation.modified_files,
         )?;
-        add_usage(&mut self.total_usage, usage);
+        self.total_usage = self.total_usage.saturating_add(usage);
         self.context_tokens = self.estimated_context_tokens();
         self.usage_estimated = true;
         self.last_context_dropped = 0;
@@ -685,7 +707,7 @@ impl Agent {
             );
             let (prefix, prefix_usage) = self.complete_summary(request, cancel).await?;
             let usage = history_usage.map_or(prefix_usage, |history_usage| {
-                combine_usage(history_usage, prefix_usage)
+                history_usage.saturating_add(prefix_usage)
             });
             return Ok((
                 format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}"),
@@ -743,8 +765,8 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn provider(&self) -> Option<&str> {
-        self.provider.as_deref()
+    pub fn provider(&self) -> &str {
+        &self.provider
     }
 
     #[must_use]
@@ -789,7 +811,7 @@ impl Agent {
     }
 
     pub fn refresh_model_profiles(&mut self) -> Result<()> {
-        self.model_profiles = AppConfig::reload_model_profiles(&self.reload_overrides)?;
+        self.model_profiles = load_model_profiles(&self.reload_overrides)?;
         Ok(())
     }
 
@@ -807,7 +829,7 @@ impl Agent {
     }
 
     pub fn select_model(&mut self, query: &str) -> Result<()> {
-        let profile = find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?
+        let profile = find_model_profile(&self.model_profiles, Some(&self.provider), query)?
             .with_context(|| format!("模型 {query:?} 不在 ~/.mcode/models.json 中"))?
             .clone();
         let effective_effort = profile.default_reasoning_effort();
@@ -817,22 +839,20 @@ impl Agent {
             api_key: profile.api_key.clone(),
             model: profile.id.clone(),
             api: profile.api,
+            max_output_tokens: profile.max_output_tokens,
             reasoning_effort: reasoning_value,
-            supports_reasoning_effort: profile.compat.reasoning_effort,
-            supports_usage_in_streaming: profile.compat.usage_in_streaming,
-            supports_strict_tools: profile.compat.strict_tools,
+            compat: profile.compat,
         })?;
-        self.provider = Some(profile.provider);
+        self.provider = profile.provider;
         self.reasoning_effort = effective_effort;
         self.default_reasoning_effort = effective_effort;
         self.context_window = profile.context_window;
         self.max_input_tokens = profile.max_input_tokens;
         self.supports_images = profile.supports_images;
         self.tools.set_api(self.client.api());
-        let provider = self.provider.clone();
         let model = self.client.model().to_string();
         self.session
-            .set_model(provider.as_deref(), &model, self.client.api())?;
+            .set_model(&self.provider, &model, self.client.api())?;
         self.session.set_reasoning_effort(self.reasoning_effort)?;
         self.context_tokens = self.estimated_context_tokens();
         self.usage_estimated = true;
@@ -936,13 +956,9 @@ impl Agent {
     }
 
     fn current_profile(&self) -> Option<&ModelProfile> {
-        self.model_profiles.iter().find(|profile| {
-            profile.id == self.client.model()
-                && self
-                    .provider
-                    .as_deref()
-                    .is_some_and(|provider| provider == profile.provider)
-        })
+        self.model_profiles
+            .iter()
+            .find(|profile| profile.id == self.client.model() && self.provider == profile.provider)
     }
 
     fn estimated_context_tokens(&self) -> u64 {
@@ -996,8 +1012,19 @@ fn normalize_usage(mut usage: Usage) -> Usage {
     usage
 }
 
-fn add_usage(total: &mut Usage, usage: Usage) {
-    *total = total.saturating_add(usage);
+fn is_recoverable_length(
+    usage: Usage,
+    estimated: bool,
+    max_output_tokens: Option<u64>,
+    max_input_tokens: u64,
+) -> bool {
+    if estimated {
+        return false;
+    }
+    if let Some(limit) = max_output_tokens {
+        return usage.completion_tokens < limit;
+    }
+    usage.total_tokens >= max_input_tokens.saturating_mul(99).div_ceil(100)
 }
 
 fn estimate_usage(
@@ -1175,7 +1202,7 @@ mod tests {
         let project = tempdir().unwrap();
         let config = AppConfig {
             model: "test-model".to_string(),
-            provider: None,
+            provider: "xai".to_string(),
             api: ApiProtocol::ChatCompletions,
             reasoning_effort: ReasoningEffort::High,
             reasoning_value: Some("high".to_string()),
@@ -1183,9 +1210,13 @@ mod tests {
             api_key: None,
             context_window: 128_000,
             max_input_tokens: 128_000,
-            supports_reasoning_effort: true,
-            supports_usage_in_streaming: true,
-            supports_strict_tools: false,
+            max_output_tokens: None,
+            compat: crate::config::ModelCompat {
+                reasoning_effort: true,
+                usage_in_streaming: true,
+                finish_reason: true,
+                strict_tools: false,
+            },
             cwd: project.path().canonicalize().unwrap(),
             request_timeout_secs: 10,
             compaction: CompactionSettings::default(),

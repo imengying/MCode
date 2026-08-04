@@ -531,6 +531,7 @@ impl ToolRegistry {
         let mut command = shell_command(&args.command);
         command
             .current_dir(&self.root)
+            .env("AI_AGENT", "mcode")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -753,6 +754,7 @@ async fn connect_mcp_server(server: &McpServerConfig, root: &Path) -> Result<Mcp
     command
         .args(&server.args)
         .envs(&server.env)
+        .env("AI_AGENT", "mcode")
         .current_dir(root);
     let (transport, stderr) = TokioChildProcess::builder(command)
         .stderr(Stdio::piped())
@@ -1213,7 +1215,10 @@ mod tests {
             kind: "function".to_string(),
             function: crate::protocol::FunctionCall {
                 name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "printf alpha; printf beta"}).to_string(),
+                arguments: serde_json::json!({
+                    "command": "printf alpha; printf beta; printf :$AI_AGENT"
+                })
+                .to_string(),
             },
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1221,14 +1226,14 @@ mod tests {
         let result = tools.execute(&call, &CancellationToken::new(), &tx).await;
 
         assert!(!result.is_error);
-        assert!(result.output.contains("alphabeta"));
+        assert!(result.output.contains("alphabeta:mcode"));
         let deltas = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|event| match event {
                 AgentEvent::ToolOutputDelta { id, delta } if id == "call_shell" => Some(delta),
                 _ => None,
             })
             .collect::<String>();
-        assert_eq!(deltas, "alphabeta");
+        assert_eq!(deltas, "alphabeta:mcode");
     }
 
     #[cfg(not(windows))]

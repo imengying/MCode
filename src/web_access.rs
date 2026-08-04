@@ -47,11 +47,6 @@ impl WebAccess {
     }
 
     #[must_use]
-    pub const fn mode(&self) -> WebSearchMode {
-        self.settings.mode
-    }
-
-    #[must_use]
     pub fn definitions(&self, api: ApiProtocol) -> Vec<ToolDefinition> {
         if !self.settings.mode.is_enabled() {
             return Vec::new();

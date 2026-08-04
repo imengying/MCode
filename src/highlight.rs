@@ -93,7 +93,7 @@ fn highlighted_lines(code: &str, language: &str) -> Option<Vec<Line<'static>>> {
     Some(lines)
 }
 
-pub(crate) fn highlight_code(code: &str, language: &str) -> Vec<Line<'static>> {
+pub(super) fn highlight_code(code: &str, language: &str) -> Vec<Line<'static>> {
     highlighted_lines(code, language).unwrap_or_else(|| {
         let mut lines = code
             .lines()

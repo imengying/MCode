@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,25 +21,11 @@ const SESSION_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    pub provider: String,
     pub model: String,
     pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
     pub web_search_mode: WebSearchMode,
-}
-
-impl SessionMetadata {
-    #[must_use]
-    pub fn local(model: impl Into<String>, reasoning_effort: ReasoningEffort) -> Self {
-        Self {
-            provider: None,
-            model: model.into(),
-            api: ApiProtocol::ChatCompletions,
-            reasoning_effort,
-            web_search_mode: WebSearchMode::Disabled,
-        }
-    }
 }
 
 impl From<&AppConfig> for SessionMetadata {
@@ -63,6 +49,7 @@ pub struct Session {
     path: Option<PathBuf>,
     writer: Option<File>,
     messages: Vec<ChatMessage>,
+    context_excluded_messages: BTreeSet<usize>,
     latest_compaction: Option<CompactionCheckpoint>,
     total_usage: Usage,
     active_run: Option<ActiveRun>,
@@ -102,7 +89,6 @@ pub struct PendingToolCall {
 struct ActiveRun {
     id: Uuid,
     message_start: usize,
-    completed_steps: usize,
     generation_attempts: usize,
     tools: BTreeMap<String, ToolIntent>,
 }
@@ -126,7 +112,7 @@ pub struct CompactionCheckpoint {
 pub struct SessionSummary {
     pub id: Uuid,
     pub created_at: u64,
-    pub provider: Option<String>,
+    pub provider: String,
     pub model: String,
     pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
@@ -181,17 +167,17 @@ enum SessionRecord {
     GenerationStarted {
         run_id: Uuid,
         attempt: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
-        model: String,
-        api: ApiProtocol,
         created_at: u64,
     },
     AssistantCompleted {
         run_id: Uuid,
         message: ChatMessage,
         usage: Usage,
-        estimated: bool,
+    },
+    AssistantDiscarded {
+        run_id: Uuid,
+        message: ChatMessage,
+        usage: Usage,
     },
     ToolStarted {
         #[serde(flatten)]
@@ -208,8 +194,7 @@ enum SessionRecord {
         created_at: u64,
     },
     ModelChanged {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
+        provider: String,
         model: String,
         api: ApiProtocol,
     },
@@ -239,6 +224,7 @@ impl Session {
                 path: None,
                 writer: None,
                 messages: Vec::new(),
+                context_excluded_messages: BTreeSet::new(),
                 latest_compaction: None,
                 total_usage: Usage::default(),
                 active_run: None,
@@ -273,6 +259,7 @@ impl Session {
             path: Some(path),
             writer: Some(writer),
             messages: Vec::new(),
+            context_excluded_messages: BTreeSet::new(),
             latest_compaction: None,
             total_usage: Usage::default(),
             active_run: None,
@@ -487,6 +474,7 @@ impl Session {
         }
 
         let mut messages = Vec::new();
+        let mut context_excluded_messages = BTreeSet::new();
         let mut latest_compaction = None;
         let mut total_usage = Usage::default();
         let mut active_run: Option<ActiveRun> = None;
@@ -534,7 +522,6 @@ impl Session {
                     active_run = Some(ActiveRun {
                         id: run_id,
                         message_start,
-                        completed_steps: 0,
                         generation_attempts: 0,
                         tools: BTreeMap::new(),
                     });
@@ -542,9 +529,6 @@ impl Session {
                 SessionRecord::GenerationStarted {
                     run_id,
                     attempt,
-                    provider: _,
-                    model: _,
-                    api: _,
                     created_at: _,
                 } => {
                     let active = active_run.as_mut().ok_or_else(|| {
@@ -567,7 +551,6 @@ impl Session {
                     run_id,
                     message,
                     usage,
-                    estimated: _,
                 } => {
                     let active = active_run.as_mut().ok_or_else(|| {
                         anyhow!(
@@ -586,9 +569,34 @@ impl Session {
                             index + 1
                         );
                     }
-                    active.completed_steps = active.completed_steps.saturating_add(1);
                     active.generation_attempts = 0;
-                    add_usage(&mut total_usage, usage);
+                    total_usage = total_usage.saturating_add(usage);
+                    messages.push(message);
+                }
+                SessionRecord::AssistantDiscarded {
+                    run_id,
+                    message,
+                    usage,
+                } => {
+                    let active = active_run.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "discarded assistant response outside a run at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?;
+                    if active.id != run_id
+                        || active.generation_attempts == 0
+                        || message.role != MessageRole::Assistant
+                    {
+                        bail!(
+                            "invalid discarded assistant response at {}:{}",
+                            path.display(),
+                            index + 1
+                        );
+                    }
+                    total_usage = total_usage.saturating_add(usage);
+                    context_excluded_messages.insert(messages.len());
                     messages.push(message);
                 }
                 SessionRecord::ToolStarted { intent } => {
@@ -689,7 +697,7 @@ impl Session {
                         );
                     }
                     if let Some(usage) = checkpoint.usage {
-                        add_usage(&mut total_usage, usage);
+                        total_usage = total_usage.saturating_add(usage);
                     }
                     latest_compaction = Some(checkpoint);
                 }
@@ -718,6 +726,7 @@ impl Session {
             path: Some(path.to_path_buf()),
             writer,
             messages,
+            context_excluded_messages,
             latest_compaction,
             total_usage,
             active_run,
@@ -774,7 +783,7 @@ impl Session {
         usage: Option<Usage>,
         read_files: Vec<String>,
         modified_files: Vec<String>,
-    ) -> Result<CompactionCheckpoint> {
+    ) -> Result<()> {
         if first_kept_message_index > self.messages.len() {
             bail!(
                 "compaction boundary {first_kept_message_index} exceeds the session message count {}",
@@ -795,30 +804,25 @@ impl Session {
             checkpoint: checkpoint.clone(),
         })?;
         if let Some(usage) = checkpoint.usage {
-            add_usage(&mut self.total_usage, usage);
+            self.total_usage = self.total_usage.saturating_add(usage);
         }
-        self.latest_compaction = Some(checkpoint.clone());
-        Ok(checkpoint)
+        self.latest_compaction = Some(checkpoint);
+        Ok(())
     }
 
-    pub fn set_model(
-        &mut self,
-        provider: Option<&str>,
-        model: &str,
-        api: ApiProtocol,
-    ) -> Result<()> {
-        if self.metadata.provider.as_deref() == provider
+    pub fn set_model(&mut self, provider: &str, model: &str, api: ApiProtocol) -> Result<()> {
+        if self.metadata.provider == provider
             && self.metadata.model == model
             && self.metadata.api == api
         {
             return Ok(());
         }
         self.persist_record(&SessionRecord::ModelChanged {
-            provider: provider.map(ToString::to_string),
+            provider: provider.to_string(),
             model: model.to_string(),
             api,
         })?;
-        self.metadata.provider = provider.map(ToString::to_string);
+        self.metadata.provider = provider.to_string();
         self.metadata.model = model.to_string();
         self.metadata.api = api;
         Ok(())
@@ -865,20 +869,13 @@ impl Session {
         self.active_run = Some(ActiveRun {
             id: run_id,
             message_start,
-            completed_steps: 0,
             generation_attempts: 0,
             tools: BTreeMap::new(),
         });
         Ok(run_id)
     }
 
-    pub fn start_generation(
-        &mut self,
-        run_id: Uuid,
-        provider: Option<&str>,
-        model: &str,
-        api: ApiProtocol,
-    ) -> Result<usize> {
+    pub fn start_generation(&mut self, run_id: Uuid) -> Result<()> {
         let active = self
             .active_run
             .as_ref()
@@ -890,15 +887,12 @@ impl Session {
         self.persist_record(&SessionRecord::GenerationStarted {
             run_id,
             attempt,
-            provider: provider.map(ToString::to_string),
-            model: model.to_string(),
-            api,
             created_at: unix_timestamp(),
         })?;
         if let Some(active) = self.active_run.as_mut() {
             active.generation_attempts = attempt;
         }
-        Ok(attempt)
+        Ok(())
     }
 
     pub fn complete_generation(
@@ -906,7 +900,6 @@ impl Session {
         run_id: Uuid,
         message: ChatMessage,
         usage: Usage,
-        estimated: bool,
     ) -> Result<()> {
         let active = self
             .active_run
@@ -922,13 +915,38 @@ impl Session {
             run_id,
             message: message.clone(),
             usage,
-            estimated,
         })?;
         if let Some(active) = self.active_run.as_mut() {
-            active.completed_steps = active.completed_steps.saturating_add(1);
             active.generation_attempts = 0;
         }
-        add_usage(&mut self.total_usage, usage);
+        self.total_usage = self.total_usage.saturating_add(usage);
+        self.messages.push(message);
+        Ok(())
+    }
+
+    pub fn discard_generation(
+        &mut self,
+        run_id: Uuid,
+        message: ChatMessage,
+        usage: Usage,
+    ) -> Result<()> {
+        let active = self
+            .active_run
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot discard a generation without an active run"))?;
+        if active.id != run_id || active.generation_attempts == 0 {
+            bail!("discarded generation does not match the active run");
+        }
+        if message.role != MessageRole::Assistant {
+            bail!("discarded generation must contain an assistant message");
+        }
+        self.persist_record(&SessionRecord::AssistantDiscarded {
+            run_id,
+            message: message.clone(),
+            usage,
+        })?;
+        self.total_usage = self.total_usage.saturating_add(usage);
+        self.context_excluded_messages.insert(self.messages.len());
         self.messages.push(message);
         Ok(())
     }
@@ -1020,20 +1038,17 @@ impl Session {
     }
 
     #[must_use]
-    pub fn active_run_completed_steps(&self) -> usize {
-        self.active_run
-            .as_ref()
-            .map_or(0, |run| run.completed_steps)
-    }
-
-    #[must_use]
     pub fn active_run_has_final_response(&self) -> bool {
         let Some(active) = &self.active_run else {
             return false;
         };
         self.messages
-            .get(active.message_start..)
-            .and_then(|messages| messages.last())
+            .iter()
+            .enumerate()
+            .skip(active.message_start)
+            .filter(|(index, _)| !self.context_excluded_messages.contains(index))
+            .map(|(_, message)| message)
+            .next_back()
             .is_some_and(|message| {
                 message.role == MessageRole::Assistant && message.tool_calls.is_empty()
             })
@@ -1047,11 +1062,17 @@ impl Session {
             .messages
             .get(active.message_start..)
             .ok_or_else(|| anyhow!("active run message boundary is invalid"))?;
-        let Some((assistant_index, assistant)) = active_messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, message)| message.role == MessageRole::Assistant)
+        let Some((assistant_index, assistant)) =
+            active_messages
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(index, message)| {
+                    message.role == MessageRole::Assistant
+                        && !self
+                            .context_excluded_messages
+                            .contains(&(active.message_start + index))
+                })
         else {
             if active.tools.is_empty() {
                 return Ok(Vec::new());
@@ -1144,7 +1165,13 @@ impl Session {
     #[must_use]
     pub fn context_messages(&self) -> Vec<ChatMessage> {
         let Some(compaction) = &self.latest_compaction else {
-            return self.messages.clone();
+            return self
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !self.context_excluded_messages.contains(index))
+                .map(|(_, message)| message.clone())
+                .collect();
         };
         let first_kept = compaction.first_kept_message_index.min(self.messages.len());
         let mut messages = Vec::with_capacity(self.messages.len() - first_kept + 1);
@@ -1152,8 +1179,23 @@ impl Session {
             "The conversation history before this point was compacted into the following summary:\n\n<summary>\n{}\n</summary>",
             compaction.summary
         )));
-        messages.extend_from_slice(&self.messages[first_kept..]);
+        messages.extend(
+            self.messages[first_kept..]
+                .iter()
+                .enumerate()
+                .filter(|(offset, _)| {
+                    !self
+                        .context_excluded_messages
+                        .contains(&(first_kept + offset))
+                })
+                .map(|(_, message)| message.clone()),
+        );
         messages
+    }
+
+    #[must_use]
+    pub(crate) fn message_is_in_context(&self, index: usize) -> bool {
+        index < self.messages.len() && !self.context_excluded_messages.contains(&index)
     }
 
     #[must_use]
@@ -1163,9 +1205,11 @@ impl Session {
 
     #[must_use]
     pub fn is_compacted_at_tip(&self) -> bool {
-        self.latest_compaction
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.message_count == self.messages.len())
+        self.latest_compaction.as_ref().is_some_and(|checkpoint| {
+            checkpoint.message_count <= self.messages.len()
+                && (checkpoint.message_count..self.messages.len())
+                    .all(|index| self.context_excluded_messages.contains(&index))
+        })
     }
 
     #[must_use]
@@ -1184,8 +1228,8 @@ impl Session {
     }
 
     #[must_use]
-    pub fn provider(&self) -> Option<&str> {
-        self.metadata.provider.as_deref()
+    pub fn provider(&self) -> &str {
+        &self.metadata.provider
     }
 
     #[must_use]
@@ -1205,10 +1249,7 @@ impl Session {
 
     #[must_use]
     pub fn model_selector(&self) -> String {
-        self.provider().map_or_else(
-            || self.model().to_string(),
-            |provider| format!("{provider}/{}", self.model()),
-        )
+        format!("{}/{}", self.provider(), self.model())
     }
 
     #[must_use]
@@ -1295,10 +1336,6 @@ fn repair_session_tail(
             .with_context(|| format!("failed to flush recovered session: {}", path.display()))?;
     }
     Ok(())
-}
-
-fn add_usage(total: &mut Usage, usage: Usage) {
-    *total = total.saturating_add(usage);
 }
 
 fn default_session_base() -> Result<PathBuf> {
@@ -1395,7 +1432,11 @@ fn scan_session_candidate(path: &Path, expected_cwd: &Path) -> Result<SessionCan
             }
         };
         match tag.kind.as_str() {
-            "message" | "run_started" | "assistant_completed" | "tool_completed" => {
+            "message"
+            | "run_started"
+            | "assistant_completed"
+            | "assistant_discarded"
+            | "tool_completed" => {
                 has_messages = true;
             }
             "generation_started" | "tool_started" | "run_finished" | "model_changed"
@@ -1446,4 +1487,53 @@ fn rollout_filename(created_at: u64, id: Uuid) -> Result<String> {
         "rollout-{}-{id}.jsonl",
         timestamp.format("%Y-%m-%dT%H-%M-%S")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn discarded_assistant_is_persisted_but_excluded_from_context() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let metadata = SessionMetadata {
+            provider: "deepseek".to_string(),
+            model: "test-model".to_string(),
+            api: ApiProtocol::Responses,
+            reasoning_effort: ReasoningEffort::High,
+            web_search_mode: WebSearchMode::Disabled,
+        };
+        let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();
+        let id = session.id();
+        let run_id = session.begin_run(ChatMessage::user("continue")).unwrap();
+        session.start_generation(run_id).unwrap();
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            total_tokens: 110,
+            cached_prompt_tokens: Some(80),
+        };
+        session
+            .discard_generation(
+                run_id,
+                ChatMessage::assistant(Some("partial".to_string()), None, Vec::new()),
+                usage,
+            )
+            .unwrap();
+        assert_eq!(session.messages().len(), 2);
+        assert_eq!(session.context_messages(), [ChatMessage::user("continue")]);
+        assert!(!session.active_run_has_final_response());
+        assert_eq!(session.total_usage(), usage);
+        drop(session);
+
+        let resumed =
+            Session::resume_in(base.path(), project.path(), Some(&id.to_string())).unwrap();
+        assert_eq!(resumed.messages().len(), 2);
+        assert_eq!(resumed.context_messages(), [ChatMessage::user("continue")]);
+        assert!(!resumed.active_run_has_final_response());
+        assert_eq!(resumed.total_usage(), usage);
+    }
 }

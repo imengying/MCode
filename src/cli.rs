@@ -59,6 +59,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "TOKEN数")]
     pub max_input_tokens: Option<u64>,
 
+    /// 单次模型响应允许的最大输出 token 数。
+    #[arg(long, global = true, value_name = "TOKEN数")]
+    pub max_output_tokens: Option<u64>,
+
     /// 以指定目录作为工作目录运行。
     #[arg(
         short = 'C',

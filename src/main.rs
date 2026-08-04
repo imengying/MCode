@@ -43,6 +43,7 @@ async fn run() -> Result<()> {
         api_key_env: cli.api_key_env.clone(),
         context_window: cli.context_window,
         max_input_tokens: cli.max_input_tokens,
+        max_output_tokens: cli.max_output_tokens,
         cwd: cli.cwd.clone(),
         request_timeout_secs: cli.request_timeout,
         web_search: cli.search.then_some(WebSearchMode::Live),
@@ -155,10 +156,7 @@ fn list_sessions(config: &AppConfig, json: bool) -> Result<()> {
                 || session.created_at.to_string(),
                 |timestamp| timestamp.format("%Y-%m-%d %H:%M:%SZ").to_string(),
             );
-        let model = session.provider.as_deref().map_or_else(
-            || session.model.clone(),
-            |provider| format!("{provider}/{}", session.model),
-        );
+        let model = format!("{}/{}", session.provider, session.model);
         println!(
             "{}  {}  {}  {}  {} 条消息，{} 个 token{}\n    {}",
             session.id,
@@ -199,6 +197,7 @@ fn run_doctor(config: &AppConfig, json: bool) -> Result<()> {
             "api": config.api.to_string(),
             "contextWindow": config.context_window,
             "maxInputTokens": config.max_input_tokens,
+            "maxOutputTokens": config.max_output_tokens,
             "webSearch": config.web_search.mode.to_string(),
         },
     }));
