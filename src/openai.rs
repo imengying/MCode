@@ -799,6 +799,7 @@ struct ResponsesUsage {
     output: u64,
     #[serde(default, rename = "total_tokens")]
     total: u64,
+    input_tokens_details: Option<CachedTokenDetails>,
 }
 
 fn apply_responses_stream_event(
@@ -869,6 +870,9 @@ fn apply_responses_stream_event(
                 prompt_tokens: usage.input,
                 completion_tokens: usage.output,
                 total_tokens: usage.total,
+                cached_prompt_tokens: usage
+                    .input_tokens_details
+                    .and_then(|details| details.cached_tokens),
             });
             state.completed = true;
         }
@@ -1242,8 +1246,40 @@ impl<'a> From<&'a ChatMessage> for ApiMessage<'a> {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
-    usage: Option<Usage>,
+    usage: Option<ChatUsage>,
     error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    prompt_cache_hit_tokens: Option<u64>,
+    prompt_tokens_details: Option<CachedTokenDetails>,
+}
+
+impl From<ChatUsage> for Usage {
+    fn from(usage: ChatUsage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_prompt_tokens: usage.prompt_cache_hit_tokens.or_else(|| {
+                usage
+                    .prompt_tokens_details
+                    .and_then(|details| details.cached_tokens)
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CachedTokenDetails {
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1337,7 +1373,7 @@ fn apply_stream_chunk(
         )));
     }
     if let Some(next_usage) = chunk.usage {
-        *usage = Some(next_usage);
+        *usage = Some(next_usage.into());
     }
     for choice in chunk.choices {
         if let Some(reason) = choice.finish_reason {
@@ -1517,5 +1553,37 @@ mod tests {
         );
         assert!(map_chat_finish_reason("content_filter").is_err());
         assert!(map_chat_finish_reason("unexpected").is_err());
+    }
+
+    #[test]
+    fn parses_cached_tokens_from_chat_and_responses_usage() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tool_calls = BTreeMap::new();
+        let mut usage = None;
+        let mut finish_reason = None;
+        apply_stream_chunk(
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}"#,
+            &mut content,
+            &mut reasoning,
+            &mut tool_calls,
+            &mut usage,
+            &mut finish_reason,
+            &events,
+        )
+        .unwrap();
+        assert_eq!(usage.unwrap().cached_prompt_tokens, Some(80));
+
+        let mut state = ResponsesAccumulator::default();
+        apply_responses_stream_event(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":200,"output_tokens":30,"total_tokens":230,"input_tokens_details":{"cached_tokens":160}},"output":[]}}"#,
+            &mut state,
+            &events,
+        )
+        .unwrap();
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.cached_prompt_tokens, Some(160));
+        assert_eq!(usage.saturating_add(usage).cached_prompt_tokens, Some(320));
     }
 }

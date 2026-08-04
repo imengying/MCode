@@ -32,9 +32,9 @@ async fn run() -> Result<()> {
     }
     let root_prompt = cli.root_prompt();
     let model_was_overridden =
-        cli.model.is_some() || env::var("OPENAI_MODEL").is_ok_and(|value| !value.trim().is_empty());
+        cli.model.is_some() || env::var("MCODE_MODEL").is_ok_and(|value| !value.trim().is_empty());
     let reasoning_was_overridden = cli.reasoning_effort.is_some()
-        || env::var("OPENAI_REASONING_EFFORT").is_ok_and(|value| !value.trim().is_empty());
+        || env::var("MCODE_REASONING_EFFORT").is_ok_and(|value| !value.trim().is_empty());
     let search_was_overridden = cli.search;
     let overrides = ConfigOverrides {
         model: cli.model.clone(),

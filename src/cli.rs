@@ -12,7 +12,7 @@ const HELP_TEMPLATE: &str = "{before-help}{about-with-newline}\
 #[command(
     name = "mcode",
     version = crate::VERSION,
-    about = "MCode，一个专注的 OpenAI-compatible 编码 Agent",
+    about = "MCode，支持 Grok、DeepSeek、GLM 和 Kimi 的终端编码 Agent",
     args_conflicts_with_subcommands = true,
     after_help = "示例：\n  mcode\n  mcode -i screenshot.png \"检查这个界面\"\n  mcode --search \"检查依赖的最新版本\"\n  mcode exec \"修复失败的测试\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode sessions\n  mcode doctor\n  mcode update\n  mcode delete <SESSION_ID>"
 )]
@@ -27,7 +27,7 @@ pub struct Cli {
     )]
     pub images: Vec<PathBuf>,
 
-    /// 发送给 OpenAI-compatible 端点的模型名称。
+    /// models.json 中配置的模型名称。
     #[arg(short = 'm', long, global = true, value_name = "模型")]
     pub model: Option<String>,
 
@@ -43,7 +43,7 @@ pub struct Cli {
     )]
     pub reasoning_effort: Option<ReasoningEffort>,
 
-    /// API 根地址，例如 <https://api.openai.com/v1>。
+    /// 覆盖所选供应商的 API 根地址。
     #[arg(long, global = true, value_name = "URL")]
     pub base_url: Option<String>,
 

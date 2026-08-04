@@ -342,4 +342,24 @@ pub struct Usage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_prompt_tokens: Option<u64>,
+}
+
+impl Usage {
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_add(other.completion_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            cached_prompt_tokens: match (self.cached_prompt_tokens, other.cached_prompt_tokens) {
+                (Some(left), Some(right)) => Some(left.saturating_add(right)),
+                (Some(cached), None) | (None, Some(cached)) => Some(cached),
+                (None, None) => None,
+            },
+        }
+    }
 }

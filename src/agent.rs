@@ -807,40 +807,27 @@ impl Agent {
     }
 
     pub fn select_model(&mut self, query: &str) -> Result<()> {
-        let profile =
-            find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?.cloned();
-        if let Some(profile) = profile {
-            let effective_effort = profile.default_reasoning_effort();
-            let reasoning_value = profile.reasoning_value(effective_effort)?;
-            self.client.reconfigure(OpenAiModelConfig {
-                base_url: profile.base_url.clone(),
-                api_key: profile.api_key.clone(),
-                model: profile.id.clone(),
-                api: profile.api,
-                reasoning_effort: reasoning_value,
-                supports_reasoning_effort: profile.compat.reasoning_effort,
-                supports_usage_in_streaming: profile.compat.usage_in_streaming,
-                supports_strict_tools: profile.compat.strict_tools,
-            })?;
-            self.provider = Some(profile.provider);
-            self.reasoning_effort = effective_effort;
-            self.default_reasoning_effort = effective_effort;
-            self.context_window = profile.context_window;
-            self.max_input_tokens = profile.max_input_tokens;
-            self.supports_images = profile.supports_images;
-        } else {
-            let query = query.trim();
-            if query.is_empty() {
-                bail!("model cannot be empty");
-            }
-            self.client.set_model(query);
-            self.client.set_reasoning_effort(
-                (self.reasoning_effort != ReasoningEffort::Off)
-                    .then(|| self.reasoning_effort.as_str().to_string()),
-            );
-            self.default_reasoning_effort = self.reasoning_effort;
-            self.supports_images = true;
-        }
+        let profile = find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?
+            .with_context(|| format!("模型 {query:?} 不在 ~/.mcode/models.json 中"))?
+            .clone();
+        let effective_effort = profile.default_reasoning_effort();
+        let reasoning_value = profile.reasoning_value(effective_effort)?;
+        self.client.reconfigure(OpenAiModelConfig {
+            base_url: profile.base_url.clone(),
+            api_key: profile.api_key.clone(),
+            model: profile.id.clone(),
+            api: profile.api,
+            reasoning_effort: reasoning_value,
+            supports_reasoning_effort: profile.compat.reasoning_effort,
+            supports_usage_in_streaming: profile.compat.usage_in_streaming,
+            supports_strict_tools: profile.compat.strict_tools,
+        })?;
+        self.provider = Some(profile.provider);
+        self.reasoning_effort = effective_effort;
+        self.default_reasoning_effort = effective_effort;
+        self.context_window = profile.context_window;
+        self.max_input_tokens = profile.max_input_tokens;
+        self.supports_images = profile.supports_images;
         self.tools.set_api(self.client.api());
         let provider = self.provider.clone();
         let model = self.client.model().to_string();
@@ -1010,11 +997,7 @@ fn normalize_usage(mut usage: Usage) -> Usage {
 }
 
 fn add_usage(total: &mut Usage, usage: Usage) {
-    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
-    total.completion_tokens = total
-        .completion_tokens
-        .saturating_add(usage.completion_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    *total = total.saturating_add(usage);
 }
 
 fn estimate_usage(
@@ -1057,6 +1040,7 @@ fn estimate_usage(
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        cached_prompt_tokens: None,
     }
 }
 

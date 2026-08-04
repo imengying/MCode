@@ -1298,11 +1298,7 @@ fn repair_session_tail(
 }
 
 fn add_usage(total: &mut Usage, usage: Usage) {
-    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
-    total.completion_tokens = total
-        .completion_tokens
-        .saturating_add(usage.completion_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    *total = total.saturating_add(usage);
 }
 
 fn default_session_base() -> Result<PathBuf> {

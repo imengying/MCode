@@ -262,13 +262,7 @@ pub fn append_file_operations(
 
 #[must_use]
 pub fn combine_usage(first: Usage, second: Usage) -> Usage {
-    Usage {
-        prompt_tokens: first.prompt_tokens.saturating_add(second.prompt_tokens),
-        completion_tokens: first
-            .completion_tokens
-            .saturating_add(second.completion_tokens),
-        total_tokens: first.total_tokens.saturating_add(second.total_tokens),
-    }
+    first.saturating_add(second)
 }
 
 #[must_use]

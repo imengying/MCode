@@ -8,9 +8,8 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_MODEL: &str = "gpt-4.1";
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+const SUPPORTED_PROVIDERS: [&str; 4] = ["xai", "deepseek", "glm", "kimi"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionSettings {
@@ -451,11 +450,6 @@ impl CompatFile {
 
 struct LoadedModelCatalog {
     profiles: Vec<ModelProfile>,
-    base_url_override: Option<String>,
-    forced_api_key: Option<String>,
-    fallback_api_key: Option<String>,
-    context_window_override: Option<u64>,
-    max_input_tokens_override: Option<u64>,
 }
 
 impl AppConfig {
@@ -485,69 +479,49 @@ impl AppConfig {
 
         let LoadedModelCatalog {
             profiles: model_profiles,
-            base_url_override,
-            forced_api_key,
-            fallback_api_key,
-            context_window_override,
-            max_input_tokens_override,
         } = load_model_catalog(overrides)?;
 
+        if model_profiles.is_empty() {
+            bail!("~/.mcode/models.json 中没有可用模型；请配置 xai（Grok）、deepseek、glm 或 kimi");
+        }
+
         let preferred_provider = settings.provider.as_deref();
+        if let Some(provider) = preferred_provider {
+            validate_supported_provider(provider)?;
+        }
         let configured_model = overrides
             .model
             .clone()
-            .or_else(|| env_non_empty("OPENAI_MODEL"))
+            .or_else(|| env_non_empty("MCODE_MODEL"))
             .or_else(|| settings.model.clone());
-        let model = configured_model.unwrap_or_else(|| {
-            if let [only_profile] = model_profiles.as_slice() {
-                only_profile.qualified_id()
-            } else {
-                DEFAULT_MODEL.to_string()
-            }
-        });
-        let selected_profile = find_model_profile(&model_profiles, preferred_provider, &model)?;
-        let selected_model =
-            selected_profile.map_or_else(|| model.clone(), |profile| profile.id.clone());
-        let provider = selected_profile
-            .map(|profile| profile.provider.clone())
-            .or_else(|| settings.provider.clone());
+        let model = configured_model
+            .or_else(|| {
+                let [only_profile] = model_profiles.as_slice() else {
+                    return None;
+                };
+                Some(only_profile.qualified_id())
+            })
+            .context("未配置默认模型；请在 ~/.mcode/settings.json 中设置 defaultModel")?;
+        let selected_profile = find_model_profile(&model_profiles, preferred_provider, &model)?
+            .with_context(|| format!("模型 {model:?} 不在 ~/.mcode/models.json 中"))?;
+        let selected_model = selected_profile.id.clone();
+        let provider = Some(selected_profile.provider.clone());
         let configured_web_search = overrides.web_search.or(settings.web_search);
-        let api = selected_profile.map_or(ApiProtocol::ChatCompletions, |profile| profile.api);
+        let api = selected_profile.api;
 
-        let environment_reasoning = env_reasoning("OPENAI_REASONING_EFFORT").transpose()?;
+        let environment_reasoning = env_reasoning("MCODE_REASONING_EFFORT").transpose()?;
         let requested_reasoning_effort = overrides.reasoning_effort.or(environment_reasoning);
         let reasoning_effort =
-            resolve_initial_reasoning_effort(selected_profile, requested_reasoning_effort);
-        let reasoning_value = selected_profile.map_or_else(
-            || {
-                Ok((reasoning_effort != ReasoningEffort::Off)
-                    .then(|| reasoning_effort.as_str().to_string()))
-            },
-            |profile| profile.reasoning_value(reasoning_effort),
-        )?;
+            resolve_initial_reasoning_effort(Some(selected_profile), requested_reasoning_effort);
+        let reasoning_value = selected_profile.reasoning_value(reasoning_effort)?;
 
-        let base_url = base_url_override
-            .or_else(|| selected_profile.map(|profile| profile.base_url.clone()))
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let api_key = if overrides.api_key_env.is_some() {
-            forced_api_key
-        } else {
-            selected_profile.map_or(fallback_api_key, |profile| profile.api_key.clone())
-        };
-        let context_window = context_window_override
-            .or_else(|| selected_profile.map(|profile| profile.context_window))
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        let max_input_tokens = max_input_tokens_override
-            .or_else(|| selected_profile.map(|profile| profile.max_input_tokens))
-            .unwrap_or(context_window);
-        let supports_reasoning_effort =
-            selected_profile.is_none_or(|profile| profile.compat.reasoning_effort);
-        let supports_usage_in_streaming =
-            selected_profile.is_none_or(|profile| profile.compat.usage_in_streaming);
-        let supports_strict_tools = selected_profile.map_or_else(
-            || api == ApiProtocol::Responses && is_official_openai_url(&base_url),
-            |profile| profile.compat.strict_tools,
-        );
+        let base_url = selected_profile.base_url.clone();
+        let api_key = selected_profile.api_key.clone();
+        let context_window = selected_profile.context_window;
+        let max_input_tokens = selected_profile.max_input_tokens;
+        let supports_reasoning_effort = selected_profile.compat.reasoning_effort;
+        let supports_usage_in_streaming = selected_profile.compat.usage_in_streaming;
+        let supports_strict_tools = selected_profile.compat.strict_tools;
         let request_timeout_secs = overrides.request_timeout_secs.unwrap_or(300);
         let defaults = CompactionSettings::default();
         let compaction = CompactionSettings {
@@ -632,30 +606,21 @@ impl AppConfig {
     }
 
     pub fn select_model(&mut self, query: &str) -> Result<()> {
-        let profile =
-            find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?.cloned();
-        if let Some(profile) = profile {
-            self.reasoning_effort = profile.clamp_reasoning_effort(self.reasoning_effort);
-            self.reasoning_value = profile.reasoning_value(self.reasoning_effort)?;
-            self.model = profile.id;
-            self.provider = Some(profile.provider);
-            self.api = profile.api;
-            self.base_url = profile.base_url;
-            self.api_key = profile.api_key;
-            self.context_window = profile.context_window;
-            self.max_input_tokens = profile.max_input_tokens;
-            self.supports_reasoning_effort = profile.compat.reasoning_effort;
-            self.supports_usage_in_streaming = profile.compat.usage_in_streaming;
-            self.supports_strict_tools = profile.compat.strict_tools;
-        } else {
-            let query = query.trim();
-            if query.is_empty() {
-                bail!("model cannot be empty");
-            }
-            self.model = query.to_string();
-            self.reasoning_value = (self.reasoning_effort != ReasoningEffort::Off)
-                .then(|| self.reasoning_effort.as_str().to_string());
-        }
+        let profile = find_model_profile(&self.model_profiles, self.provider.as_deref(), query)?
+            .with_context(|| format!("模型 {query:?} 不在 ~/.mcode/models.json 中"))?
+            .clone();
+        self.reasoning_effort = profile.clamp_reasoning_effort(self.reasoning_effort);
+        self.reasoning_value = profile.reasoning_value(self.reasoning_effort)?;
+        self.model = profile.id;
+        self.provider = Some(profile.provider);
+        self.api = profile.api;
+        self.base_url = profile.base_url;
+        self.api_key = profile.api_key;
+        self.context_window = profile.context_window;
+        self.max_input_tokens = profile.max_input_tokens;
+        self.supports_reasoning_effort = profile.compat.reasoning_effort;
+        self.supports_usage_in_streaming = profile.compat.usage_in_streaming;
+        self.supports_strict_tools = profile.compat.strict_tools;
         Ok(())
     }
 
@@ -665,16 +630,10 @@ impl AppConfig {
 
     pub fn select_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
         let profile =
-            find_model_profile(&self.model_profiles, self.provider.as_deref(), &self.model)?;
-        let effective_effort =
-            profile.map_or(effort, |profile| profile.clamp_reasoning_effort(effort));
-        self.reasoning_value = profile.map_or_else(
-            || {
-                Ok((effective_effort != ReasoningEffort::Off)
-                    .then(|| effective_effort.as_str().to_string()))
-            },
-            |profile| profile.reasoning_value(effective_effort),
-        )?;
+            find_model_profile(&self.model_profiles, self.provider.as_deref(), &self.model)?
+                .with_context(|| format!("模型 {:?} 不在 ~/.mcode/models.json 中", self.model))?;
+        let effective_effort = profile.clamp_reasoning_effort(effort);
+        self.reasoning_value = profile.reasoning_value(effective_effort)?;
         self.reasoning_effort = effective_effort;
         Ok(())
     }
@@ -700,12 +659,11 @@ fn load_model_catalog(overrides: &ConfigOverrides) -> Result<LoadedModelCatalog>
     let base_url_override = overrides
         .base_url
         .clone()
-        .or_else(|| env_non_empty("OPENAI_BASE_URL"));
+        .or_else(|| env_non_empty("MCODE_BASE_URL"));
     let forced_api_key = overrides.api_key_env.as_deref().and_then(env_non_empty);
-    let fallback_api_key = env_non_empty("OPENAI_API_KEY");
-    let environment_context = env_u64("OPENAI_CONTEXT_WINDOW").transpose()?;
+    let environment_context = env_u64("MCODE_CONTEXT_WINDOW").transpose()?;
     let context_window_override = overrides.context_window.or(environment_context);
-    let environment_max_input = env_u64("OPENAI_MAX_INPUT_TOKENS").transpose()?;
+    let environment_max_input = env_u64("MCODE_MAX_INPUT_TOKENS").transpose()?;
     let max_input_tokens_override = overrides.max_input_tokens.or(environment_max_input);
     let mut profiles = if let Some(home) = mcode_home_dir() {
         let models_path = home.join("models.json");
@@ -714,7 +672,6 @@ fn load_model_catalog(overrides: &ConfigOverrides) -> Result<LoadedModelCatalog>
                 read_json::<ModelsFile>(&models_path)?,
                 base_url_override.as_deref(),
                 overrides.api_key_env.as_ref().map(|_| &forced_api_key),
-                fallback_api_key.as_ref(),
                 context_window_override,
                 max_input_tokens_override,
             )?
@@ -725,14 +682,7 @@ fn load_model_catalog(overrides: &ConfigOverrides) -> Result<LoadedModelCatalog>
         Vec::new()
     };
     profiles.sort_by(|left, right| (&left.provider, &left.id).cmp(&(&right.provider, &right.id)));
-    Ok(LoadedModelCatalog {
-        profiles,
-        base_url_override,
-        forced_api_key,
-        fallback_api_key,
-        context_window_override,
-        max_input_tokens_override,
-    })
+    Ok(LoadedModelCatalog { profiles })
 }
 
 fn resolve_initial_reasoning_effort(
@@ -932,37 +882,35 @@ fn build_model_profiles(
     file: ModelsFile,
     base_url_override: Option<&str>,
     forced_api_key: Option<&Option<String>>,
-    fallback_api_key: Option<&String>,
     context_window_override: Option<u64>,
     max_input_tokens_override: Option<u64>,
 ) -> Result<Vec<ModelProfile>> {
     let mut profiles = Vec::new();
     for (provider_name, provider) in file.providers {
+        validate_supported_provider(&provider_name)?;
         for model in provider.models {
-            let Some(api) = model
+            let api_name = model
                 .api
                 .as_deref()
                 .or(provider.api.as_deref())
-                .and_then(parse_api_protocol)
-            else {
-                continue;
-            };
+                .with_context(|| format!("provider {provider_name} is missing api"))?;
+            let api = parse_api_protocol(api_name).with_context(|| {
+                format!("provider {provider_name} uses unsupported api {api_name:?}")
+            })?;
             if model.id.trim().is_empty() {
                 bail!("provider {provider_name} contains a model with an empty id");
             }
             let base_url = base_url_override
                 .map(ToString::to_string)
                 .or_else(|| provider.base_url.clone())
-                .or_else(|| (provider_name == "openai").then(|| DEFAULT_BASE_URL.to_string()))
                 .with_context(|| {
-                    format!(
-                        "OpenAI-compatible provider {provider_name:?} is missing baseUrl in models.json"
-                    )
+                    format!("provider {provider_name:?} is missing baseUrl in models.json")
                 })?;
+            validate_http_base_url(&base_url, &format!("provider {provider_name} baseUrl"))?;
             let api_key = forced_api_key.map_or_else(
                 || match provider.api_key.as_deref() {
                     Some(value) => resolve_static_config_value(value),
-                    None => fallback_api_key.cloned(),
+                    None => None,
                 },
                 |value| (*value).clone(),
             );
@@ -1014,9 +962,7 @@ fn build_model_profiles(
                     model.id
                 );
             }
-            let supports_strict_tools = compat.strict_tools.unwrap_or_else(|| {
-                api == ApiProtocol::Responses && is_official_openai_url(&base_url)
-            });
+            let supports_strict_tools = compat.strict_tools.unwrap_or(false);
             let profile = ModelProfile {
                 provider: provider_name.clone(),
                 id: model.id,
@@ -1061,11 +1007,11 @@ fn build_model_profiles(
     Ok(profiles)
 }
 
-fn is_official_openai_url(value: &str) -> bool {
-    url::Url::parse(value)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+fn validate_supported_provider(provider: &str) -> Result<()> {
+    if SUPPORTED_PROVIDERS.contains(&provider) {
+        return Ok(());
+    }
+    bail!("不支持 provider {provider:?}；MCode 仅支持 xai（Grok）、deepseek、glm 和 kimi")
 }
 
 fn parse_api_protocol(value: &str) -> Option<ApiProtocol> {
@@ -1158,4 +1104,42 @@ fn interpolate_environment(
         index = end;
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_catalog_allows_only_the_supported_four() {
+        let file = serde_json::from_str(include_str!("../models.example.json")).unwrap();
+        let profiles = build_model_profiles(file, None, None, None, None).unwrap();
+        let providers = profiles
+            .iter()
+            .map(|profile| profile.provider.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            providers,
+            BTreeSet::from(["deepseek", "glm", "kimi", "xai"])
+        );
+
+        let file = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "other": {
+                    "baseUrl": "https://example.com/v1",
+                    "api": "openai-completions",
+                    "models": []
+                }
+            }
+        }))
+        .unwrap();
+        let error = build_model_profiles(file, None, None, None, None)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("仅支持 xai（Grok）、deepseek、glm 和 kimi")
+        );
+    }
 }

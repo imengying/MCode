@@ -278,7 +278,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
     )
     .unwrap();
     let config = AppConfig {
-        model: "gpt-test".to_string(),
+        model: "deepseek-test".to_string(),
         provider: None,
         api: ApiProtocol::Responses,
         reasoning_effort: ReasoningEffort::Low,
@@ -739,17 +739,21 @@ async fn exec_command_sends_image_content_parts() {
         [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
     )
     .unwrap();
+    let mcode_home = project.path().join(".mcode-home");
+    write_test_model_catalog(&mcode_home, "vision-model", true);
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
         .arg("exec")
         .arg("--base-url")
         .arg(format!("http://{address}/v1"))
         .arg("--model")
-        .arg("vision-model")
+        .arg("xai/vision-model")
+        .arg("--api-key-env")
+        .arg("XAI_API_KEY")
         .arg("--image")
         .arg("pixel.png")
         .arg("inspect this image")
-        .env("MCODE_HOME", project.path().join(".mcode-home"))
-        .env("OPENAI_API_KEY", "fixture-key")
+        .env("MCODE_HOME", &mcode_home)
+        .env("XAI_API_KEY", "fixture-key")
         .current_dir(project.path())
         .output()
         .await
@@ -1007,6 +1011,7 @@ async fn resume_does_not_replay_a_dangerous_tool_with_an_unknown_result() {
                 prompt_tokens: 40,
                 completion_tokens: 10,
                 total_tokens: 50,
+                cached_prompt_tokens: None,
             },
             false,
         )
@@ -1085,6 +1090,7 @@ async fn resume_replays_a_safe_read_file_tool() {
                 prompt_tokens: 30,
                 completion_tokens: 8,
                 total_tokens: 38,
+                cached_prompt_tokens: None,
             },
             false,
         )
@@ -1135,7 +1141,9 @@ async fn resume_replays_a_safe_read_file_tool() {
 async fn delete_command_removes_only_the_selected_project_session() {
     let home = tempdir().unwrap();
     let project = tempdir().unwrap();
-    let base = home.path().join(".mcode/sessions");
+    let mcode_home = home.path().join(".mcode");
+    write_test_model_catalog(&mcode_home, "test-model", false);
+    let base = mcode_home.join("sessions");
     let selected = Session::create_in(
         &base,
         project.path(),
@@ -1155,7 +1163,7 @@ async fn delete_command_removes_only_the_selected_project_session() {
     let listed = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
         .arg("sessions")
         .arg("--json")
-        .env("MCODE_HOME", home.path().join(".mcode"))
+        .env("MCODE_HOME", &mcode_home)
         .current_dir(project.path())
         .output()
         .await
@@ -1173,7 +1181,7 @@ async fn delete_command_removes_only_the_selected_project_session() {
         .arg("delete")
         .arg(selected_id.to_string())
         .arg("--force")
-        .env("MCODE_HOME", home.path().join(".mcode"))
+        .env("MCODE_HOME", &mcode_home)
         .current_dir(project.path())
         .output()
         .await
@@ -1198,6 +1206,36 @@ fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
             arguments: arguments.to_string(),
         },
     }
+}
+
+fn write_test_model_catalog(home: &std::path::Path, model: &str, supports_images: bool) {
+    std::fs::create_dir_all(home).unwrap();
+    let input = if supports_images {
+        json!(["text", "image"])
+    } else {
+        json!(["text"])
+    };
+    let catalog = json!({
+        "providers": {
+            "xai": {
+                "baseUrl": "http://127.0.0.1:1/v1",
+                "api": "openai-completions",
+                "models": [{
+                    "id": model,
+                    "input": input,
+                    "reasoning": false,
+                    "default": "off",
+                    "contextWindow": 128_000,
+                    "maxInputTokens": 128_000
+                }]
+            }
+        }
+    });
+    std::fs::write(
+        home.join("models.json"),
+        serde_json::to_vec_pretty(&catalog).unwrap(),
+    )
+    .unwrap();
 }
 
 async fn read_json_request(stream: &mut TcpStream) -> Value {

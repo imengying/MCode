@@ -1,7 +1,7 @@
 # MCode
 
-面向 Linux Wayland 的 Rust 终端 coding agent，提供 Codex 风格交互，支持 OpenAI-compatible
-Chat Completions 和 Responses API。
+面向 Linux Wayland 的 Rust 终端 coding agent，提供 Codex 风格交互，支持 Grok、DeepSeek、
+GLM 和 Kimi。
 
 ## 功能
 
@@ -11,7 +11,7 @@ Chat Completions 和 Responses API。
 - 图片输入和本地 stdio MCP
 - shell/MCP 执行审批
 - Pi 风格自动上下文压缩和溢出恢复
-- JSONL v3 会话、崩溃恢复和累计 token 统计
+- JSONL v3 会话、崩溃恢复、累计 token 与缓存命中统计
 - 模型、effort 和搜索模式独立切换
 - 当前正式支持 Linux x86_64 与 ARM64
 
@@ -55,20 +55,26 @@ cargo install --path . --locked
 ## 快速开始
 
 ```bash
-export OPENAI_API_KEY="..."
+mkdir -p ~/.mcode
+curl -fsSL https://raw.githubusercontent.com/imengying/MCode/main/models.example.json \
+  -o ~/.mcode/models.json
+curl -fsSL https://raw.githubusercontent.com/imengying/MCode/main/settings.example.json \
+  -o ~/.mcode/settings.json
+export XAI_API_KEY="..."
 mcode doctor
 mcode
 ```
 
-连接兼容端点：
+切换供应商时配置对应密钥和模型：
 
 ```bash
-export OPENAI_MODEL="example-model"
-export OPENAI_BASE_URL="https://api.example.com/v1"
-mcode
+export DEEPSEEK_API_KEY="..."  # DeepSeek
+export MOONSHOT_API_KEY="..."  # Kimi
+export ZHIPUAI_API_KEY="..."   # GLM
+MCODE_MODEL=deepseek/deepseek-v4-flash mcode
 ```
 
-API key 可以省略，以连接不需要认证的端点。MCode 不会保存凭据。
+MCode 不会把 API 密钥写入配置或会话。
 
 ## 配置
 
@@ -80,7 +86,7 @@ API key 可以省略，以连接不需要认证的端点。MCode 不会保存凭
 
 完整配置见 [settings.example.json](settings.example.json) 和
 [models.example.json](models.example.json)。优先级为：命令行、环境变量、项目设置、全局设置、
-内置默认值。`MCODE_HOME` 可覆盖默认的 `~/.mcode`。
+单模型自动选择。`MCODE_HOME` 可覆盖默认的 `~/.mcode`。
 
 常用配置：
 
@@ -94,10 +100,12 @@ API key 可以省略，以连接不需要认证的端点。MCode 不会保存凭
 - `compaction`：自动压缩开关、预留 token 和最近历史预算
 - `mcpServers`：本地 stdio MCP；项目配置按名称覆盖全局配置
 
-`models.example.json` 已包含 OpenAI、Grok、DeepSeek、Kimi、GLM 和通用
-OpenAI-compatible profile。对应密钥环境变量为 `OPENAI_API_KEY`、`XAI_API_KEY`、
-`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和 `ZHIPUAI_API_KEY`。DeepSeek V4 Flash 与 V4 Pro
-均使用 Responses API。
+`models.example.json` 只包含 Grok、DeepSeek、Kimi 和 GLM。对应密钥环境变量为
+`XAI_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和 `ZHIPUAI_API_KEY`。DeepSeek
+V4 Flash 与 V4 Pro 均使用 Responses API。未知 provider 会被拒绝。
+
+`MCODE_MODEL`、`MCODE_REASONING_EFFORT`、`MCODE_BASE_URL`、`MCODE_CONTEXT_WINDOW` 和
+`MCODE_MAX_INPUT_TOKENS` 可覆盖当前选择；`--api-key-env` 可临时指定密钥环境变量。
 
 Web Search 依 API 协议分流：
 

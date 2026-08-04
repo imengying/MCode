@@ -50,6 +50,7 @@ const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
 const MIN_TERMINAL_HEIGHT: u16 = 10;
 const INPUT_PREFIX_WIDTH: u16 = 2;
+const INPUT_PLACEHOLDER: &str = "描述任务，或输入 / 查看命令";
 const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
@@ -2212,7 +2213,7 @@ impl UiState {
     fn model_list_notice(&self) -> String {
         if self.model_choices.is_empty() {
             return format!(
-                "当前模型：{}\n~/.mcode/models.json 中没有模型列表；仍可使用 /model <ID> 选择当前端点上的模型。",
+                "当前模型：{}\n~/.mcode/models.json 中没有可用模型。",
                 self.model
             );
         }
@@ -2294,8 +2295,18 @@ impl UiState {
         let qualified_model = self.qualified_model();
         let estimate = if self.usage_estimated { "~" } else { "" };
         let percent = format_context_percent(self.context_tokens, self.max_input_tokens);
+        let cache = self
+            .usage
+            .cached_prompt_tokens
+            .map_or_else(String::new, |cached| {
+                format!(
+                    "\n缓存命中：{}（输入的 {}%）",
+                    format_tokens(cached),
+                    format_context_percent(cached, self.usage.prompt_tokens)
+                )
+            });
         format!(
-            "模型：{qualified_model}\nAPI：{}\neffort：{}\n网页搜索：{}\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
+            "模型：{qualified_model}\nAPI：{}\neffort：{}\n网页搜索：{}\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
             self.api,
             self.reasoning_effort,
             self.web_search_mode.label_zh(),
@@ -2523,14 +2534,7 @@ impl UiState {
                 max_input_tokens,
                 estimated,
             } => {
-                self.usage.prompt_tokens =
-                    self.usage.prompt_tokens.saturating_add(usage.prompt_tokens);
-                self.usage.completion_tokens = self
-                    .usage
-                    .completion_tokens
-                    .saturating_add(usage.completion_tokens);
-                self.usage.total_tokens =
-                    self.usage.total_tokens.saturating_add(usage.total_tokens);
+                self.usage = self.usage.saturating_add(usage);
                 self.context_tokens = context_tokens;
                 self.context_window = context_window;
                 self.max_input_tokens = max_input_tokens;
@@ -2557,16 +2561,7 @@ impl UiState {
                 ..
             } => {
                 if let Some(usage) = usage {
-                    self.usage.prompt_tokens = self
-                        .usage
-                        .prompt_tokens
-                        .saturating_add(usage.prompt_tokens);
-                    self.usage.completion_tokens = self
-                        .usage
-                        .completion_tokens
-                        .saturating_add(usage.completion_tokens);
-                    self.usage.total_tokens =
-                        self.usage.total_tokens.saturating_add(usage.total_tokens);
+                    self.usage = self.usage.saturating_add(usage);
                 }
                 self.context_tokens = tokens_after;
                 self.usage_estimated = true;
@@ -2890,13 +2885,14 @@ fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
             state.transcript_tail_state = TranscriptTailState::Following;
         }
     }
-    let render_area = Rect::new(
-        area.x,
-        area.bottom()
-            .saturating_sub(u16::try_from(visible_height).unwrap_or(area.height)),
-        content_width,
-        u16::try_from(visible_height).unwrap_or(area.height),
-    );
+    let render_height = u16::try_from(visible_height).unwrap_or(area.height);
+    let render_y = if state.show_welcome && state.messages.is_empty() {
+        area.y
+            .saturating_add(area.height.saturating_sub(render_height) / 2)
+    } else {
+        area.bottom().saturating_sub(render_height)
+    };
+    let render_area = Rect::new(area.x, render_y, content_width, render_height);
     state.transcript_render_area = render_area;
     let scroll = u16::try_from(state.transcript_scroll_top).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), render_area);
@@ -3077,7 +3073,7 @@ fn welcome_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
             ),
         ]),
     ];
-    let mut lines = Vec::with_capacity(bordered.len().saturating_add(4));
+    let mut lines = Vec::with_capacity(bordered.len().saturating_add(2));
     lines.push(Line::from(Span::styled(
         format!("╭{}╮", "─".repeat(inner_width.saturating_add(2))),
         Style::default().fg(THEME_MUTED),
@@ -3097,11 +3093,6 @@ fn welcome_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(Span::styled(
         format!("╰{}╯", "─".repeat(inner_width.saturating_add(2))),
-        Style::default().fg(THEME_MUTED),
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "  描述任务，或输入 / 查看命令",
         Style::default().fg(THEME_MUTED),
     )));
     lines
@@ -3307,12 +3298,20 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     let (cursor_x, cursor_y, scroll) = state
         .editor
         .cursor_layout(input_area.width, input_area.height);
-    frame.render_widget(
+    let editor = if state.editor.is_empty() {
+        Paragraph::new(Span::styled(
+            truncate_width(
+                INPUT_PLACEHOLDER,
+                usize::from(input_area.width).saturating_add(1),
+            ),
+            Style::default().fg(THEME_MUTED),
+        ))
+    } else {
         Paragraph::new(state.editor.text())
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        input_area,
-    );
+            .scroll((scroll, 0))
+    };
+    frame.render_widget(editor, input_area);
     frame.set_cursor_position(Position::new(
         input_area
             .x
@@ -4746,13 +4745,13 @@ mod tests {
     }
 
     #[test]
-    fn renders_a_welcome_card_for_a_new_session() {
+    fn renders_a_welcome_card_and_input_placeholder_for_a_new_session() {
         let mut state = UiState::new(
-            "gpt-test".to_string(),
+            "grok-test".to_string(),
             "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
-        state.provider = Some("openai".to_string());
+        state.provider = Some("xai".to_string());
         state.reasoning_effort = ReasoningEffort::High;
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -4761,10 +4760,33 @@ mod tests {
 
         let rendered = rendered_terminal(&terminal);
         assert!(rendered.contains("MCode"));
-        assert!(rendered.contains("openai/gpt-test high"));
-        assert!(rendered.contains("描"));
-        assert!(rendered.contains("命"));
+        assert!(rendered.contains("xai/grok-test high"));
         assert!(rendered.contains("╭"));
+
+        let buffer = terminal.backend().buffer();
+        let placeholder_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "描").then_some(index / 80))
+            .unwrap();
+        let input_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .rfind(|(_, cell)| cell.symbol() == ">")
+            .map(|(index, _)| index / 80)
+            .unwrap();
+        assert_eq!(placeholder_y, input_y);
+        assert_eq!(
+            state.transcript_render_area.y,
+            state.transcript_area.y
+                + (state.transcript_area.height - state.transcript_render_area.height) / 2
+        );
+
+        state.editor.insert('x');
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert!(!rendered_terminal(&terminal).contains("描述任务"));
     }
 
     #[test]
