@@ -175,6 +175,7 @@ pub struct ModelProfile {
     pub context_window: u64,
     pub max_input_tokens: u64,
     pub reasoning: bool,
+    pub supports_images: bool,
     pub compat: ModelCompat,
     default_reasoning_effort: ReasoningEffort,
     thinking_level_map: BTreeMap<ReasoningEffort, Option<String>>,
@@ -275,6 +276,7 @@ pub struct AppConfig {
     pub web_search: WebSearchSettings,
     pub model_profiles: Vec<ModelProfile>,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub reload_overrides: ConfigOverrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +412,7 @@ struct ModelFile {
     name: Option<String>,
     api: Option<String>,
     reasoning: Option<bool>,
+    input: Option<Vec<InputModality>>,
     default: Option<ReasoningEffort>,
     context_window: Option<u64>,
     max_input_tokens: Option<u64>,
@@ -417,6 +420,13 @@ struct ModelFile {
     compat: CompatFile,
     #[serde(default)]
     thinking_level_map: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum InputModality {
+    Text,
+    Image,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -439,6 +449,15 @@ impl CompatFile {
     }
 }
 
+struct LoadedModelCatalog {
+    profiles: Vec<ModelProfile>,
+    base_url_override: Option<String>,
+    forced_api_key: Option<String>,
+    fallback_api_key: Option<String>,
+    context_window_override: Option<u64>,
+    max_input_tokens_override: Option<u64>,
+}
+
 impl AppConfig {
     pub fn load(overrides: &ConfigOverrides) -> Result<Self> {
         let cwd = overrides
@@ -448,6 +467,8 @@ impl AppConfig {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("working directory does not exist: {}", cwd.display()))?;
+        let mut reload_overrides = overrides.clone();
+        reload_overrides.cwd = Some(cwd.clone());
 
         let home = mcode_home_dir();
         let mut settings = SettingsFile::default();
@@ -462,35 +483,14 @@ impl AppConfig {
             settings.overlay(read_json(&project_path)?);
         }
 
-        let base_url_override = overrides
-            .base_url
-            .clone()
-            .or_else(|| env_non_empty("OPENAI_BASE_URL"));
-        let forced_api_key = overrides.api_key_env.as_deref().and_then(env_non_empty);
-        let fallback_api_key = env_non_empty("OPENAI_API_KEY");
-        let environment_context = env_u64("OPENAI_CONTEXT_WINDOW").transpose()?;
-        let context_window_override = overrides.context_window.or(environment_context);
-        let environment_max_input = env_u64("OPENAI_MAX_INPUT_TOKENS").transpose()?;
-        let max_input_tokens_override = overrides.max_input_tokens.or(environment_max_input);
-        let mut model_profiles = if let Some(home) = &home {
-            let models_path = home.join("models.json");
-            if models_path.is_file() {
-                build_model_profiles(
-                    read_json::<ModelsFile>(&models_path)?,
-                    base_url_override.as_deref(),
-                    overrides.api_key_env.as_ref().map(|_| &forced_api_key),
-                    fallback_api_key.as_ref(),
-                    context_window_override,
-                    max_input_tokens_override,
-                )?
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        model_profiles
-            .sort_by(|left, right| (&left.provider, &left.id).cmp(&(&right.provider, &right.id)));
+        let LoadedModelCatalog {
+            profiles: model_profiles,
+            base_url_override,
+            forced_api_key,
+            fallback_api_key,
+            context_window_override,
+            max_input_tokens_override,
+        } = load_model_catalog(overrides)?;
 
         let preferred_provider = settings.provider.as_deref();
         let configured_model = overrides
@@ -627,6 +627,7 @@ impl AppConfig {
             web_search,
             model_profiles,
             mcp_servers,
+            reload_overrides,
         })
     }
 
@@ -656,6 +657,10 @@ impl AppConfig {
                 .then(|| self.reasoning_effort.as_str().to_string());
         }
         Ok(())
+    }
+
+    pub fn reload_model_profiles(overrides: &ConfigOverrides) -> Result<Vec<ModelProfile>> {
+        Ok(load_model_catalog(overrides)?.profiles)
     }
 
     pub fn select_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
@@ -689,6 +694,45 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn load_model_catalog(overrides: &ConfigOverrides) -> Result<LoadedModelCatalog> {
+    let base_url_override = overrides
+        .base_url
+        .clone()
+        .or_else(|| env_non_empty("OPENAI_BASE_URL"));
+    let forced_api_key = overrides.api_key_env.as_deref().and_then(env_non_empty);
+    let fallback_api_key = env_non_empty("OPENAI_API_KEY");
+    let environment_context = env_u64("OPENAI_CONTEXT_WINDOW").transpose()?;
+    let context_window_override = overrides.context_window.or(environment_context);
+    let environment_max_input = env_u64("OPENAI_MAX_INPUT_TOKENS").transpose()?;
+    let max_input_tokens_override = overrides.max_input_tokens.or(environment_max_input);
+    let mut profiles = if let Some(home) = mcode_home_dir() {
+        let models_path = home.join("models.json");
+        if models_path.is_file() {
+            build_model_profiles(
+                read_json::<ModelsFile>(&models_path)?,
+                base_url_override.as_deref(),
+                overrides.api_key_env.as_ref().map(|_| &forced_api_key),
+                fallback_api_key.as_ref(),
+                context_window_override,
+                max_input_tokens_override,
+            )?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    profiles.sort_by(|left, right| (&left.provider, &left.id).cmp(&(&right.provider, &right.id)));
+    Ok(LoadedModelCatalog {
+        profiles,
+        base_url_override,
+        forced_api_key,
+        fallback_api_key,
+        context_window_override,
+        max_input_tokens_override,
+    })
 }
 
 fn resolve_initial_reasoning_effort(
@@ -941,6 +985,15 @@ fn build_model_profiles(
                 .unwrap_or(context_window);
             let compat = provider.compat.merge(model.compat);
             let reasoning = model.reasoning.unwrap_or(false);
+            let input = model.input.unwrap_or_else(|| vec![InputModality::Text]);
+            if !input.contains(&InputModality::Text) {
+                bail!(
+                    "model {}/{} must support text input",
+                    provider_name,
+                    model.id
+                );
+            }
+            let supports_images = input.contains(&InputModality::Image);
             let default_reasoning_effort = model.default.with_context(|| {
                 format!(
                     "模型 {}/{} 缺少 default；请指定默认 effort",
@@ -974,6 +1027,7 @@ fn build_model_profiles(
                 context_window,
                 max_input_tokens,
                 reasoning,
+                supports_images,
                 compat: ModelCompat {
                     reasoning_effort: compat.reasoning_effort.unwrap_or(true),
                     usage_in_streaming: compat.usage_in_streaming.unwrap_or(true),

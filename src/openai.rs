@@ -101,6 +101,14 @@ pub struct AssistantTurn {
     pub tool_calls: Vec<ToolCall>,
     pub response_items: Vec<serde_json::Value>,
     pub usage: Option<Usage>,
+    pub stop_reason: AssistantStopReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantStopReason {
+    Stop,
+    Length,
+    ToolUse,
 }
 
 impl OpenAiClient {
@@ -319,7 +327,7 @@ impl OpenAiClient {
         let mut tool_calls = BTreeMap::<usize, ToolCallBuilder>::new();
         let mut usage = None;
         let mut done = false;
-        let mut saw_finish_reason = false;
+        let mut finish_reason = None;
 
         while !done {
             let chunk = tokio::select! {
@@ -339,12 +347,13 @@ impl OpenAiClient {
                     done = true;
                     break;
                 }
-                saw_finish_reason |= apply_stream_chunk(
+                apply_stream_chunk(
                     &data,
                     &mut content,
                     &mut reasoning,
                     &mut tool_calls,
                     &mut usage,
+                    &mut finish_reason,
                     events,
                 )
                 .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
@@ -356,25 +365,29 @@ impl OpenAiClient {
             .map_err(|error| attach_request_id(error, request_id.as_deref()))?
         {
             if data.trim() != "[DONE]" {
-                saw_finish_reason |= apply_stream_chunk(
+                apply_stream_chunk(
                     &data,
                     &mut content,
                     &mut reasoning,
                     &mut tool_calls,
                     &mut usage,
+                    &mut finish_reason,
                     events,
                 )
                 .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
             }
         }
 
-        if !done && !saw_finish_reason {
-            return Err(stream_error(
-                "Chat Completions stream ended before [DONE] or finish_reason",
+        let stop_reason = finish_reason.ok_or_else(|| {
+            stream_error(
+                if done {
+                    "Chat Completions stream reached [DONE] without finish_reason"
+                } else {
+                    "Chat Completions stream ended without finish_reason"
+                },
                 request_id.as_deref(),
-            ));
-        }
-
+            )
+        })?;
         let tool_calls = tool_calls
             .into_values()
             .map(ToolCallBuilder::finish)
@@ -387,6 +400,7 @@ impl OpenAiClient {
             tool_calls,
             response_items: Vec::new(),
             usage,
+            stop_reason,
         })
     }
 
@@ -450,6 +464,10 @@ impl OpenAiClient {
                 }
                 apply_responses_stream_event(&data, &mut state, events)
                     .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
+                if state.completed {
+                    done = true;
+                    break;
+                }
             }
         }
         for data in decoder
@@ -468,12 +486,23 @@ impl OpenAiClient {
             ));
         }
 
+        let reasoning = if state.raw_reasoning.is_empty() {
+            state.reasoning
+        } else {
+            state.raw_reasoning
+        };
+        let stop_reason = if state.tool_calls.is_empty() {
+            AssistantStopReason::Stop
+        } else {
+            AssistantStopReason::ToolUse
+        };
         Ok(AssistantTurn {
             content: (!state.content.is_empty()).then_some(state.content),
-            reasoning_content: (!state.reasoning.is_empty()).then_some(state.reasoning),
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
             tool_calls: state.tool_calls,
             response_items: state.response_items,
             usage: state.usage,
+            stop_reason,
         })
     }
 }
@@ -661,6 +690,7 @@ fn responses_tools(
 struct ResponsesAccumulator {
     content: String,
     reasoning: String,
+    raw_reasoning: String,
     reasoning_summary_index: Option<usize>,
     tool_calls: Vec<ToolCall>,
     response_items: Vec<serde_json::Value>,
@@ -679,6 +709,7 @@ struct ResponsesStreamEvent {
     response: Option<serde_json::Value>,
     item: Option<serde_json::Value>,
     delta: Option<String>,
+    text: Option<String>,
     summary_index: Option<usize>,
 }
 
@@ -702,6 +733,8 @@ enum ResponsesOutputItem {
     Reasoning {
         #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
+        #[serde(default)]
+        content: Vec<ResponsesReasoningContent>,
     },
     #[serde(other)]
     Other,
@@ -742,6 +775,16 @@ enum ResponsesReasoningSummary {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesReasoningContent {
+    ReasoningText {
+        text: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
 struct ResponsesCompleted {
     usage: Option<ResponsesUsage>,
     #[serde(default)]
@@ -770,6 +813,16 @@ fn apply_responses_stream_event(
             if let Some(text) = event.delta {
                 state.content.push_str(&text);
                 let _ = events.send(AgentEvent::TextDelta { text });
+            }
+        }
+        "response.reasoning_text.delta" => {
+            if let Some(text) = event.delta {
+                state.raw_reasoning.push_str(&text);
+            }
+        }
+        "response.reasoning_text.done" => {
+            if let Some(text) = event.text {
+                merge_completed_text(&mut state.raw_reasoning, &text);
             }
         }
         "response.reasoning_summary_part.added" => {
@@ -806,8 +859,11 @@ fn apply_responses_stream_event(
                 serde_json::from_value(response).map_err(|error| {
                     OpenAiError::Protocol(format!("invalid response.completed payload: {error}"))
                 })?;
-            for item in completed.output {
-                apply_raw_responses_output_item(item, state, events)?;
+            for item in &completed.output {
+                apply_raw_responses_output_item(item.clone(), state, events)?;
+            }
+            if !completed.output.is_empty() {
+                state.response_items = completed.output;
             }
             state.usage = completed.usage.map(|usage| Usage {
                 prompt_tokens: usage.input,
@@ -924,7 +980,17 @@ fn apply_responses_output_item(
             }
             append_citations(citations, state, events);
         }
-        ResponsesOutputItem::Reasoning { summary } => {
+        ResponsesOutputItem::Reasoning { summary, content } => {
+            let completed_reasoning = content
+                .into_iter()
+                .filter_map(|part| match part {
+                    ResponsesReasoningContent::ReasoningText { text } => Some(text),
+                    ResponsesReasoningContent::Other => None,
+                })
+                .collect::<String>();
+            if !completed_reasoning.is_empty() {
+                merge_completed_text(&mut state.raw_reasoning, &completed_reasoning);
+            }
             let parts = summary
                 .into_iter()
                 .filter_map(|part| match part {
@@ -932,6 +998,7 @@ fn apply_responses_output_item(
                     ResponsesReasoningSummary::Other => None,
                 })
                 .collect::<Vec<_>>();
+            let has_summary = !state.reasoning.is_empty() || !parts.is_empty();
             if state.reasoning.is_empty() {
                 for (index, text) in parts.into_iter().enumerate() {
                     begin_reasoning_summary_part(index, state, events);
@@ -940,9 +1007,23 @@ fn apply_responses_output_item(
                 }
             }
             state.reasoning_summary_index = None;
-            let _ = events.send(AgentEvent::ReasoningSummaryFinished);
+            if has_summary {
+                let _ = events.send(AgentEvent::ReasoningSummaryFinished);
+            }
         }
         ResponsesOutputItem::Other => {}
+    }
+}
+
+fn merge_completed_text(partial: &mut String, completed: &str) {
+    if partial == completed {
+        return;
+    }
+    if let Some(suffix) = completed.strip_prefix(partial.as_str()) {
+        partial.push_str(suffix);
+    } else {
+        partial.clear();
+        partial.push_str(completed);
     }
 }
 
@@ -1245,8 +1326,9 @@ fn apply_stream_chunk(
     reasoning: &mut String,
     tool_calls: &mut BTreeMap<usize, ToolCallBuilder>,
     usage: &mut Option<Usage>,
+    finish_reason: &mut Option<AssistantStopReason>,
     events: &mpsc::UnboundedSender<AgentEvent>,
-) -> Result<bool> {
+) -> Result<()> {
     let chunk: StreamChunk = serde_json::from_str(data)
         .map_err(|error| OpenAiError::Protocol(format!("invalid JSON event: {error}")))?;
     if let Some(error) = chunk.error {
@@ -1257,9 +1339,16 @@ fn apply_stream_chunk(
     if let Some(next_usage) = chunk.usage {
         *usage = Some(next_usage);
     }
-    let mut saw_finish_reason = false;
     for choice in chunk.choices {
-        saw_finish_reason |= choice.finish_reason.is_some();
+        if let Some(reason) = choice.finish_reason {
+            let next = map_chat_finish_reason(&reason)?;
+            if finish_reason.is_some_and(|current| current != next) {
+                return Err(OpenAiError::Protocol(format!(
+                    "provider returned conflicting finish reasons: {finish_reason:?} and {reason:?}"
+                )));
+            }
+            *finish_reason = Some(next);
+        }
         if let Some(text) = choice.delta.content {
             content.push_str(&text);
             let _ = events.send(AgentEvent::TextDelta { text });
@@ -1271,7 +1360,21 @@ fn apply_stream_chunk(
             tool_calls.entry(delta.index).or_default().apply(delta);
         }
     }
-    Ok(saw_finish_reason)
+    Ok(())
+}
+
+fn map_chat_finish_reason(reason: &str) -> Result<AssistantStopReason> {
+    match reason {
+        "stop" | "end" | "end_turn" => Ok(AssistantStopReason::Stop),
+        "length" | "max_tokens" => Ok(AssistantStopReason::Length),
+        "tool_calls" | "function_call" => Ok(AssistantStopReason::ToolUse),
+        "content_filter" | "network_error" => Err(OpenAiError::Protocol(format!(
+            "provider finish_reason: {reason}"
+        ))),
+        _ => Err(OpenAiError::Protocol(format!(
+            "unknown provider finish_reason: {reason}"
+        ))),
+    }
 }
 
 fn api_endpoint_url(base_url: &str, api: ApiProtocol) -> Result<Url> {
@@ -1391,5 +1494,28 @@ impl SseDecoder {
             events.push(self.data_lines.join("\n"));
             self.data_lines.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_only_known_chat_finish_reasons() {
+        assert_eq!(
+            map_chat_finish_reason("stop").unwrap(),
+            AssistantStopReason::Stop
+        );
+        assert_eq!(
+            map_chat_finish_reason("length").unwrap(),
+            AssistantStopReason::Length
+        );
+        assert_eq!(
+            map_chat_finish_reason("tool_calls").unwrap(),
+            AssistantStopReason::ToolUse
+        );
+        assert!(map_chat_finish_reason("content_filter").is_err());
+        assert!(map_chat_finish_reason("unexpected").is_err());
     }
 }

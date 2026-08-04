@@ -86,6 +86,7 @@ API key 可以省略，以连接不需要认证的端点。MCode 不会保存凭
 
 - `api`：`openai-completions` 或 `openai-responses`
 - `contextWindow` / `maxInputTokens`：上下文窗口与最大输入
+- `input`：模型输入模态；文本模型使用 `["text"]`
 - `default`：每个模型必填，指定默认 effort；非推理模型使用 `off`
 - `thinkingLevelMap`：当前推理模型可选的 effort，`default` 必须是其中的非 `null` 等级
 - `compat`：控制 reasoning effort、流式 usage 和 strict tools
@@ -95,7 +96,8 @@ API key 可以省略，以连接不需要认证的端点。MCode 不会保存凭
 
 `models.example.json` 已包含 OpenAI、Grok、DeepSeek、Kimi、GLM 和通用
 OpenAI-compatible profile。对应密钥环境变量为 `OPENAI_API_KEY`、`XAI_API_KEY`、
-`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和 `ZHIPUAI_API_KEY`。
+`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和 `ZHIPUAI_API_KEY`。DeepSeek V4 Flash 与 V4 Pro
+均使用 Responses API。
 
 Web Search 依 API 协议分流：
 

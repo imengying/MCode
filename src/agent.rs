@@ -16,11 +16,13 @@ use crate::compaction::{
     should_compact, turn_prefix_summary_request,
 };
 use crate::config::{
-    ApiProtocol, AppConfig, CompactionSettings, ModelProfile, ReasoningEffort, WebSearchMode,
-    find_model_profile,
+    ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ModelProfile, ReasoningEffort,
+    WebSearchMode, find_model_profile,
 };
 use crate::event::{AgentEvent, CompactionReason};
-use crate::openai::{AssistantTurn, OpenAiClient, OpenAiError, OpenAiModelConfig};
+use crate::openai::{
+    AssistantStopReason, AssistantTurn, OpenAiClient, OpenAiError, OpenAiModelConfig,
+};
 use crate::protocol::{ChatMessage, ImageAttachment, MessageRole, ToolDefinition, Usage};
 use crate::session::{PendingToolCall, RunOutcome, Session, ToolReplayPolicy};
 use crate::tools::{McpStartupFailure, ToolRegistry};
@@ -34,11 +36,13 @@ pub enum RunStatus {
 pub struct Agent {
     client: OpenAiClient,
     model_profiles: Vec<ModelProfile>,
+    reload_overrides: ConfigOverrides,
     provider: Option<String>,
     reasoning_effort: ReasoningEffort,
     default_reasoning_effort: ReasoningEffort,
     context_window: u64,
     max_input_tokens: u64,
+    supports_images: bool,
     context_tokens: u64,
     compaction_settings: CompactionSettings,
     usage_estimated: bool,
@@ -99,28 +103,28 @@ impl Agent {
         .await?;
         let system_prompt = build_system_prompt(&config.cwd)?;
         let total_usage = session.total_usage();
-        let default_reasoning_effort = config
-            .model_profiles
-            .iter()
-            .find(|profile| {
-                profile.id == config.model
-                    && config
-                        .provider
-                        .as_deref()
-                        .is_some_and(|provider| provider == profile.provider)
-            })
-            .map_or(
-                config.reasoning_effort,
-                ModelProfile::default_reasoning_effort,
-            );
+        let selected_profile = config.model_profiles.iter().find(|profile| {
+            profile.id == config.model
+                && config
+                    .provider
+                    .as_deref()
+                    .is_some_and(|provider| provider == profile.provider)
+        });
+        let default_reasoning_effort = selected_profile.map_or(
+            config.reasoning_effort,
+            ModelProfile::default_reasoning_effort,
+        );
+        let supports_images = selected_profile.is_none_or(|profile| profile.supports_images);
         let mut agent = Self {
             client,
             model_profiles: config.model_profiles.clone(),
+            reload_overrides: config.reload_overrides.clone(),
             provider: config.provider.clone(),
             reasoning_effort: config.reasoning_effort,
             default_reasoning_effort,
             context_window: config.context_window,
             max_input_tokens: config.max_input_tokens,
+            supports_images,
             context_tokens: 0,
             compaction_settings: config.compaction,
             usage_estimated: false,
@@ -149,6 +153,9 @@ impl Agent {
     ) -> Result<RunStatus> {
         if prompt.trim().is_empty() {
             bail!("prompt cannot be empty");
+        }
+        if !images.is_empty() && !self.supports_images {
+            bail!("当前模型 {} 不支持图片输入", self.client.model());
         }
         if self.session.has_pending_run() {
             bail!("session has an unfinished run; resume it before starting another prompt");
@@ -274,7 +281,10 @@ impl Agent {
                 }
             };
 
-            if turn.content.is_none() && turn.tool_calls.is_empty() {
+            let stop_reason = turn.stop_reason;
+            let reasoning_only_truncation =
+                stop_reason == AssistantStopReason::Length && turn.reasoning_content.is_some();
+            if turn.content.is_none() && turn.tool_calls.is_empty() && !reasoning_only_truncation {
                 return Err(anyhow!("provider completed without text or tool calls"));
             }
             let (usage, estimated) = turn.usage.map_or_else(
@@ -304,6 +314,15 @@ impl Agent {
                 estimated,
             });
 
+            if stop_reason == AssistantStopReason::Length {
+                let had_tool_calls = !tool_calls.is_empty();
+                let _ = events.send(AgentEvent::ResponseTruncated { had_tool_calls });
+                if had_tool_calls {
+                    self.reject_truncated_tool_calls(run_id, tool_calls, events)?;
+                    continue;
+                }
+            }
+
             if tool_calls.is_empty() {
                 let _ = self
                     .maybe_auto_compact(CompactionReason::Threshold, events, cancel)
@@ -325,6 +344,38 @@ impl Agent {
                 return Ok(RunStatus::Cancelled);
             }
         }
+    }
+
+    fn reject_truncated_tool_calls(
+        &mut self,
+        run_id: uuid::Uuid,
+        tool_calls: Vec<crate::protocol::ToolCall>,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<()> {
+        for call in tool_calls {
+            let _ = events.send(AgentEvent::ToolStarted {
+                id: call.id.clone(),
+                name: call.function.name.clone(),
+                arguments: call.function.arguments.clone(),
+            });
+            let intent = self
+                .session
+                .start_tool(run_id, call.clone(), ToolReplayPolicy::Never)?;
+            let output = format!(
+                "tool error: {} was not executed because the model response reached its output token limit; the arguments may be incomplete",
+                call.function.name
+            );
+            self.session
+                .complete_tool(&intent, ChatMessage::tool(call.id.clone(), output.clone()))?;
+            let _ = events.send(AgentEvent::ToolFinished {
+                id: call.id,
+                name: call.function.name,
+                output,
+                is_error: true,
+                file_change: None,
+            });
+        }
+        Ok(())
     }
 
     async fn execute_tool_calls(
@@ -415,7 +466,7 @@ impl Agent {
                     file_change: None,
                 }
             } else {
-                self.tools.execute(&call, cancel).await
+                self.tools.execute(&call, cancel, events).await
             };
             self.session.complete_tool(
                 &intent,
@@ -737,6 +788,11 @@ impl Agent {
             .collect()
     }
 
+    pub fn refresh_model_profiles(&mut self) -> Result<()> {
+        self.model_profiles = AppConfig::reload_model_profiles(&self.reload_overrides)?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn available_reasoning_efforts(&self) -> Vec<ReasoningEffort> {
         self.current_profile().map_or_else(
@@ -771,6 +827,7 @@ impl Agent {
             self.default_reasoning_effort = effective_effort;
             self.context_window = profile.context_window;
             self.max_input_tokens = profile.max_input_tokens;
+            self.supports_images = profile.supports_images;
         } else {
             let query = query.trim();
             if query.is_empty() {
@@ -782,6 +839,7 @@ impl Agent {
                     .then(|| self.reasoning_effort.as_str().to_string()),
             );
             self.default_reasoning_effort = self.reasoning_effort;
+            self.supports_images = true;
         }
         self.tools.set_api(self.client.api());
         let provider = self.provider.clone();
@@ -1150,6 +1208,7 @@ mod tests {
             web_search: crate::config::WebSearchSettings::default(),
             model_profiles: Vec::new(),
             mcp_servers: Vec::new(),
+            reload_overrides: ConfigOverrides::default(),
         };
         let session = Session::create(
             project.path(),

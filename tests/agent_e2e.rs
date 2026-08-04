@@ -4,7 +4,8 @@ use std::sync::Arc;
 use mcode::agent::{Agent, RunStatus};
 use mcode::approval::ApprovalGate;
 use mcode::config::{
-    ApiProtocol, AppConfig, CompactionSettings, ReasoningEffort, WebSearchMode, WebSearchSettings,
+    ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ReasoningEffort, WebSearchMode,
+    WebSearchSettings,
 };
 use mcode::event::AgentEvent;
 use mcode::protocol::{ChatMessage, FunctionCall, ToolCall, Usage};
@@ -84,6 +85,7 @@ async fn executes_a_tool_and_continues_the_model_turn() {
         web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
+        reload_overrides: ConfigOverrides::default(),
     };
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
@@ -203,6 +205,26 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
             } else {
                 vec![
                     json!({
+                        "type": "response.reasoning_text.delta",
+                        "delta": "I should use the "
+                    }),
+                    json!({
+                        "type": "response.reasoning_text.done",
+                        "text": "I should use the hosted search result."
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "rs_deepseek",
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": "I should use the hosted search result."
+                            }],
+                            "summary": []
+                        }
+                    }),
+                    json!({
                         "type": "response.output_item.added",
                         "item": {
                             "type": "web_search_call",
@@ -277,6 +299,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
         },
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
+        reload_overrides: ConfigOverrides::default(),
     };
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
@@ -374,6 +397,11 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
         .collect::<String>();
     assert!(streamed.contains("Rust is current."));
     assert!(streamed.contains("[Rust Programming Language](https://www.rust-lang.org/)"));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ReasoningSummaryDelta { text }
+            if text.contains("hosted search result")
+    )));
     assert!(
         agent
             .messages()
@@ -381,6 +409,16 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
             .and_then(|message| message.content.as_deref())
             .is_some_and(|content| content.contains("Sources:"))
     );
+    let final_message = agent.messages().last().unwrap();
+    assert_eq!(
+        final_message.reasoning_content.as_deref(),
+        Some("I should use the hosted search result.")
+    );
+    assert!(final_message.response_items.iter().any(|item| {
+        item["type"] == "reasoning"
+            && item["id"] == "rs_deepseek"
+            && item["content"][0]["type"] == "reasoning_text"
+    }));
 }
 
 #[tokio::test]
@@ -493,6 +531,7 @@ async fn shell_tool_is_denied_without_frontend_approval() {
         web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
+        reload_overrides: ConfigOverrides::default(),
     };
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
@@ -549,7 +588,7 @@ async fn omits_request_fields_disabled_by_pi_compat() {
         let (mut stream, _) = listener.accept().await.unwrap();
         let (request, user_agent) = read_http_request(&mut stream).await;
         let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
         );
         let response = format!(
@@ -582,6 +621,7 @@ async fn omits_request_fields_disabled_by_pi_compat() {
         web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
+        reload_overrides: ConfigOverrides::default(),
     };
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
@@ -614,7 +654,10 @@ async fn retries_a_truncated_stream_without_persisting_partial_output() {
             let (mut stream, _) = listener.accept().await.unwrap();
             let _ = read_json_request(&mut stream).await;
             if attempt == 0 {
-                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"discard-me\"}}]}\n\n";
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"discard-me\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -677,7 +720,7 @@ async fn exec_command_sends_image_content_parts() {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request = read_json_request(&mut stream).await;
         let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Image received.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Image received.\"},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
         );
         let response = format!(
@@ -1199,6 +1242,7 @@ fn compaction_test_config(
         web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
+        reload_overrides: ConfigOverrides::default(),
     }
 }
 
@@ -1222,6 +1266,7 @@ fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -
         web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
+        reload_overrides: ConfigOverrides::default(),
     }
 }
 
@@ -1274,7 +1319,6 @@ async fn write_responses_sse(stream: &mut TcpStream, events: Vec<Value>) {
         let kind = event["type"].as_str().unwrap();
         let _ = write!(body, "event: {kind}\ndata: {event}\n\n");
     }
-    body.push_str("data: [DONE]\n\n");
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),

@@ -505,6 +505,7 @@ async fn run_exec(
     drop(tx);
 
     let mut streamed_text = false;
+    let mut streamed_tool_output_needs_newline = false;
     while let Some(event) = rx.recv().await {
         if json {
             println!(
@@ -533,14 +534,33 @@ async fn run_exec(
                     sanitize_terminal_text(&message)
                 );
             }
+            AgentEvent::ResponseTruncated { had_tool_calls } => eprintln!(
+                "[响应不完整] {}",
+                if had_tool_calls {
+                    "模型输出达到上限，工具参数未执行"
+                } else {
+                    "模型输出达到上限"
+                }
+            ),
             AgentEvent::ToolStarted { name, .. } => {
                 if streamed_text {
                     println!();
                     streamed_text = false;
                 }
+                streamed_tool_output_needs_newline = false;
                 eprintln!("[工具] {}", sanitize_terminal_text(&name));
             }
+            AgentEvent::ToolOutputDelta { delta, .. } => {
+                let delta = sanitize_terminal_text(&delta);
+                eprint!("{delta}");
+                io::stderr().flush().context("刷新标准错误失败")?;
+                streamed_tool_output_needs_newline = !delta.ends_with('\n');
+            }
             AgentEvent::ToolFinished { name, is_error, .. } => {
+                if streamed_tool_output_needs_newline {
+                    eprintln!();
+                }
+                streamed_tool_output_needs_newline = false;
                 eprintln!(
                     "[{}] {}",
                     if is_error {

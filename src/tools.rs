@@ -12,11 +12,13 @@ use rmcp::{RoleClient, ServiceExt};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStderr, Command};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ApiProtocol, McpServerConfig, WebSearchMode, WebSearchSettings};
+use crate::event::AgentEvent;
 use crate::protocol::{
     FileChangeKind, FileChangeLine, FileChangeLineKind, FileChangeSummary, FunctionDefinition,
     ToolCall, ToolDefinition,
@@ -28,6 +30,7 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 60_000;
 const MAX_FILE_CHANGE_PREVIEW_LINES: usize = 5;
 const MCP_CALL_TIMEOUT: Duration = Duration::from_mins(2);
 const MAX_MCP_STDERR_BYTES: usize = 16_000;
+const SHELL_EXIT_PIPE_IDLE_GRACE: Duration = Duration::from_millis(100);
 
 pub struct ToolRegistry {
     root: PathBuf,
@@ -268,7 +271,12 @@ impl ToolRegistry {
         ]
     }
 
-    pub async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolExecution {
+    pub async fn execute(
+        &self,
+        call: &ToolCall,
+        cancel: &CancellationToken,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> ToolExecution {
         if is_web_access_tool(&call.function.name)
             && self
                 .definitions
@@ -317,7 +325,7 @@ impl ToolRegistry {
                 Err(error) => return ToolExecution::error(error),
             },
             "shell" => match parse_args(&call.function.arguments) {
-                Ok(args) => self.shell(args, cancel).await,
+                Ok(args) => self.shell(args, &call.id, cancel, events).await,
                 Err(error) => Err(error),
             },
             unknown => Err(anyhow!("unknown tool: {unknown}")),
@@ -509,7 +517,13 @@ impl ToolRegistry {
         ))
     }
 
-    async fn shell(&self, args: ShellArgs, cancel: &CancellationToken) -> Result<String> {
+    async fn shell(
+        &self,
+        args: ShellArgs,
+        tool_id: &str,
+        cancel: &CancellationToken,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<String> {
         if args.command.trim().is_empty() {
             bail!("command cannot be empty");
         }
@@ -521,22 +535,126 @@ impl ToolRegistry {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let child = command.spawn().context("failed to start shell command")?;
-        let output = tokio::select! {
-            () = cancel.cancelled() => bail!("command cancelled"),
-            result = tokio::time::timeout(timeout, child.wait_with_output()) => {
-                match result {
-                    Ok(output) => output.context("failed to wait for shell command")?,
-                    Err(_) => bail!("command timed out after {} seconds", timeout.as_secs()),
-                }
-            }
-        };
+        let mut child = command.spawn().context("failed to start shell command")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to capture shell stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("failed to capture shell stderr")?;
+        let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        let stdout_task = tokio::spawn(read_shell_pipe(stdout, ShellPipe::Stdout, pipe_tx.clone()));
+        let stderr_task = tokio::spawn(read_shell_pipe(stderr, ShellPipe::Stderr, pipe_tx.clone()));
+        drop(pipe_tx);
+        let mut wait_task = tokio::spawn(async move { child.wait().await });
+        let mut wait_pending = true;
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let exit_pipe_idle = tokio::time::sleep(SHELL_EXIT_PIPE_IDLE_GRACE);
+        tokio::pin!(exit_pipe_idle);
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut status = None;
+        let mut pipes_closed = false;
+        let mut exit_pipe_idle_armed = false;
+        let mut pipe_error = None;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_decoder = StreamingUtf8::default();
+        let mut stderr_decoder = StreamingUtf8::default();
+        let mut stderr_started = false;
+
+        loop {
+            if status.is_some() && pipes_closed {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    if wait_pending {
+                        wait_task.abort();
+                        let _ = wait_task.await;
+                    }
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    bail!("command cancelled");
+                }
+                () = &mut deadline => {
+                    if wait_pending {
+                        wait_task.abort();
+                        let _ = wait_task.await;
+                    }
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    bail!("command timed out after {} seconds", timeout.as_secs());
+                }
+                result = &mut wait_task, if wait_pending => {
+                    wait_pending = false;
+                    status = Some(
+                        result
+                            .context("shell wait task failed")?
+                            .context("failed to wait for shell command")?,
+                    );
+                    exit_pipe_idle
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + SHELL_EXIT_PIPE_IDLE_GRACE);
+                    exit_pipe_idle_armed = true;
+                }
+                next = pipe_rx.recv(), if !pipes_closed => {
+                    match next {
+                        Some(ShellPipeEvent::Chunk { pipe: ShellPipe::Stdout, bytes }) => {
+                            stdout_bytes.extend_from_slice(&bytes);
+                            emit_shell_delta(tool_id, &stdout_decoder.push(&bytes), events);
+                        }
+                        Some(ShellPipeEvent::Chunk { pipe: ShellPipe::Stderr, bytes }) => {
+                            stderr_bytes.extend_from_slice(&bytes);
+                            let text = stderr_decoder.push(&bytes);
+                            if !text.is_empty() {
+                                let prefix = if stderr_started { "" } else { "\nstderr:\n" };
+                                stderr_started = true;
+                                emit_shell_delta(tool_id, &format!("{prefix}{text}"), events);
+                            }
+                        }
+                        Some(ShellPipeEvent::Error(error)) => pipe_error = Some(error),
+                        None => pipes_closed = true,
+                    }
+                    if status.is_some() && !pipes_closed {
+                        exit_pipe_idle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + SHELL_EXIT_PIPE_IDLE_GRACE);
+                        exit_pipe_idle_armed = true;
+                    }
+                }
+                () = &mut exit_pipe_idle, if exit_pipe_idle_armed => break,
+            }
+        }
+
+        emit_shell_delta(tool_id, &stdout_decoder.finish(), events);
+        let stderr_tail = stderr_decoder.finish();
+        if !stderr_tail.is_empty() {
+            let prefix = if stderr_started { "" } else { "\nstderr:\n" };
+            emit_shell_delta(tool_id, &format!("{prefix}{stderr_tail}"), events);
+        }
+        if pipes_closed {
+            stdout_task.await.context("stdout reader task failed")?;
+            stderr_task.await.context("stderr reader task failed")?;
+        } else {
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+        }
+        if let Some(error) = pipe_error {
+            bail!("failed to read shell output: {error}");
+        }
+
+        let status = status.context("shell command ended without an exit status")?;
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         Ok(format!(
             "exit code: {}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code().map_or_else(
+            status.code().map_or_else(
                 || "terminated by signal".to_string(),
                 |code| code.to_string()
             ),
@@ -865,6 +983,98 @@ fn push_file_change_preview_line(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ShellPipe {
+    Stdout,
+    Stderr,
+}
+
+enum ShellPipeEvent {
+    Chunk { pipe: ShellPipe, bytes: Vec<u8> },
+    Error(String),
+}
+
+async fn read_shell_pipe<R>(
+    mut reader: R,
+    pipe: ShellPipe,
+    events: mpsc::UnboundedSender<ShellPipeEvent>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0; 8 * 1024];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                if events
+                    .send(ShellPipeEvent::Chunk {
+                        pipe,
+                        bytes: buffer[..read].to_vec(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = events.send(ShellPipeEvent::Error(error.to_string()));
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamingUtf8 {
+    pending: Vec<u8>,
+}
+
+impl StreamingUtf8 {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut output = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    output.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        output.push_str(
+                            std::str::from_utf8(&self.pending[..valid])
+                                .expect("UTF-8 validator reported a valid prefix"),
+                        );
+                        self.pending.drain(..valid);
+                    }
+                    let Some(invalid) = error.error_len() else {
+                        break;
+                    };
+                    output.push('\u{fffd}');
+                    self.pending.drain(..invalid);
+                }
+            }
+        }
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&pending).into_owned()
+    }
+}
+
+fn emit_shell_delta(tool_id: &str, delta: &str, events: &mpsc::UnboundedSender<AgentEvent>) {
+    if !delta.is_empty() {
+        let _ = events.send(AgentEvent::ToolOutputDelta {
+            id: tool_id.to_string(),
+            delta: delta.to_string(),
+        });
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadFileArgs {
@@ -961,6 +1171,8 @@ fn shell_command(command: &str) -> Command {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -990,5 +1202,57 @@ mod tests {
         let added = summarize_file_change("new.rs", None, "one\ntwo\n");
         assert_eq!(added.kind, FileChangeKind::Added);
         assert_eq!((added.added_lines, added.removed_lines), (2, 0));
+    }
+
+    #[tokio::test]
+    async fn shell_emits_incremental_output_events() {
+        let project = tempdir().unwrap();
+        let tools = ToolRegistry::new(project.path()).unwrap();
+        let call = ToolCall {
+            id: "call_shell".to_string(),
+            kind: "function".to_string(),
+            function: crate::protocol::FunctionCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "printf alpha; printf beta"}).to_string(),
+            },
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let result = tools.execute(&call, &CancellationToken::new(), &tx).await;
+
+        assert!(!result.is_error);
+        assert!(result.output.contains("alphabeta"));
+        let deltas = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AgentEvent::ToolOutputDelta { id, delta } if id == "call_shell" => Some(delta),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(deltas, "alphabeta");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_stops_waiting_for_quiet_inherited_pipes_after_exit() {
+        let project = tempdir().unwrap();
+        let tools = ToolRegistry::new(project.path()).unwrap();
+        let call = ToolCall {
+            id: "call_shell".to_string(),
+            kind: "function".to_string(),
+            function: crate::protocol::FunctionCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({
+                    "command": "sh -c 'sleep 2 &' && printf done",
+                    "timeout_seconds": 1
+                })
+                .to_string(),
+            },
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let result = tools.execute(&call, &CancellationToken::new(), &tx).await;
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("done"));
     }
 }

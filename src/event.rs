@@ -31,10 +31,17 @@ pub enum AgentEvent {
         index: usize,
     },
     ReasoningSummaryFinished,
+    ResponseTruncated {
+        had_tool_calls: bool,
+    },
     ToolStarted {
         id: String,
         name: String,
         arguments: String,
+    },
+    ToolOutputDelta {
+        id: String,
+        delta: String,
     },
     ApprovalRequested {
         id: String,

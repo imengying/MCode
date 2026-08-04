@@ -8,6 +8,7 @@
         {
           "id": "gpt-5.6-terra",
           "name": "GPT-5.6 Terra",
+          "input": ["text", "image"],
           "reasoning": true,
           "default": "high",
           "contextWindow": 272000,
@@ -53,7 +54,7 @@
     },
     "deepseek": {
       "baseUrl": "https://api.deepseek.com",
-      "api": "openai-completions",
+      "api": "openai-responses",
       "apiKey": "$DEEPSEEK_API_KEY",
       "compat": {
         "supportsReasoningEffort": true,
@@ -62,15 +63,33 @@
       },
       "models": [
         {
-          "id": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro",
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash",
+          "input": ["text"],
           "reasoning": true,
           "default": "high",
-          "contextWindow": 1000000,
-          "maxInputTokens": 1000000,
+          "contextWindow": 1048576,
+          "maxInputTokens": 1048576,
           "thinkingLevelMap": {
             "minimal": null,
-            "low": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          }
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro",
+          "input": ["text"],
+          "reasoning": true,
+          "default": "high",
+          "contextWindow": 1048576,
+          "maxInputTokens": 1048576,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": "low",
             "medium": null,
             "high": "high",
             "xhigh": null,

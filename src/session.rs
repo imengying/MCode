@@ -1,6 +1,7 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -134,6 +135,28 @@ pub struct SessionSummary {
     pub total_usage: Usage,
     pub has_pending_run: bool,
     pub path: PathBuf,
+}
+
+#[derive(Debug)]
+struct SessionCandidate {
+    path: PathBuf,
+    id: Uuid,
+    created_at: u64,
+    has_messages: bool,
+}
+
+#[derive(Deserialize)]
+struct SessionRecordTag {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("session is already open by another MCode process: {path} ({source})")]
+struct SessionAlreadyOpen {
+    path: PathBuf,
+    #[source]
+    source: io::Error,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -285,26 +308,32 @@ impl Session {
         let mut load_error = None;
         let mut sessions = Vec::new();
         for path in candidates {
-            match Self::load_readonly(&path) {
-                Ok(session) => {
-                    sessions.push((path, session.created_at, session.id, session.messages.len()));
-                }
+            match scan_session_candidate(&path, &cwd) {
+                Ok(session) => sessions.push(session),
                 Err(error) if prefer_non_empty => load_error = Some(error),
                 Err(error) => return Err(error),
             }
         }
-        let newest = |sessions: &[(PathBuf, u64, Uuid, usize)], non_empty: bool| {
-            sessions
-                .iter()
-                .filter(|(_, _, _, message_count)| !non_empty || *message_count > 0)
-                .max_by_key(|(_, created_at, id, _)| (*created_at, *id))
-                .map(|(path, _, _, _)| path.clone())
-        };
-        let path = prefer_non_empty
-            .then(|| newest(&sessions, true))
-            .flatten()
-            .or_else(|| newest(&sessions, false));
-        let Some(path) = path else {
+        sessions.sort_by_key(|session| Reverse((session.created_at, session.id)));
+        if prefer_non_empty {
+            for has_messages in [true, false] {
+                for session in sessions
+                    .iter()
+                    .filter(|session| session.has_messages == has_messages)
+                {
+                    match Self::load_for_project(&session.path, &directory, &cwd) {
+                        Ok(session) => return Ok(session),
+                        Err(error) if error.downcast_ref::<SessionAlreadyOpen>().is_some() => {
+                            return Err(error);
+                        }
+                        Err(error) => load_error = Some(error),
+                    }
+                }
+            }
+        } else if let Some(session) = sessions.first() {
+            return Self::load_for_project(&session.path, &directory, &cwd);
+        }
+        if sessions.is_empty() || prefer_non_empty {
             if let Some(error) = load_error {
                 return Err(error);
             }
@@ -313,8 +342,8 @@ impl Session {
             } else {
                 anyhow!("no previous session for {}", cwd.display())
             });
-        };
-        Self::load_for_project(&path, &directory, &cwd)
+        }
+        unreachable!("a non-empty explicit candidate list returned above")
     }
 
     pub fn list(cwd: &Path) -> Result<Vec<SessionSummary>> {
@@ -1227,11 +1256,9 @@ fn open_session_writer(path: &Path) -> Result<File> {
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open session: {}", path.display()))?;
-    file.try_lock().map_err(|error| {
-        anyhow!(
-            "session is already open by another MCode process: {} ({error})",
-            path.display()
-        )
+    file.try_lock().map_err(|source| SessionAlreadyOpen {
+        path: path.to_path_buf(),
+        source: source.into(),
     })?;
     Ok(file)
 }
@@ -1309,6 +1336,103 @@ fn session_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
                 .is_some_and(|extension| extension == "jsonl")
         })
         .collect())
+}
+
+fn scan_session_candidate(path: &Path, expected_cwd: &Path) -> Result<SessionCandidate> {
+    let file = File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    if reader
+        .read_until(b'\n', &mut line)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        == 0
+    {
+        bail!("session is empty: {}", path.display());
+    }
+    let header = trim_jsonl_line(&line);
+    let header: SessionRecord = serde_json::from_slice(header)
+        .with_context(|| format!("invalid session header: {}", path.display()))?;
+    let SessionRecord::Session {
+        version,
+        id,
+        cwd,
+        created_at,
+        ..
+    } = header
+    else {
+        bail!("first session record is not a header: {}", path.display());
+    };
+    if version != SESSION_VERSION {
+        bail!("unsupported session version {version}; expected {SESSION_VERSION}");
+    }
+    if cwd != expected_cwd {
+        bail!(
+            "session {id} belongs to {}, not {}",
+            cwd.display(),
+            expected_cwd.display()
+        );
+    }
+
+    let mut has_messages = false;
+    let mut line_number = 1usize;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        let terminated = line.ends_with(b"\n");
+        let record = trim_jsonl_line(&line);
+        if record.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let tag: SessionRecordTag = match serde_json::from_slice(record) {
+            Ok(tag) => tag,
+            Err(_) if !terminated => break,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("invalid session record at {}:{line_number}", path.display())
+                });
+            }
+        };
+        match tag.kind.as_str() {
+            "message" | "run_started" | "assistant_completed" | "tool_completed" => {
+                has_messages = true;
+            }
+            "generation_started" | "tool_started" | "run_finished" | "model_changed"
+            | "reasoning_changed" | "web_search_changed" | "compaction" => {}
+            "session" if !terminated => break,
+            "session" => bail!(
+                "duplicate session header at {}:{line_number}",
+                path.display()
+            ),
+            _ if !terminated => break,
+            unknown => bail!(
+                "unknown session record {unknown:?} at {}:{line_number}",
+                path.display()
+            ),
+        }
+    }
+
+    Ok(SessionCandidate {
+        path: path.to_path_buf(),
+        id,
+        created_at,
+        has_messages,
+    })
+}
+
+fn trim_jsonl_line(mut line: &[u8]) -> &[u8] {
+    if line.ends_with(b"\n") {
+        line = &line[..line.len() - 1];
+    }
+    if line.ends_with(b"\r") {
+        line = &line[..line.len() - 1];
+    }
+    line
 }
 
 fn unix_timestamp() -> u64 {
