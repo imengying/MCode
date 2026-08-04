@@ -1,37 +1,32 @@
-use std::collections::BTreeMap;
 use std::io::{self, Read as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
-use crossterm::cursor::{Hide, Show};
+use anyhow::{Context, Result, bail};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType as TerminalClearType, disable_raw_mode, enable_raw_mode,
 };
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions, Parser, Tag,
     TagEnd,
 };
 use ratatui::backend::{Backend, ClearType as BackendClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::{Buffer, Cell};
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect, Size};
+use ratatui::buffer::Cell;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
-use ratatui::{Frame, Terminal};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use wl_clipboard_rs::copy::{
-    MimeType as CopyMimeType, Options as CopyOptions, Source as CopySource,
-};
 use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents, get_mime_types};
 
 use crate::agent::{Agent, ModelChoice};
@@ -55,26 +50,27 @@ const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
 const PREVIEW_LINE_CHARS: usize = 240;
-const TRANSCRIPT_SCROLL_LINES: usize = 3;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
 const X11_CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(500);
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const THEME_BASE: Color = Color::Rgb(30, 30, 46);
-const THEME_MANTLE: Color = Color::Rgb(24, 24, 37);
-const THEME_SURFACE: Color = Color::Rgb(49, 50, 68);
-const THEME_TEXT: Color = Color::Rgb(205, 214, 244);
-const THEME_SUBTEXT: Color = Color::Rgb(186, 194, 222);
-const THEME_MUTED: Color = Color::Rgb(108, 112, 134);
-const THEME_BLUE: Color = Color::Rgb(137, 180, 250);
-const THEME_GREEN: Color = Color::Rgb(166, 227, 161);
-const THEME_YELLOW: Color = Color::Rgb(249, 226, 175);
-const THEME_RED: Color = Color::Rgb(243, 139, 168);
+// Match Codex's terminal-native palette: inherit the configured foreground/background and use
+// ANSI semantic colors so accents remain legible across terminal themes.
+const THEME_BASE: Color = Color::Reset;
+const THEME_MANTLE: Color = Color::Reset;
+const THEME_SURFACE: Color = Color::DarkGray;
+const THEME_TEXT: Color = Color::Reset;
+const THEME_SUBTEXT: Color = Color::Gray;
+const THEME_MUTED: Color = Color::DarkGray;
+const THEME_BLUE: Color = Color::Cyan;
+const THEME_GREEN: Color = Color::Green;
+const THEME_YELLOW: Color = Color::Yellow;
+const THEME_RED: Color = Color::Red;
 const THEME_DIFF_ADD_BG: Color = Color::Rgb(33, 58, 43);
 const THEME_DIFF_REMOVE_BG: Color = Color::Rgb(74, 34, 29);
-const THEME_MAUVE: Color = Color::Rgb(203, 166, 247);
-const THEME_TEAL: Color = Color::Rgb(148, 226, 213);
+const THEME_MAUVE: Color = Color::Magenta;
+const THEME_TEAL: Color = Color::Cyan;
 const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
@@ -132,7 +128,14 @@ pub fn run_interactive(
 
     let screen = ScreenGuard::enter()?;
     let backend = UiBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).context("初始化终端失败")?;
+    let viewport_height = backend.size().context("读取终端尺寸失败")?.height;
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )
+    .context("初始化终端失败")?;
     terminal.clear().context("清空终端失败")?;
 
     if let Some(checkpoint) = historical_compaction {
@@ -197,6 +200,9 @@ pub fn run_interactive(
             pending_approval = Some(request);
         }
 
+        if needs_draw {
+            archive_transcript_overflow(&mut terminal, &mut state)?;
+        }
         if state.run_started_at.is_some() && last_frame.elapsed() >= ELAPSED_REFRESH_INTERVAL {
             needs_draw = true;
         }
@@ -338,26 +344,15 @@ pub fn run_interactive(
                 needs_draw = true;
                 paste_text_or_image(&mut state, &text);
             }
-            Event::Mouse(mouse) => {
-                let outcome = handle_mouse(mouse, &mut state);
-                needs_draw |= outcome.redraw;
-                if let Some(text) = outcome.copy_text
-                    && let Err(error) = copy_text_to_clipboard(&mut state, text)
-                {
-                    state.push_error(format!("无法复制选中文本：{error}"));
-                    needs_draw = true;
-                }
-            }
-            Event::FocusLost => needs_draw |= state.cancel_transcript_selection_drag(),
             Event::FocusGained => needs_draw = true,
             Event::Resize(..) => {
-                state.clear_transcript_selection();
                 needs_draw = true;
             }
             _ => {}
         }
     }
 
+    finish_terminal_view(&mut terminal, &mut state)?;
     drop(terminal);
     drop(screen);
     if let Some(id) = deleted_session {
@@ -443,7 +438,78 @@ impl Backend for UiBackend {
 type UiTerminal = Terminal<UiBackend>;
 
 fn clear_terminal_view(terminal: &mut UiTerminal) -> Result<()> {
+    execute!(io::stdout(), Clear(TerminalClearType::Purge), MoveTo(0, 0))
+        .context("清空终端滚动历史失败")?;
+    terminal.backend_mut().cursor = Some(Position::ORIGIN);
     terminal.clear().context("重置终端视口失败")
+}
+
+fn finish_terminal_view(terminal: &mut UiTerminal, state: &mut UiState) -> Result<()> {
+    state.editor.set_text("");
+    terminal
+        .draw(|frame| render(frame, state))
+        .context("完成终端界面绘制失败")?;
+    let size = terminal.size().context("读取终端尺寸失败")?;
+    let clear_from = ui_section_heights(state, size.width, size.height).conversation;
+    execute!(
+        io::stdout(),
+        MoveTo(0, clear_from),
+        Clear(TerminalClearType::FromCursorDown)
+    )
+    .context("清理终端输入区失败")?;
+    terminal.backend_mut().cursor = Some(Position::new(0, clear_from));
+    Ok(())
+}
+
+fn archive_transcript_overflow(terminal: &mut UiTerminal, state: &mut UiState) -> Result<()> {
+    terminal.autoresize().context("调整终端视口失败")?;
+    let size = terminal.size().context("读取终端尺寸失败")?;
+    let conversation_height =
+        usize::from(ui_section_heights(state, size.width, size.height).conversation);
+    let width = size.width.max(1);
+    let count = transcript_archive_count(state, width, conversation_height);
+    if count == 0 {
+        return Ok(());
+    }
+
+    let lines = conversation_lines_for_messages(&state.messages[..count]);
+    if !lines.is_empty() {
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let height = paragraph.line_count(width);
+        let height = u16::try_from(height).context("单条终端历史记录过长")?;
+        terminal
+            .insert_before(height, move |buffer| {
+                paragraph.render(buffer.area, buffer);
+            })
+            .context("写入终端滚动历史失败")?;
+    }
+
+    state.messages.drain(..count);
+    state.current_assistant = state
+        .current_assistant
+        .and_then(|index| index.checked_sub(count));
+    state.generation_start = state
+        .generation_start
+        .and_then(|index| index.checked_sub(count));
+    Ok(())
+}
+
+fn transcript_archive_count(state: &UiState, width: u16, conversation_height: usize) -> usize {
+    if transcript_line_count(state, &state.messages, width) <= conversation_height {
+        return 0;
+    }
+    let archivable = state
+        .messages
+        .iter()
+        .take_while(|message| !message.running)
+        .count();
+    let mut count = 0;
+    while count < archivable
+        && transcript_line_count(state, &state.messages[count..], width) > conversation_height
+    {
+        count += 1;
+    }
+    count
 }
 
 fn start_resume(
@@ -1438,115 +1504,6 @@ enum ReasoningActivityState {
     Active,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum TranscriptTailState {
-    #[default]
-    Following,
-    Paused,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TranscriptPoint {
-    row: usize,
-    column: u16,
-}
-
-#[derive(Debug, Default)]
-enum TranscriptSelectionState {
-    #[default]
-    None,
-    Dragging {
-        anchor: TranscriptPoint,
-        focus: TranscriptPoint,
-        document_height: usize,
-    },
-    Selected {
-        anchor: TranscriptPoint,
-        focus: TranscriptPoint,
-        document_height: usize,
-    },
-}
-
-impl TranscriptSelectionState {
-    fn bounds(&self) -> Option<(TranscriptPoint, TranscriptPoint)> {
-        let (anchor, focus) = match self {
-            Self::Dragging { anchor, focus, .. } | Self::Selected { anchor, focus, .. } => {
-                (*anchor, *focus)
-            }
-            Self::None => return None,
-        };
-        (anchor != focus).then(|| {
-            if anchor < focus {
-                (anchor, focus)
-            } else {
-                (focus, anchor)
-            }
-        })
-    }
-
-    fn document_height(&self) -> Option<usize> {
-        match self {
-            Self::Dragging {
-                document_height, ..
-            }
-            | Self::Selected {
-                document_height, ..
-            } => Some(*document_height),
-            Self::None => None,
-        }
-    }
-
-    fn is_dragging(&self) -> bool {
-        matches!(self, Self::Dragging { .. })
-    }
-}
-
-#[derive(Debug)]
-struct TranscriptGlyph {
-    column: u16,
-    width: u16,
-    text: String,
-}
-
-#[derive(Debug, Default)]
-struct TranscriptRenderedRow {
-    glyphs: Vec<TranscriptGlyph>,
-    content_width: u16,
-}
-
-impl TranscriptRenderedRow {
-    fn glyph_bounds_at(&self, column: u16) -> (u16, u16) {
-        self.glyphs
-            .iter()
-            .find(|glyph| column < glyph.column.saturating_add(glyph.width))
-            .map_or((column, column), |glyph| {
-                (
-                    glyph.column,
-                    glyph.column.saturating_add(glyph.width).saturating_sub(1),
-                )
-            })
-    }
-
-    fn selection_columns(
-        &self,
-        row: usize,
-        start: TranscriptPoint,
-        end: TranscriptPoint,
-    ) -> (u16, u16) {
-        let start_column = if row == start.row {
-            self.glyph_bounds_at(start.column).0
-        } else {
-            0
-        };
-        let end_column = if row == end.row {
-            self.glyph_bounds_at(end.column).1
-        } else {
-            self.content_width.saturating_sub(1)
-        };
-        (start_column, end_column)
-    }
-}
-
 impl ApprovalChoice {
     fn previous(self) -> Self {
         match self {
@@ -1619,16 +1576,6 @@ struct UiState {
     mcp_tool_count: usize,
     pending_approval: Option<ApprovalView>,
     show_welcome: bool,
-    transcript_scroll_top: usize,
-    transcript_total_height: usize,
-    transcript_view_height: usize,
-    transcript_area: Rect,
-    transcript_render_area: Rect,
-    transcript_scrollbar_thumb: Option<Rect>,
-    transcript_drag_offset: Option<u16>,
-    transcript_tail_state: TranscriptTailState,
-    transcript_selection: TranscriptSelectionState,
-    transcript_rows: BTreeMap<usize, TranscriptRenderedRow>,
     x11_clipboard: Option<X11Clipboard>,
 }
 
@@ -1673,16 +1620,6 @@ impl UiState {
             mcp_tool_count: 0,
             pending_approval: None,
             show_welcome: true,
-            transcript_scroll_top: 0,
-            transcript_total_height: 0,
-            transcript_view_height: 0,
-            transcript_area: Rect::default(),
-            transcript_render_area: Rect::default(),
-            transcript_scrollbar_thumb: None,
-            transcript_drag_offset: None,
-            transcript_tail_state: TranscriptTailState::Following,
-            transcript_selection: TranscriptSelectionState::None,
-            transcript_rows: BTreeMap::new(),
             x11_clipboard: None,
         }
     }
@@ -1836,7 +1773,6 @@ impl UiState {
 
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
         self.show_welcome = false;
-        self.follow_transcript_tail();
         self.record_input(prompt.clone());
         self.messages.push(ViewMessage {
             role: ViewRole::User,
@@ -1855,7 +1791,6 @@ impl UiState {
     }
 
     fn push_notice(&mut self, content: impl AsRef<str>) {
-        self.clear_transcript_selection();
         self.messages.push(ViewMessage {
             role: ViewRole::Notice,
             title: "MCode".to_string(),
@@ -1869,7 +1804,6 @@ impl UiState {
     }
 
     fn push_error(&mut self, content: impl AsRef<str>) {
-        self.clear_transcript_selection();
         self.messages.push(ViewMessage {
             role: ViewRole::Error,
             title: "错误".to_string(),
@@ -1915,7 +1849,6 @@ impl UiState {
         self.pending_images.clear();
         self.pending_approval = None;
         self.show_welcome = true;
-        self.reset_transcript_scroll();
         self.input_history.clear();
         self.detach_input_history();
         self.reset_reasoning_summary();
@@ -1926,228 +1859,7 @@ impl UiState {
         self.current_assistant = None;
         self.generation_start = None;
         self.delete_confirmation = DeleteConfirmation::None;
-        self.reset_transcript_scroll();
         self.reset_reasoning_summary();
-    }
-
-    fn reset_transcript_scroll(&mut self) {
-        self.transcript_scroll_top = 0;
-        self.transcript_total_height = 0;
-        self.transcript_view_height = 0;
-        self.transcript_render_area = Rect::default();
-        self.transcript_scrollbar_thumb = None;
-        self.transcript_drag_offset = None;
-        self.transcript_tail_state = TranscriptTailState::Following;
-        self.transcript_selection = TranscriptSelectionState::None;
-        self.transcript_rows.clear();
-    }
-
-    fn follow_transcript_tail(&mut self) {
-        self.clear_transcript_selection();
-        self.transcript_tail_state = TranscriptTailState::Following;
-        self.transcript_scroll_top = self.max_transcript_scroll();
-    }
-
-    fn max_transcript_scroll(&self) -> usize {
-        self.transcript_total_height
-            .saturating_sub(self.transcript_view_height)
-    }
-
-    fn scroll_transcript_up(&mut self, lines: usize) -> bool {
-        if self.max_transcript_scroll() == 0 {
-            return false;
-        }
-        let next = self.transcript_scroll_top.saturating_sub(lines);
-        let changed = next != self.transcript_scroll_top
-            || self.transcript_tail_state == TranscriptTailState::Following;
-        self.transcript_scroll_top = next;
-        self.transcript_tail_state = TranscriptTailState::Paused;
-        changed
-    }
-
-    fn scroll_transcript_down(&mut self, lines: usize) -> bool {
-        let max_scroll = self.max_transcript_scroll();
-        if max_scroll == 0 {
-            return false;
-        }
-        let next = self
-            .transcript_scroll_top
-            .saturating_add(lines)
-            .min(max_scroll);
-        let tail_state = if next == max_scroll {
-            TranscriptTailState::Following
-        } else {
-            TranscriptTailState::Paused
-        };
-        let changed =
-            next != self.transcript_scroll_top || self.transcript_tail_state != tail_state;
-        self.transcript_scroll_top = next;
-        self.transcript_tail_state = tail_state;
-        changed
-    }
-
-    fn begin_transcript_drag(&mut self, mouse: MouseEvent) -> bool {
-        let Some(thumb) = self.transcript_scrollbar_thumb else {
-            return false;
-        };
-        if mouse.column != self.transcript_area.right().saturating_sub(1)
-            || mouse.row < self.transcript_area.y
-            || mouse.row >= self.transcript_area.bottom()
-        {
-            return false;
-        }
-        let offset = if mouse.row >= thumb.y && mouse.row < thumb.bottom() {
-            mouse.row.saturating_sub(thumb.y)
-        } else {
-            thumb.height / 2
-        };
-        self.transcript_selection = TranscriptSelectionState::None;
-        self.transcript_rows.clear();
-        self.transcript_drag_offset = Some(offset);
-        self.drag_transcript_to(mouse.row)
-    }
-
-    fn drag_transcript_to(&mut self, row: u16) -> bool {
-        let Some(offset) = self.transcript_drag_offset else {
-            return false;
-        };
-        let Some(thumb) = self.transcript_scrollbar_thumb else {
-            return false;
-        };
-        let max_scroll = self.max_transcript_scroll();
-        let available = self.transcript_area.height.saturating_sub(thumb.height);
-        if max_scroll == 0 || available == 0 {
-            return false;
-        }
-        let thumb_top = row
-            .saturating_sub(self.transcript_area.y)
-            .saturating_sub(offset)
-            .min(available);
-        let next = usize::from(thumb_top)
-            .saturating_mul(max_scroll)
-            .saturating_add(usize::from(available) / 2)
-            / usize::from(available);
-        let tail_state = if next >= max_scroll {
-            TranscriptTailState::Following
-        } else {
-            TranscriptTailState::Paused
-        };
-        let changed =
-            next != self.transcript_scroll_top || self.transcript_tail_state != tail_state;
-        self.transcript_scroll_top = next.min(max_scroll);
-        self.transcript_tail_state = tail_state;
-        changed
-    }
-
-    fn transcript_point(&self, mouse: MouseEvent, clamp: bool) -> Option<TranscriptPoint> {
-        let area = self.transcript_render_area;
-        if area.width == 0 || area.height == 0 {
-            return None;
-        }
-        let inside = mouse.column >= area.x
-            && mouse.column < area.right()
-            && mouse.row >= area.y
-            && mouse.row < area.bottom();
-        if !inside && !clamp {
-            return None;
-        }
-        let row = mouse.row.clamp(area.y, area.bottom().saturating_sub(1));
-        let column = mouse.column.clamp(area.x, area.right().saturating_sub(1));
-        Some(TranscriptPoint {
-            row: self
-                .transcript_scroll_top
-                .saturating_add(usize::from(row.saturating_sub(area.y))),
-            column: column.saturating_sub(area.x),
-        })
-    }
-
-    fn begin_transcript_selection(&mut self, mouse: MouseEvent) -> bool {
-        let Some(anchor) = self.transcript_point(mouse, false) else {
-            return false;
-        };
-        let Some(rows) = snapshot_transcript_rows(self) else {
-            return false;
-        };
-        self.transcript_rows = rows;
-        self.transcript_selection = TranscriptSelectionState::Dragging {
-            anchor,
-            focus: anchor,
-            document_height: self.transcript_total_height,
-        };
-        true
-    }
-
-    fn update_transcript_selection(&mut self, mouse: MouseEvent) -> bool {
-        let Some(focus) = self.transcript_point(mouse, true) else {
-            return false;
-        };
-        let TranscriptSelectionState::Dragging { focus: current, .. } =
-            &mut self.transcript_selection
-        else {
-            return false;
-        };
-        let changed = *current != focus;
-        *current = focus;
-        changed
-    }
-
-    fn finish_transcript_selection(&mut self, mouse: MouseEvent) -> Option<String> {
-        self.update_transcript_selection(mouse);
-        let selection = std::mem::take(&mut self.transcript_selection);
-        let TranscriptSelectionState::Dragging {
-            anchor,
-            focus,
-            document_height,
-        } = selection
-        else {
-            self.transcript_selection = selection;
-            return None;
-        };
-        if anchor == focus {
-            self.transcript_rows.clear();
-            return None;
-        }
-        self.transcript_selection = TranscriptSelectionState::Selected {
-            anchor,
-            focus,
-            document_height,
-        };
-        self.selected_transcript_text()
-    }
-
-    fn selected_transcript_text(&self) -> Option<String> {
-        let (start, end) = self.transcript_selection.bounds()?;
-        let mut output = String::new();
-        for row_index in start.row..=end.row {
-            let row = self.transcript_rows.get(&row_index)?;
-            let (start_column, end_column) = row.selection_columns(row_index, start, end);
-            let mut line = String::new();
-            for glyph in &row.glyphs {
-                let glyph_end = glyph.column.saturating_add(glyph.width);
-                if glyph_end > start_column && glyph.column <= end_column {
-                    line.push_str(&glyph.text);
-                }
-            }
-            output.push_str(line.trim_end());
-            if row_index != end.row {
-                output.push('\n');
-            }
-        }
-        (!output.is_empty()).then_some(output)
-    }
-
-    fn cancel_transcript_selection_drag(&mut self) -> bool {
-        if !self.transcript_selection.is_dragging() {
-            return false;
-        }
-        self.transcript_selection = TranscriptSelectionState::None;
-        self.transcript_rows.clear();
-        true
-    }
-
-    fn clear_transcript_selection(&mut self) {
-        self.transcript_selection = TranscriptSelectionState::None;
-        self.transcript_rows.clear();
     }
 
     fn hold_pending_tools(&mut self, tool_ids: &[String]) {
@@ -2380,7 +2092,6 @@ impl UiState {
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent) {
-        self.clear_transcript_selection();
         match event {
             AgentEvent::RunStarted | AgentEvent::RunResumed => {
                 self.begin_run("处理中");
@@ -2749,70 +2460,6 @@ impl UiState {
     }
 }
 
-#[derive(Debug, Default)]
-struct MouseOutcome {
-    redraw: bool,
-    copy_text: Option<String>,
-}
-
-fn handle_mouse(mouse: MouseEvent, state: &mut UiState) -> MouseOutcome {
-    let over_transcript = mouse.column >= state.transcript_area.x
-        && mouse.column < state.transcript_area.right()
-        && mouse.row >= state.transcript_area.y
-        && mouse.row < state.transcript_area.bottom();
-    let redraw = match mouse.kind {
-        MouseEventKind::ScrollUp if over_transcript => {
-            state.scroll_transcript_up(TRANSCRIPT_SCROLL_LINES)
-        }
-        MouseEventKind::ScrollDown if over_transcript => {
-            state.scroll_transcript_down(TRANSCRIPT_SCROLL_LINES)
-        }
-        MouseEventKind::Down(MouseButton::Left) => {
-            state.begin_transcript_drag(mouse) || state.begin_transcript_selection(mouse)
-        }
-        MouseEventKind::Drag(MouseButton::Left) if state.transcript_drag_offset.is_some() => {
-            state.drag_transcript_to(mouse.row)
-        }
-        MouseEventKind::Drag(MouseButton::Left) => state.update_transcript_selection(mouse),
-        MouseEventKind::Up(MouseButton::Left) if state.transcript_drag_offset.take().is_some() => {
-            true
-        }
-        MouseEventKind::Up(MouseButton::Left) if state.transcript_selection.is_dragging() => {
-            return MouseOutcome {
-                redraw: true,
-                copy_text: state.finish_transcript_selection(mouse),
-            };
-        }
-        _ => false,
-    };
-    MouseOutcome {
-        redraw,
-        copy_text: None,
-    }
-}
-
-fn copy_text_to_clipboard(state: &mut UiState, text: String) -> Result<()> {
-    let wayland_error = match CopyOptions::new().copy(
-        CopySource::Bytes(text.as_bytes().to_vec().into_boxed_slice()),
-        CopyMimeType::Text,
-    ) {
-        Ok(()) => {
-            state.x11_clipboard = None;
-            return Ok(());
-        }
-        Err(error) => error,
-    };
-    let clipboard = x11_clipboard(state)
-        .map_err(|x11_error| anyhow!("Wayland：{wayland_error}；X11：{x11_error:#}"))?;
-    clipboard
-        .store(
-            clipboard.setter.atoms.clipboard,
-            clipboard.setter.atoms.utf8_string,
-            text.into_bytes(),
-        )
-        .map_err(|x11_error| anyhow!("Wayland：{wayland_error}；X11：{x11_error}"))
-}
-
 fn x11_clipboard(state: &mut UiState) -> Result<&x11_clipboard::Clipboard> {
     if state.x11_clipboard.is_none() {
         state.x11_clipboard = Some(X11Clipboard(
@@ -2933,41 +2580,15 @@ fn render_activity_status(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     );
 }
 
-fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
-    state.transcript_area = area;
-    state.transcript_view_height = usize::from(area.height);
-    let content_width = area.width.saturating_sub(1).max(1);
+fn render_conversation(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    let content_width = area.width.max(1);
     let lines = transcript_lines(state, content_width);
     if lines.is_empty() || area.height == 0 || area.width == 0 {
-        state.transcript_total_height = 0;
-        state.transcript_scroll_top = 0;
-        state.transcript_render_area = Rect::default();
-        state.transcript_scrollbar_thumb = None;
-        state.transcript_selection = TranscriptSelectionState::None;
-        state.transcript_rows.clear();
         return;
     }
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total_height = paragraph.line_count(content_width);
     let visible_height = total_height.min(usize::from(area.height));
-    state.transcript_total_height = total_height;
-    if state
-        .transcript_selection
-        .document_height()
-        .is_some_and(|height| height != total_height)
-    {
-        state.transcript_selection = TranscriptSelectionState::None;
-        state.transcript_rows.clear();
-    }
-    let max_scroll = state.max_transcript_scroll();
-    if state.transcript_tail_state == TranscriptTailState::Following {
-        state.transcript_scroll_top = max_scroll;
-    } else {
-        state.transcript_scroll_top = state.transcript_scroll_top.min(max_scroll);
-        if state.transcript_scroll_top == max_scroll {
-            state.transcript_tail_state = TranscriptTailState::Following;
-        }
-    }
     let render_height = u16::try_from(visible_height).unwrap_or(area.height);
     let render_y = if state.show_welcome && state.messages.is_empty() {
         area.y
@@ -2976,155 +2597,38 @@ fn render_conversation(frame: &mut Frame<'_>, state: &mut UiState, area: Rect) {
         area.bottom().saturating_sub(render_height)
     };
     let render_area = Rect::new(area.x, render_y, content_width, render_height);
-    state.transcript_render_area = render_area;
-    let scroll = u16::try_from(state.transcript_scroll_top).unwrap_or(u16::MAX);
+    let scroll = u16::try_from(total_height.saturating_sub(visible_height)).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), render_area);
-    apply_transcript_selection(frame.buffer_mut(), state, render_area);
-    state.transcript_scrollbar_thumb = render_transcript_scrollbar(
-        frame,
-        area,
-        total_height,
-        usize::from(area.height),
-        state.transcript_scroll_top,
-    );
 }
 
 fn transcript_lines(state: &UiState, content_width: u16) -> Vec<Line<'static>> {
+    transcript_lines_for_messages(state, &state.messages, content_width)
+}
+
+fn transcript_lines_for_messages(
+    state: &UiState,
+    messages: &[ViewMessage],
+    content_width: u16,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if state.show_welcome {
         lines.extend(welcome_lines(state, content_width));
-        if !state.messages.is_empty() {
+        if !messages.is_empty() {
             lines.push(Line::default());
         }
     }
-    lines.extend(conversation_lines(state));
+    lines.extend(conversation_lines_for_messages(messages));
     lines
 }
 
-fn snapshot_transcript_rows(state: &UiState) -> Option<BTreeMap<usize, TranscriptRenderedRow>> {
-    let width = state.transcript_render_area.width;
-    let height = u16::try_from(state.transcript_total_height).ok()?;
-    if width == 0 || height == 0 {
-        return None;
+fn transcript_line_count(state: &UiState, messages: &[ViewMessage], width: u16) -> usize {
+    let lines = transcript_lines_for_messages(state, messages, width);
+    if lines.is_empty() {
+        return 0;
     }
-    let area = Rect::new(0, 0, width, height);
-    let lines = transcript_lines(state, width);
-    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let mut buffer = Buffer::empty(area);
-    paragraph.render(area, &mut buffer);
-    Some(
-        (0..height)
-            .map(|row| {
-                (
-                    usize::from(row),
-                    rendered_transcript_row(&buffer, area, row),
-                )
-            })
-            .collect(),
-    )
-}
-
-fn rendered_transcript_row(buffer: &Buffer, area: Rect, row: u16) -> TranscriptRenderedRow {
-    let mut glyphs = Vec::new();
-    let mut column = 0u16;
-    while column < area.width {
-        let text = buffer[(area.x.saturating_add(column), area.y.saturating_add(row))]
-            .symbol()
-            .to_string();
-        let width = u16::try_from(display_width(&text).max(1))
-            .unwrap_or(u16::MAX)
-            .min(area.width.saturating_sub(column));
-        glyphs.push(TranscriptGlyph {
-            column,
-            width,
-            text,
-        });
-        column = column.saturating_add(width);
-    }
-    let content_width = glyphs
-        .iter()
-        .rfind(|glyph| !glyph.text.chars().all(char::is_whitespace))
-        .map_or(0, |glyph| glyph.column.saturating_add(glyph.width));
-    TranscriptRenderedRow {
-        glyphs,
-        content_width,
-    }
-}
-
-fn apply_transcript_selection(buffer: &mut Buffer, state: &UiState, area: Rect) {
-    let Some((start, end)) = state.transcript_selection.bounds() else {
-        return;
-    };
-    for visible_row in 0..area.height {
-        let document_row = state
-            .transcript_scroll_top
-            .saturating_add(usize::from(visible_row));
-        if document_row < start.row || document_row > end.row {
-            continue;
-        }
-        let Some(row) = state.transcript_rows.get(&document_row) else {
-            continue;
-        };
-        let (start_column, end_column) = row.selection_columns(document_row, start, end);
-        for column in start_column.min(area.width)..=end_column.min(area.width.saturating_sub(1)) {
-            buffer[(
-                area.x.saturating_add(column),
-                area.y.saturating_add(visible_row),
-            )]
-                .set_style(Style::default().add_modifier(Modifier::REVERSED));
-        }
-    }
-}
-
-fn render_transcript_scrollbar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    total_height: usize,
-    visible_height: usize,
-    scroll_top: usize,
-) -> Option<Rect> {
-    if area.width == 0 || area.height == 0 || total_height <= visible_height {
-        return None;
-    }
-    let track_height = usize::from(area.height);
-    let thumb_height = visible_height
-        .saturating_mul(track_height)
-        .saturating_add(total_height.saturating_sub(1))
-        / total_height;
-    let max_thumb_height = track_height.saturating_sub(1).max(1);
-    let thumb_height = thumb_height.clamp(1, max_thumb_height);
-    let available = track_height.saturating_sub(thumb_height);
-    let max_scroll = total_height.saturating_sub(visible_height);
-    let thumb_top = scroll_top
-        .min(max_scroll)
-        .saturating_mul(available)
-        .saturating_add(max_scroll / 2)
-        / max_scroll;
-    let scrollbar_area = Rect::new(area.right().saturating_sub(1), area.y, 1, area.height);
-    frame.render_widget(
-        Paragraph::new(
-            (0..track_height)
-                .map(|_| Line::from(Span::styled("│", Style::default().fg(THEME_SURFACE))))
-                .collect::<Vec<_>>(),
-        ),
-        scrollbar_area,
-    );
-    let thumb = Rect::new(
-        scrollbar_area.x,
-        area.y
-            .saturating_add(u16::try_from(thumb_top).unwrap_or(u16::MAX)),
-        1,
-        u16::try_from(thumb_height).unwrap_or(area.height),
-    );
-    frame.render_widget(
-        Paragraph::new(
-            (0..thumb_height)
-                .map(|_| Line::from(Span::styled("┃", Style::default().fg(THEME_BLUE))))
-                .collect::<Vec<_>>(),
-        ),
-        thumb,
-    );
-    Some(thumb)
+    Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
 }
 
 fn welcome_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
@@ -3157,10 +2661,13 @@ fn welcome_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
         ]),
     ];
     let mut lines = Vec::with_capacity(bordered.len().saturating_add(2));
-    lines.push(Line::from(Span::styled(
-        format!("╭{}╮", "─".repeat(inner_width.saturating_add(2))),
-        Style::default().fg(THEME_MUTED),
-    )));
+    lines.push(
+        Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(inner_width.saturating_add(2))),
+            Style::default().fg(THEME_MUTED),
+        ))
+        .alignment(Alignment::Center),
+    );
     for line in bordered {
         let used = line
             .spans
@@ -3172,12 +2679,15 @@ fn welcome_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
         spans.extend(line.spans);
         spans.push(Span::raw(" ".repeat(inner_width.saturating_sub(used))));
         spans.push(Span::styled(" │", Style::default().fg(THEME_MUTED)));
-        lines.push(Line::from(spans));
+        lines.push(Line::from(spans).alignment(Alignment::Center));
     }
-    lines.push(Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(inner_width.saturating_add(2))),
-        Style::default().fg(THEME_MUTED),
-    )));
+    lines.push(
+        Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(inner_width.saturating_add(2))),
+            Style::default().fg(THEME_MUTED),
+        ))
+        .alignment(Alignment::Center),
+    );
     lines
 }
 
@@ -3292,6 +2802,11 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         );
         return;
     }
+
+    frame.render_widget(
+        Block::default().style(Style::default().bg(THEME_MANTLE)),
+        area,
+    );
 
     if let DeleteConfirmation::Selecting(selection) = state.delete_confirmation {
         let yes_style = if selection == DeleteChoice::Yes {
@@ -3740,6 +3255,7 @@ fn split_reasoning_summary_parts(parts: &[String]) -> (String, String) {
     (placeholder_header.unwrap_or_default(), content)
 }
 
+#[cfg(test)]
 fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
     conversation_lines_for_messages(&state.messages)
 }
@@ -3860,12 +3376,12 @@ fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
             "› ",
             Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(first.to_string(), Style::default().fg(THEME_TEXT)),
+        Span::styled(first.to_string(), Style::default().fg(THEME_TEAL)),
     ]));
     for line in content_lines {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(line.to_string(), Style::default().fg(THEME_TEXT)),
+            Span::styled(line.to_string(), Style::default().fg(THEME_TEAL)),
         ]));
     }
 }
@@ -4614,20 +4130,11 @@ struct ScreenGuard;
 impl ScreenGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("启用终端原始模式失败")?;
-        if let Err(error) = execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableFocusChange,
-            EnableBracketedPaste,
-            Hide
-        ) {
+        if let Err(error) = execute!(io::stdout(), EnableFocusChange, EnableBracketedPaste, Hide) {
             let _ = execute!(
                 io::stdout(),
                 DisableBracketedPaste,
                 DisableFocusChange,
-                DisableMouseCapture,
-                LeaveAlternateScreen,
                 Show
             );
             let _ = disable_raw_mode();
@@ -4643,8 +4150,6 @@ impl Drop for ScreenGuard {
             io::stdout(),
             DisableBracketedPaste,
             DisableFocusChange,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
             Show
         );
         let _ = disable_raw_mode();
@@ -4665,89 +4170,6 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
-    }
-
-    #[test]
-    fn transcript_scrollbar_pauses_and_restores_tail_following() {
-        let mut state = UiState::new(
-            "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
-            std::path::PathBuf::from("."),
-        );
-        state.push_user(
-            (0..40)
-                .map(|index| format!("line {index}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            &[],
-        );
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-
-        let max_scroll = state.max_transcript_scroll();
-        assert!(max_scroll > 0);
-        assert_eq!(state.transcript_scroll_top, max_scroll);
-        assert_eq!(state.transcript_tail_state, TranscriptTailState::Following);
-        assert!(state.transcript_scrollbar_thumb.is_some());
-        assert!(rendered_terminal(&terminal).contains('┃'));
-
-        assert!(
-            handle_mouse(
-                MouseEvent {
-                    kind: MouseEventKind::ScrollUp,
-                    column: state.transcript_area.x,
-                    row: state.transcript_area.y,
-                    modifiers: KeyModifiers::NONE,
-                },
-                &mut state,
-            )
-            .redraw
-        );
-        assert!(state.transcript_scroll_top < max_scroll);
-        assert_eq!(state.transcript_tail_state, TranscriptTailState::Paused);
-
-        let scrollbar_column = state.transcript_area.right() - 1;
-        let scrollbar_bottom = state.transcript_area.bottom() - 1;
-        assert!(
-            handle_mouse(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column: scrollbar_column,
-                    row: scrollbar_bottom,
-                    modifiers: KeyModifiers::NONE,
-                },
-                &mut state,
-            )
-            .redraw
-        );
-        assert_eq!(state.transcript_scroll_top, max_scroll);
-        assert_eq!(state.transcript_tail_state, TranscriptTailState::Following);
-    }
-
-    #[test]
-    fn transcript_selection_keeps_a_wide_grapheme_intact() {
-        let mut state = UiState::new(
-            "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
-            std::path::PathBuf::from("."),
-        );
-        let area = Rect::new(0, 0, 8, 1);
-        let mut buffer = Buffer::empty(area);
-        buffer.set_string(0, 0, "A👩‍💻 B", Style::default());
-        state
-            .transcript_rows
-            .insert(0, rendered_transcript_row(&buffer, area, 0));
-        state.transcript_selection = TranscriptSelectionState::Selected {
-            anchor: TranscriptPoint { row: 0, column: 2 },
-            focus: TranscriptPoint { row: 0, column: 4 },
-            document_height: 1,
-        };
-
-        assert_eq!(state.selected_transcript_text().as_deref(), Some("👩‍💻 B"));
-        apply_transcript_selection(&mut buffer, &state, area);
-        assert!(buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
-        assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -4861,15 +4283,72 @@ mod tests {
             .map(|(index, _)| index / 80)
             .unwrap();
         assert_eq!(placeholder_y, input_y);
+        let border_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "╭").then_some(index / 80))
+            .unwrap();
+        let border_left = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "╭").then_some(index % 80))
+            .unwrap();
+        let border_right = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "╮").then_some(index % 80))
+            .unwrap();
+        assert_eq!(border_y, 4);
+        assert!(border_left.abs_diff(79 - border_right) <= 1);
         assert_eq!(
-            state.transcript_render_area.y,
-            state.transcript_area.y
-                + (state.transcript_area.height - state.transcript_render_area.height) / 2
+            buffer[(79, u16::try_from(input_y).unwrap())].bg,
+            Color::Reset
         );
 
         state.editor.insert('x');
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         assert!(!rendered_terminal(&terminal).contains("描述任务"));
+    }
+
+    #[test]
+    fn archives_only_completed_overflow_and_distinguishes_user_text() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_user("用户内容\n".repeat(12), &[]);
+        state.start_assistant_message();
+
+        assert_eq!(transcript_archive_count(&state, 40, 5), 1);
+        let lines = conversation_lines_for_messages(&state.messages);
+        let user_span = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("用户内容"))
+            .unwrap();
+        assert_eq!(user_span.style.fg, Some(THEME_TEAL));
+
+        let assistant = ViewMessage {
+            role: ViewRole::Assistant,
+            title: String::new(),
+            content: "Agent 内容".to_string(),
+            reasoning: String::new(),
+            tool_arguments: None,
+            tool_id: None,
+            file_change: None,
+            running: false,
+        };
+        let assistant_lines = conversation_lines_for_messages(&[assistant]);
+        let assistant_span = assistant_lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("Agent 内容"))
+            .unwrap();
+        assert_eq!(assistant_span.style.fg, Some(THEME_TEXT));
     }
 
     #[test]
