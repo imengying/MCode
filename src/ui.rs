@@ -136,7 +136,7 @@ pub fn run_interactive(
         },
     )
     .context("初始化终端失败")?;
-    terminal.clear().context("清空终端失败")?;
+    clear_terminal_view(&mut terminal)?;
 
     if let Some(checkpoint) = historical_compaction {
         state.push_notice(format!(
@@ -352,7 +352,7 @@ pub fn run_interactive(
         }
     }
 
-    finish_terminal_view(&mut terminal, &mut state)?;
+    clear_terminal_view(&mut terminal)?;
     drop(terminal);
     drop(screen);
     if let Some(id) = deleted_session {
@@ -383,7 +383,11 @@ impl Backend for UiBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.inner.draw(content)
+        let mut positions = DrawPositionAdapter::default();
+        self.inner.draw(content.map(|(x, y, cell)| {
+            let position = positions.map(x, y, cell.symbol());
+            (position.x, position.y, cell)
+        }))
     }
 
     fn append_lines(&mut self, count: u16) -> io::Result<()> {
@@ -438,27 +442,43 @@ impl Backend for UiBackend {
 type UiTerminal = Terminal<UiBackend>;
 
 fn clear_terminal_view(terminal: &mut UiTerminal) -> Result<()> {
-    execute!(io::stdout(), Clear(TerminalClearType::Purge), MoveTo(0, 0))
-        .context("清空终端滚动历史失败")?;
+    execute!(
+        io::stdout(),
+        MoveTo(0, 0),
+        Clear(TerminalClearType::All),
+        Clear(TerminalClearType::Purge),
+        MoveTo(0, 0)
+    )
+    .context("清空终端滚动历史失败")?;
     terminal.backend_mut().cursor = Some(Position::ORIGIN);
     terminal.clear().context("重置终端视口失败")
 }
 
-fn finish_terminal_view(terminal: &mut UiTerminal, state: &mut UiState) -> Result<()> {
-    state.editor.set_text("");
-    terminal
-        .draw(|frame| render(frame, state))
-        .context("完成终端界面绘制失败")?;
-    let size = terminal.size().context("读取终端尺寸失败")?;
-    let clear_from = ui_section_heights(state, size.width, size.height).conversation;
-    execute!(
-        io::stdout(),
-        MoveTo(0, clear_from),
-        Clear(TerminalClearType::FromCursorDown)
-    )
-    .context("清理终端输入区失败")?;
-    terminal.backend_mut().cursor = Some(Position::new(0, clear_from));
-    Ok(())
+// Ratatui omits the trailing cells of wide glyphs, while Crossterm assumes every yielded cell is
+// one column wide. Report adjacent virtual positions so it does not reposition between CJK glyphs.
+#[derive(Debug, Default)]
+struct DrawPositionAdapter {
+    actual_end: Option<Position>,
+    reported: Option<Position>,
+}
+
+impl DrawPositionAdapter {
+    fn map(&mut self, x: u16, y: u16, symbol: &str) -> Position {
+        let actual = Position::new(x, y);
+        let reported = if self.actual_end == Some(actual) {
+            Position::new(
+                self.reported
+                    .map_or(x, |position| position.x.saturating_add(1)),
+                y,
+            )
+        } else {
+            actual
+        };
+        let width = u16::try_from(UnicodeWidthStr::width(symbol).max(1)).unwrap_or(u16::MAX);
+        self.actual_end = Some(Position::new(x.saturating_add(width), y));
+        self.reported = Some(reported);
+        reported
+    }
 }
 
 fn archive_transcript_overflow(terminal: &mut UiTerminal, state: &mut UiState) -> Result<()> {
@@ -4352,6 +4372,17 @@ mod tests {
     }
 
     #[test]
+    fn writes_adjacent_wide_glyphs_without_intermediate_cursor_moves() {
+        let mut positions = DrawPositionAdapter::default();
+
+        assert_eq!(positions.map(0, 2, "你"), Position::new(0, 2));
+        assert_eq!(positions.map(2, 2, "好"), Position::new(1, 2));
+        assert_eq!(positions.map(4, 2, "!"), Position::new(2, 2));
+        assert_eq!(positions.map(7, 2, "x"), Position::new(7, 2));
+        assert_eq!(positions.map(0, 3, "新"), Position::new(0, 3));
+    }
+
+    #[test]
     fn aligns_a_short_conversation_directly_above_the_input() {
         let mut state = UiState::new(
             "model".to_string(),
@@ -4669,7 +4700,7 @@ mod tests {
         );
         resumed_state.api = ApiProtocol::Responses;
         resumed_state.push_history(ChatMessage::assistant_with_response_items(
-            Some("Final response.".to_string()),
+            Some("**Final response.**".to_string()),
             Some("Private raw reasoning.".to_string()),
             Vec::new(),
             vec![serde_json::json!({
@@ -4682,12 +4713,20 @@ mod tests {
                 "summary": []
             })],
         ));
-        let resumed = conversation_lines(&resumed_state)
+        let resumed_lines = conversation_lines(&resumed_state);
+        let resumed = resumed_lines
             .iter()
             .map(Line::to_string)
             .collect::<String>();
         assert!(resumed.contains("Final response."));
+        assert!(!resumed.contains("**"));
         assert!(!resumed.contains("Private raw reasoning."));
+        let final_response = resumed_lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "Final response.")
+            .unwrap();
+        assert!(final_response.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
