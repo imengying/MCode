@@ -32,6 +32,7 @@ use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents, get_mi
 
 use crate::agent::{Agent, ModelChoice};
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
+use crate::compaction::{estimate_message_tokens, estimate_text_tokens};
 use crate::config::{ApiProtocol, ReasoningEffort};
 use crate::event::{AgentEvent, CompactionReason};
 use crate::highlight::highlight_code;
@@ -544,6 +545,9 @@ fn archive_transcript_overflow(terminal: &mut UiTerminal, state: &mut UiState) -
     state.generation_start = state
         .generation_start
         .and_then(|index| index.checked_sub(count));
+    state.protected_turn_start = state
+        .protected_turn_start
+        .and_then(|index| index.checked_sub(count));
     Ok(())
 }
 
@@ -555,7 +559,8 @@ fn transcript_archive_count(state: &UiState, width: u16, conversation_height: us
         .messages
         .iter()
         .take_while(|message| !message.running)
-        .count();
+        .count()
+        .min(state.protected_turn_start.unwrap_or(usize::MAX));
     let mut count = 0;
     while count < archivable
         && transcript_line_count(state, &state.messages[count..], width) > conversation_height
@@ -572,6 +577,8 @@ fn start_resume(
     state: &mut UiState,
     active_cancel: &mut Option<CancellationToken>,
 ) {
+    state.protect_resumed_turn();
+    state.begin_live_usage(state.context_tokens);
     state.begin_run("正在恢复中断任务");
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
@@ -599,6 +606,12 @@ fn start_run(
     state: &mut UiState,
     active_cancel: &mut Option<CancellationToken>,
 ) {
+    let prompt_tokens = estimate_message_tokens(&ChatMessage::user_with_images(
+        prompt.clone(),
+        images.clone(),
+    ));
+    state.protect_new_turn();
+    state.begin_live_usage(state.context_tokens.saturating_add(prompt_tokens));
     state.push_user(prompt.clone(), &images);
     state.begin_run("处理中");
     let cancel = CancellationToken::new();
@@ -625,6 +638,7 @@ fn start_compaction(
     state: &mut UiState,
     active_cancel: &mut Option<CancellationToken>,
 ) {
+    state.begin_live_usage(state.context_tokens);
     state.begin_run("正在压缩上下文");
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
@@ -1767,8 +1781,11 @@ struct UiState {
     run_elapsed_before_pause: Duration,
     current_assistant: Option<usize>,
     generation_start: Option<usize>,
+    protected_turn_start: Option<usize>,
     status: String,
     usage: Usage,
+    live_prompt_tokens: u64,
+    live_completion: String,
     context_tokens: u64,
     context_window: u64,
     max_input_tokens: u64,
@@ -1813,8 +1830,11 @@ impl UiState {
             run_elapsed_before_pause: Duration::ZERO,
             current_assistant: None,
             generation_start: None,
+            protected_turn_start: None,
             status: "就绪".to_string(),
             usage: Usage::default(),
+            live_prompt_tokens: 0,
+            live_completion: String::new(),
             context_tokens: 0,
             context_window: 128_000,
             max_input_tokens: 128_000,
@@ -1867,6 +1887,58 @@ impl UiState {
         }
         self.running = true;
         self.status = status.into();
+    }
+
+    fn protect_new_turn(&mut self) {
+        self.protected_turn_start = Some(self.messages.len());
+    }
+
+    fn protect_resumed_turn(&mut self) {
+        self.protected_turn_start = self
+            .messages
+            .iter()
+            .rposition(|message| message.role == ViewRole::User);
+    }
+
+    fn begin_live_usage(&mut self, prompt_tokens: u64) {
+        self.live_prompt_tokens = prompt_tokens;
+        self.live_completion.clear();
+    }
+
+    fn append_live_completion(&mut self, text: &str) {
+        self.live_completion.push_str(text);
+    }
+
+    fn clear_live_usage(&mut self) {
+        self.live_prompt_tokens = 0;
+        self.live_completion.clear();
+    }
+
+    fn live_completion_tokens(&self) -> u64 {
+        estimate_text_tokens(&self.live_completion)
+    }
+
+    fn displayed_usage(&self) -> Usage {
+        let completion_tokens = self.live_completion_tokens();
+        self.usage.saturating_add(Usage {
+            prompt_tokens: self.live_prompt_tokens,
+            completion_tokens,
+            total_tokens: self.live_prompt_tokens.saturating_add(completion_tokens),
+            cached_prompt_tokens: None,
+        })
+    }
+
+    fn displayed_context_tokens(&self) -> u64 {
+        if self.live_prompt_tokens == 0 {
+            self.context_tokens
+        } else {
+            self.live_prompt_tokens
+                .saturating_add(self.live_completion_tokens())
+        }
+    }
+
+    fn displayed_usage_is_estimated(&self) -> bool {
+        self.usage_estimated || self.live_prompt_tokens > 0 || !self.live_completion.is_empty()
     }
 
     fn run_elapsed(&self) -> Duration {
@@ -2067,7 +2139,9 @@ impl UiState {
         self.run_elapsed_before_pause = Duration::ZERO;
         self.current_assistant = None;
         self.generation_start = None;
+        self.protected_turn_start = None;
         self.usage = Usage::default();
+        self.clear_live_usage();
         self.context_tokens = 0;
         self.usage_estimated = false;
         self.status = "就绪".to_string();
@@ -2087,6 +2161,7 @@ impl UiState {
         self.messages.clear();
         self.current_assistant = None;
         self.generation_start = None;
+        self.protected_turn_start = None;
         self.delete_confirmation = DeleteConfirmation::None;
         self.reset_reasoning_summary();
     }
@@ -2324,8 +2399,14 @@ impl UiState {
 
     fn status_notice(&self) -> String {
         let qualified_model = self.qualified_model();
-        let estimate = if self.usage_estimated { "~" } else { "" };
-        let percent = format_context_percent(self.context_tokens, self.max_input_tokens);
+        let usage = self.displayed_usage();
+        let context_tokens = self.displayed_context_tokens();
+        let estimate = if self.displayed_usage_is_estimated() {
+            "~"
+        } else {
+            ""
+        };
+        let percent = format_context_percent(context_tokens, self.max_input_tokens);
         let cache = self
             .usage
             .cached_prompt_tokens
@@ -2333,18 +2414,18 @@ impl UiState {
                 format!(
                     "\n缓存命中：{}（输入的 {}%）",
                     format_tokens(cached),
-                    format_context_percent(cached, self.usage.prompt_tokens)
+                    format_context_percent(cached, usage.prompt_tokens)
                 )
             });
         format!(
             "模型：{qualified_model}\nAPI：{}\neffort：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
             self.api,
             self.reasoning_effort,
-            format_tokens(self.context_tokens),
+            format_tokens(context_tokens),
             format_tokens(self.max_input_tokens),
             format_tokens(self.context_window),
-            format_tokens(self.usage.prompt_tokens),
-            format_tokens(self.usage.completion_tokens),
+            format_tokens(usage.prompt_tokens),
+            format_tokens(usage.completion_tokens),
             self.mcp_server_count,
             self.mcp_tool_count,
             self.endpoint,
@@ -2358,6 +2439,11 @@ impl UiState {
                 self.begin_run("处理中");
             }
             AgentEvent::AssistantStarted => {
+                if self.live_prompt_tokens == 0 {
+                    self.begin_live_usage(self.context_tokens);
+                } else {
+                    self.live_completion.clear();
+                }
                 let index = self.start_assistant_message();
                 self.generation_start = Some(index);
                 self.start_reasoning_summary();
@@ -2368,6 +2454,7 @@ impl UiState {
                 max_attempts,
                 message,
             } => {
+                self.live_completion.clear();
                 let index = self
                     .generation_start
                     .filter(|index| *index < self.messages.len())
@@ -2392,14 +2479,17 @@ impl UiState {
             }
             AgentEvent::TextDelta { text } => {
                 self.finish_reasoning_summary();
+                let text = sanitize_terminal_text(&text);
+                self.append_live_completion(&text);
                 let index = self.ensure_assistant_message();
                 if let Some(message) = self.messages.get_mut(index) {
-                    message.content.push_str(&sanitize_terminal_text(&text));
+                    message.content.push_str(&text);
                 }
                 self.status = "正在生成回复".to_string();
             }
             AgentEvent::ReasoningSummaryDelta { text } => {
                 if self.api == ApiProtocol::Responses {
+                    self.append_live_completion(&text);
                     self.append_reasoning_summary(&text);
                 }
                 self.status = "正在思考".to_string();
@@ -2568,6 +2658,7 @@ impl UiState {
                 self.context_window = context_window;
                 self.max_input_tokens = max_input_tokens;
                 self.usage_estimated = estimated;
+                self.clear_live_usage();
             }
             AgentEvent::ContextTrimmed {
                 dropped_messages,
@@ -2662,6 +2753,7 @@ impl UiState {
         self.generation_start = None;
         self.running = false;
         self.pending_approval = None;
+        self.clear_live_usage();
         self.reset_reasoning_summary();
         elapsed
     }
@@ -3261,21 +3353,27 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    let estimate = if state.usage_estimated { "~" } else { "" };
+    let usage_values = state.displayed_usage();
+    let context_tokens = state.displayed_context_tokens();
+    let estimate = if state.displayed_usage_is_estimated() {
+        "~"
+    } else {
+        ""
+    };
     let context_full = format!(
         "{estimate}{}/{} ({}%)",
-        format_tokens(state.context_tokens),
+        format_tokens(context_tokens),
         format_tokens(state.max_input_tokens),
-        format_context_percent(state.context_tokens, state.max_input_tokens)
+        format_context_percent(context_tokens, state.max_input_tokens)
     );
     let context_compact = format!(
         "{estimate}{}%",
-        format_context_percent(state.context_tokens, state.max_input_tokens)
+        format_context_percent(context_tokens, state.max_input_tokens)
     );
     let usage = format!(
         " | 输入 {} 输出 {}",
-        format_tokens(state.usage.prompt_tokens),
-        format_tokens(state.usage.completion_tokens)
+        format_tokens(usage_values.prompt_tokens),
+        format_tokens(usage_values.completion_tokens)
     );
     let effort = state.reasoning_effort.to_string();
     let context_label = " 上下文 ";
@@ -3341,10 +3439,7 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
         Span::styled(
             context,
             Style::default()
-                .fg(context_usage_color(
-                    state.context_tokens,
-                    state.max_input_tokens,
-                ))
+                .fg(context_usage_color(context_tokens, state.max_input_tokens))
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -4682,6 +4777,64 @@ mod tests {
         assert!(completed.contains("已完成"));
         assert!(completed.contains("5m 22s"));
         assert_eq!(format_elapsed_compact(3_723), "1h 02m 03s");
+    }
+
+    #[test]
+    fn keeps_the_live_turn_contiguous_and_refreshes_usage() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.protect_new_turn();
+        state.begin_live_usage(120);
+        state.push_user("继续".to_string(), &[]);
+        state.begin_run("处理中");
+        state.apply_agent_event(AgentEvent::AssistantStarted);
+        state.apply_agent_event(AgentEvent::TextDelta {
+            text: format!("{}最终一行", "较长的中文输出。\n".repeat(40)),
+        });
+
+        let live_usage = state.displayed_usage();
+        assert_eq!(live_usage.prompt_tokens, 120);
+        assert!(live_usage.completion_tokens > 0);
+        assert!(footer_line(&state, 80).to_string().contains('~'));
+
+        state.apply_agent_event(AgentEvent::Usage {
+            usage: Usage {
+                prompt_tokens: 150,
+                completion_tokens: 90,
+                total_tokens: 240,
+                cached_prompt_tokens: None,
+            },
+            context_tokens: 240,
+            context_window: 1_000,
+            max_input_tokens: 1_000,
+            estimated: false,
+        });
+        state.apply_agent_event(AgentEvent::RunFinished);
+
+        assert_eq!(state.displayed_usage().prompt_tokens, 150);
+        assert_eq!(state.displayed_usage().completion_tokens, 90);
+        assert_eq!(transcript_archive_count(&state, 40, 6), 0);
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let final_line_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "最").then_some(index / 40))
+            .unwrap();
+        let completed_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "已").then_some(index / 40))
+            .unwrap();
+        assert!(completed_y.saturating_sub(final_line_y) <= 2);
     }
 
     #[test]
