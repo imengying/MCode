@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::str;
 use std::time::Duration;
 
+use dom_query::Document;
 use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ pub enum OpenAiError {
     Url(#[from] url::ParseError),
     #[error("failed to encode OpenAI request: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("OpenAI API returned HTTP {status}: {body}{request_id}", request_id = request_id.as_deref().map(|id| format!(" (request id: {id})")).unwrap_or_default())]
+    #[error("API 返回 HTTP {status}：{body}{request_id}", request_id = request_id.as_deref().map(|id| format!("（请求 ID：{id}）")).unwrap_or_default())]
     Api {
         status: u16,
         body: String,
@@ -215,7 +216,7 @@ impl OpenAiClient {
                     };
                     let error = OpenAiError::Api {
                         status: status.as_u16(),
-                        body: truncate_error_body(&body),
+                        body: summarize_error_body(&body),
                         request_id,
                     };
                     if !is_retryable_status(status) || attempt + 1 == MAX_REQUEST_ATTEMPTS {
@@ -1558,14 +1559,92 @@ fn endpoint_url(base_url: &str, path: &str) -> Result<Url> {
     Ok(Url::parse(&endpoint)?)
 }
 
-fn truncate_error_body(body: &str) -> String {
-    const MAX_CHARS: usize = 8_000;
-    let mut chars = body.chars();
-    let truncated: String = chars.by_ref().take(MAX_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{truncated}\n... response truncated")
+fn summarize_error_body(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return "响应正文为空".to_string();
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let message = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+            .or_else(|| value.get("detail").and_then(serde_json::Value::as_str))
+            .or_else(|| value.get("error").and_then(serde_json::Value::as_str));
+        if let Some(message) = message {
+            let code = value
+                .pointer("/error/code")
+                .or_else(|| value.pointer("/error/type"))
+                .or_else(|| value.get("code"))
+                .and_then(|code| {
+                    code.as_str()
+                        .map(str::to_string)
+                        .or_else(|| code.as_i64().map(|code| code.to_string()))
+                });
+            let summary = code.map_or_else(
+                || message.to_string(),
+                |code| format!("{message}（代码：{code}）"),
+            );
+            return truncate_error_summary(&collapse_whitespace(&summary));
+        }
+        return truncate_error_summary(&collapse_whitespace(&value.to_string()));
+    }
+
+    if looks_like_html(body) {
+        return summarize_html_error(body);
+    }
+
+    truncate_error_summary(&collapse_whitespace(body))
+}
+
+fn looks_like_html(body: &str) -> bool {
+    let prefix = body
+        .chars()
+        .take(256)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    prefix.contains("<!doctype html") || prefix.contains("<html") || prefix.contains("<head")
+}
+
+fn summarize_html_error(body: &str) -> String {
+    let document = Document::from(body);
+    let mut parts = ["h1", "h2"]
+        .into_iter()
+        .map(|selector| collapse_whitespace(document.select(selector).first().text().as_ref()))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        let title = collapse_whitespace(document.select("title").first().text().as_ref());
+        if !title.is_empty() {
+            parts.push(title);
+        }
+    }
+    let description = if parts.is_empty() {
+        "服务器返回了 HTML 错误页".to_string()
     } else {
-        truncated
+        parts.join(" · ")
+    };
+    let prefix = if body.to_ascii_lowercase().contains("cloudflare") {
+        "Cloudflare 拒绝了请求"
+    } else {
+        "HTML 错误页"
+    };
+    truncate_error_summary(&format!("{prefix}：{description}"))
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_error_summary(text: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let mut chars = text.chars();
+    let prefix = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
     }
 }
 
@@ -1647,6 +1726,24 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarizes_structured_and_html_error_bodies() {
+        let json = r#"{"error":{"message":"Invalid API key","code":"invalid_api_key"}}"#;
+        assert_eq!(
+            summarize_error_body(json),
+            "Invalid API key（代码：invalid_api_key）"
+        );
+
+        let html = r"<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1><h2>You are unable to access mengying.eu.org</h2><script>ignored</script></body></html>";
+        let summary = summarize_error_body(html);
+        assert_eq!(
+            summary,
+            "Cloudflare 拒绝了请求：Sorry, you have been blocked · You are unable to access mengying.eu.org"
+        );
+        assert!(!summary.contains("<html>"));
+        assert!(!summary.contains("ignored"));
+    }
 
     #[test]
     fn maps_only_known_chat_finish_reasons() {

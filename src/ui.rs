@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, Read as _, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,9 +46,11 @@ const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
 const MIN_TERMINAL_HEIGHT: u16 = 10;
 const INPUT_PREFIX_WIDTH: u16 = 2;
+const INPUT_FOOTER_GAP: u16 = 1;
 const INPUT_PLACEHOLDER: &str = "描述任务，或输入 / 查看命令";
 const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
+const MAX_QUEUED_SUBMISSIONS: usize = 8;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
 const PREVIEW_LINE_CHARS: usize = 240;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
@@ -55,6 +58,7 @@ const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
 const X11_CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(500);
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(1);
 // Match Codex's terminal-native palette: inherit the configured foreground/background and use
 // ANSI semantic colors so accents remain legible across terminal themes.
 const THEME_BASE: Color = Color::Reset;
@@ -182,6 +186,9 @@ pub fn run_interactive(
     let mut last_frame = now.checked_sub(FRAME_INTERVAL).unwrap_or(now);
     let mut needs_draw = true;
     'ui: loop {
+        if state.expire_quit_shortcut() {
+            needs_draw = true;
+        }
         while let Ok(agent_event) = event_rx.try_recv() {
             needs_draw = true;
             state.apply_agent_event(agent_event);
@@ -199,6 +206,21 @@ pub fn run_interactive(
             needs_draw = true;
             state.set_pending_approval(&request);
             pending_approval = Some(request);
+        }
+        if !state.running
+            && pending_approval.is_none()
+            && let Some(queued) = state.queued_submissions.pop_front()
+        {
+            needs_draw = true;
+            start_run(
+                Arc::clone(&agent),
+                queued.prompt,
+                queued.images,
+                &event_tx,
+                approvals.clone(),
+                &mut state,
+                &mut active_cancel,
+            );
         }
 
         if needs_draw {
@@ -719,6 +741,9 @@ fn slash_input(text: &str) -> Option<(&str, Option<&str>)> {
 
 fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
     let text = state.editor.text();
+    if state.dismissed_slash_input.as_deref() == Some(text.as_str()) {
+        return Vec::new();
+    }
     let Some((name, argument)) = slash_input(&text) else {
         return Vec::new();
     };
@@ -820,6 +845,7 @@ fn complete_slash_suggestion(state: &mut UiState) -> bool {
     state.detach_input_history();
     state.editor.set_text(&suggestion.replacement);
     state.slash_selection = 0;
+    state.dismissed_slash_input = None;
     true
 }
 
@@ -836,6 +862,12 @@ fn handle_key(
     {
         state.editor.set_text("");
         return UiAction::Quit;
+    }
+
+    let is_ctrl_c = matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key.modifiers.contains(KeyModifiers::CONTROL);
+    if !is_ctrl_c {
+        state.clear_quit_shortcut();
     }
 
     if state.pending_approval.is_some() {
@@ -925,29 +957,106 @@ fn handle_key(
         return UiAction::None;
     }
 
+    if key.code == KeyCode::Esc && !slash_suggestions(state).is_empty() {
+        state.dismissed_slash_input = Some(state.editor.text());
+        state.slash_selection = 0;
+        return UiAction::None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') => {
-                if state.running {
-                    if let Some(cancel) = active_cancel {
-                        cancel.cancel();
-                        state.status = "正在取消".to_string();
-                    }
+            KeyCode::Char('c' | 'C') => {
+                if !state.editor.is_empty() || !state.pending_images.is_empty() {
+                    let draft = state.editor.content();
+                    state.record_input(draft);
+                    state.editor.clear();
+                    state.pending_images.clear();
+                    state.prepare_input_edit();
+                    state.arm_quit_shortcut();
                     return UiAction::None;
                 }
-                return UiAction::Quit;
-            }
-            KeyCode::Char('d') if state.editor.is_empty() && !state.running => {
-                return UiAction::Quit;
-            }
-            KeyCode::Char('j') => {
-                state.detach_input_history();
-                state.editor.insert('\n');
+                if state.quit_shortcut_active() {
+                    return UiAction::Quit;
+                }
+                state.arm_quit_shortcut();
+                if state.running
+                    && let Some(cancel) = active_cancel
+                {
+                    cancel.cancel();
+                    state.status = "正在取消".to_string();
+                }
                 return UiAction::None;
             }
+            KeyCode::Char('d')
+                if state.editor.is_empty() && state.pending_images.is_empty() && !state.running =>
+            {
+                return UiAction::Quit;
+            }
+            KeyCode::Char('a') => state.editor.move_home(),
+            KeyCode::Char('b') => state.editor.move_left(),
+            KeyCode::Char('e') => state.editor.move_end(),
+            KeyCode::Char('f') => state.editor.move_right(),
+            KeyCode::Char('j' | 'm') => {
+                state.prepare_input_edit();
+                state.editor.insert('\n');
+            }
+            KeyCode::Char('h') => {
+                state.prepare_input_edit();
+                state.editor.backspace();
+            }
+            KeyCode::Char('k') => {
+                state.prepare_input_edit();
+                state.editor.kill_line_end();
+            }
+            KeyCode::Char('n') => state.next_input(),
+            KeyCode::Char('p') => state.previous_input(),
+            KeyCode::Char('u') => {
+                state.prepare_input_edit();
+                state.editor.kill_line_start();
+            }
             KeyCode::Char('v') => return UiAction::PasteClipboard,
-            _ => {}
+            KeyCode::Char('w') | KeyCode::Backspace => {
+                state.prepare_input_edit();
+                state.editor.delete_backward_word();
+            }
+            KeyCode::Char('y') => {
+                state.prepare_input_edit();
+                state.editor.yank();
+            }
+            KeyCode::Char('d') => {
+                state.prepare_input_edit();
+                state.editor.delete();
+            }
+            KeyCode::Left => state.editor.move_word_left(),
+            KeyCode::Right => state.editor.move_word_right(),
+            KeyCode::Delete => {
+                state.prepare_input_edit();
+                state.editor.delete_forward_word();
+            }
+            _ => return UiAction::None,
         }
+        return UiAction::None;
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Enter => {
+                state.prepare_input_edit();
+                state.editor.insert('\n');
+            }
+            KeyCode::Char('b') | KeyCode::Left => state.editor.move_word_left(),
+            KeyCode::Char('f') | KeyCode::Right => state.editor.move_word_right(),
+            KeyCode::Char('d') | KeyCode::Delete => {
+                state.prepare_input_edit();
+                state.editor.delete_forward_word();
+            }
+            KeyCode::Backspace => {
+                state.prepare_input_edit();
+                state.editor.delete_backward_word();
+            }
+            _ => return UiAction::None,
+        }
+        return UiAction::None;
     }
 
     let suggestions = slash_suggestions(state);
@@ -987,24 +1096,23 @@ fn handle_key(
                 state.status = "正在取消".to_string();
             }
         }
-        KeyCode::Enter
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                || key.modifiers.contains(KeyModifiers::ALT) =>
-        {
-            state.detach_input_history();
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.prepare_input_edit();
             state.editor.insert('\n');
         }
         KeyCode::Enter if !state.running => {
             return submit_editor(state);
         }
+        KeyCode::Enter => queue_editor(state),
+        KeyCode::Tab if state.running => queue_editor(state),
+        KeyCode::Tab => return submit_editor(state),
         KeyCode::Char(character)
             if !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            state.detach_input_history();
+            state.prepare_input_edit();
             state.editor.insert(character);
-            state.slash_selection = 0;
         }
         KeyCode::Backspace => {
             if state.editor.is_empty() {
@@ -1012,15 +1120,15 @@ fn handle_key(
                     state.status = attachment_status(state.pending_images.len());
                 }
             } else {
-                state.detach_input_history();
+                state.prepare_input_edit();
                 state.editor.backspace();
             }
             state.slash_selection = 0;
+            state.dismissed_slash_input = None;
         }
         KeyCode::Delete => {
-            state.detach_input_history();
+            state.prepare_input_edit();
             state.editor.delete();
-            state.slash_selection = 0;
         }
         KeyCode::Left => state.editor.move_left(),
         KeyCode::Right => state.editor.move_right(),
@@ -1033,8 +1141,29 @@ fn handle_key(
     UiAction::None
 }
 
+fn queue_editor(state: &mut UiState) {
+    if state.queued_submissions.len() >= MAX_QUEUED_SUBMISSIONS {
+        state.push_error("最多排队 8 条消息。");
+        return;
+    }
+    let prompt = state.editor.content();
+    if prompt.trim().is_empty() || prompt.trim_start().starts_with('/') {
+        return;
+    }
+    let prompt = state.editor.take();
+    state.record_input(prompt.clone());
+    let images = state.take_pending_images();
+    state
+        .queued_submissions
+        .push_back(QueuedSubmission { prompt, images });
+    state.slash_selection = 0;
+    state.dismissed_slash_input = None;
+}
+
 fn submit_editor(state: &mut UiState) -> UiAction {
     state.slash_selection = 0;
+    state.dismissed_slash_input = None;
+    state.clear_quit_shortcut();
     let prompt = state.editor.take();
     if prompt.trim().is_empty() {
         return UiAction::None;
@@ -1258,6 +1387,7 @@ fn paste_text_or_image(state: &mut UiState, text: &str) {
         state.editor.insert_paste(text);
     }
     state.slash_selection = 0;
+    state.dismissed_slash_input = None;
 }
 
 fn pasted_image_path(text: &str) -> Option<PathBuf> {
@@ -1303,7 +1433,7 @@ fn parse_web_search_mode(value: &str) -> Option<WebSearchMode> {
         .find(|mode| mode.as_str().eq_ignore_ascii_case(value))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum EditorItem {
     Character(char),
     Paste { content: String, label: String },
@@ -1313,6 +1443,7 @@ enum EditorItem {
 struct Editor {
     items: Vec<EditorItem>,
     cursor: usize,
+    kill_buffer: Vec<EditorItem>,
 }
 
 impl Editor {
@@ -1365,12 +1496,35 @@ impl Editor {
         }
     }
 
+    fn clear(&mut self) {
+        self.items.clear();
+        self.cursor = 0;
+    }
+
     fn move_left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
     fn move_right(&mut self) {
         self.cursor = (self.cursor + 1).min(self.items.len());
+    }
+
+    fn move_word_left(&mut self) {
+        while self.cursor > 0 && Self::is_whitespace(&self.items[self.cursor - 1]) {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0 && !Self::is_whitespace(&self.items[self.cursor - 1]) {
+            self.cursor -= 1;
+        }
+    }
+
+    fn move_word_right(&mut self) {
+        while self.cursor < self.items.len() && Self::is_whitespace(&self.items[self.cursor]) {
+            self.cursor += 1;
+        }
+        while self.cursor < self.items.len() && !Self::is_whitespace(&self.items[self.cursor]) {
+            self.cursor += 1;
+        }
     }
 
     fn move_home(&mut self) {
@@ -1385,6 +1539,65 @@ impl Editor {
             .iter()
             .position(|item| matches!(item, EditorItem::Character('\n')))
             .map_or(self.items.len(), |index| self.cursor + index);
+    }
+
+    fn delete_backward_word(&mut self) {
+        let end = self.cursor;
+        self.move_word_left();
+        self.kill_range(self.cursor, end);
+    }
+
+    fn delete_forward_word(&mut self) {
+        let start = self.cursor;
+        self.move_word_right();
+        let end = self.cursor;
+        self.cursor = start;
+        self.kill_range(start, end);
+    }
+
+    fn kill_line_start(&mut self) {
+        let end = self.cursor;
+        self.move_home();
+        self.kill_range(self.cursor, end);
+    }
+
+    fn kill_line_end(&mut self) {
+        let start = self.cursor;
+        self.move_end();
+        let mut end = self.cursor;
+        if end == start
+            && self
+                .items
+                .get(end)
+                .is_some_and(|item| matches!(item, EditorItem::Character('\n')))
+        {
+            end += 1;
+        }
+        self.cursor = start;
+        self.kill_range(start, end);
+    }
+
+    fn yank(&mut self) {
+        if self.kill_buffer.is_empty() {
+            return;
+        }
+        let count = self.kill_buffer.len();
+        self.items
+            .splice(self.cursor..self.cursor, self.kill_buffer.clone());
+        self.cursor += count;
+    }
+
+    fn kill_range(&mut self, start: usize, end: usize) {
+        if start >= end || end > self.items.len() {
+            self.cursor = start.min(self.items.len());
+            return;
+        }
+        self.kill_buffer = self.items.drain(start..end).collect();
+        self.cursor = start;
+    }
+
+    fn is_whitespace(item: &EditorItem) -> bool {
+        matches!(item, EditorItem::Character(character) if character.is_whitespace())
     }
 
     fn is_empty(&self) -> bool {
@@ -1515,6 +1728,12 @@ struct ViewMessage {
 }
 
 #[derive(Debug)]
+struct QueuedSubmission {
+    prompt: String,
+    images: Vec<ImageAttachment>,
+}
+
+#[derive(Debug)]
 struct ApprovalView {
     name: String,
     arguments: String,
@@ -1595,7 +1814,9 @@ struct UiState {
     usage_estimated: bool,
     delete_confirmation: DeleteConfirmation,
     pending_images: Vec<ImageAttachment>,
+    queued_submissions: VecDeque<QueuedSubmission>,
     slash_selection: usize,
+    dismissed_slash_input: Option<String>,
     input_history: Vec<String>,
     input_history_index: Option<usize>,
     input_history_draft: Option<String>,
@@ -1607,6 +1828,7 @@ struct UiState {
     mcp_server_count: usize,
     mcp_tool_count: usize,
     pending_approval: Option<ApprovalView>,
+    quit_shortcut_expires_at: Option<Instant>,
     show_welcome: bool,
     x11_clipboard: Option<X11Clipboard>,
 }
@@ -1639,7 +1861,9 @@ impl UiState {
             usage_estimated: false,
             delete_confirmation: DeleteConfirmation::None,
             pending_images: Vec::new(),
+            queued_submissions: VecDeque::new(),
             slash_selection: 0,
+            dismissed_slash_input: None,
             input_history: Vec::new(),
             input_history_index: None,
             input_history_draft: None,
@@ -1651,6 +1875,7 @@ impl UiState {
             mcp_server_count: 0,
             mcp_tool_count: 0,
             pending_approval: None,
+            quit_shortcut_expires_at: None,
             show_welcome: true,
             x11_clipboard: None,
         }
@@ -1676,6 +1901,7 @@ impl UiState {
     }
 
     fn begin_run(&mut self, status: impl Into<String>) {
+        self.quit_shortcut_expires_at = None;
         if !self.running {
             self.run_elapsed_before_pause = Duration::ZERO;
             self.run_started_at = Some(Instant::now());
@@ -1709,8 +1935,17 @@ impl UiState {
         if !self.running || self.pending_approval.is_some() {
             return None;
         }
-        self.reasoning_activity()
-            .or_else(|| (!self.status.is_empty()).then(|| self.status.clone()))
+        let activity = self
+            .reasoning_activity()
+            .or_else(|| (!self.status.is_empty()).then(|| self.status.clone()))?;
+        if self.queued_submissions.is_empty() {
+            Some(activity)
+        } else {
+            Some(format!(
+                "{activity} · 已排队 {}",
+                self.queued_submissions.len()
+            ))
+        }
     }
 
     fn push_history(&mut self, message: ChatMessage) {
@@ -1839,7 +2074,7 @@ impl UiState {
         self.messages.push(ViewMessage {
             role: ViewRole::Error,
             title: "错误".to_string(),
-            content: sanitize_terminal_text(content.as_ref()),
+            content: truncate_error_for_ui(&sanitize_terminal_text(content.as_ref())),
             reasoning: String::new(),
             tool_arguments: None,
             tool_id: None,
@@ -1879,7 +2114,10 @@ impl UiState {
         self.status = "就绪".to_string();
         self.delete_confirmation = DeleteConfirmation::None;
         self.pending_images.clear();
+        self.queued_submissions.clear();
+        self.dismissed_slash_input = None;
         self.pending_approval = None;
+        self.quit_shortcut_expires_at = None;
         self.show_welcome = true;
         self.input_history.clear();
         self.detach_input_history();
@@ -1892,6 +2130,31 @@ impl UiState {
         self.generation_start = None;
         self.delete_confirmation = DeleteConfirmation::None;
         self.reset_reasoning_summary();
+    }
+
+    fn arm_quit_shortcut(&mut self) {
+        self.quit_shortcut_expires_at = Instant::now().checked_add(QUIT_SHORTCUT_TIMEOUT);
+    }
+
+    fn quit_shortcut_active(&self) -> bool {
+        self.quit_shortcut_expires_at
+            .is_some_and(|expires_at| Instant::now() < expires_at)
+    }
+
+    fn clear_quit_shortcut(&mut self) {
+        self.quit_shortcut_expires_at = None;
+    }
+
+    fn expire_quit_shortcut(&mut self) -> bool {
+        if self
+            .quit_shortcut_expires_at
+            .is_some_and(|expires_at| Instant::now() >= expires_at)
+        {
+            self.quit_shortcut_expires_at = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn hold_pending_tools(&mut self, tool_ids: &[String]) {
@@ -1993,6 +2256,7 @@ impl UiState {
         self.input_history_index = Some(index);
         self.editor.set_text(&self.input_history[index]);
         self.slash_selection = 0;
+        self.dismissed_slash_input = None;
     }
 
     fn next_input(&mut self) {
@@ -2009,11 +2273,18 @@ impl UiState {
                 .set_text(&self.input_history_draft.take().unwrap_or_default());
         }
         self.slash_selection = 0;
+        self.dismissed_slash_input = None;
     }
 
     fn detach_input_history(&mut self) {
         self.input_history_index = None;
         self.input_history_draft = None;
+    }
+
+    fn prepare_input_edit(&mut self) {
+        self.detach_input_history();
+        self.slash_selection = 0;
+        self.dismissed_slash_input = None;
     }
 
     fn model_list_notice(&self) -> String {
@@ -2405,7 +2676,7 @@ impl UiState {
                 self.messages.push(ViewMessage {
                     role: ViewRole::Error,
                     title: "错误".to_string(),
-                    content: sanitize_terminal_text(&message),
+                    content: truncate_error_for_ui(&sanitize_terminal_text(&message)),
                     reasoning: String::new(),
                     tool_arguments: None,
                     tool_id: None,
@@ -2529,6 +2800,7 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
             Constraint::Length(heights.suggestions),
             Constraint::Length(heights.activity),
             Constraint::Length(heights.input),
+            Constraint::Length(INPUT_FOOTER_GAP),
             Constraint::Length(1),
         ])
         .split(area);
@@ -2536,7 +2808,7 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     render_slash_suggestions(frame, state, areas[1]);
     render_activity_status(frame, state, areas[2]);
     render_input(frame, state, areas[3]);
-    render_footer(frame, state, areas[4]);
+    render_footer(frame, state, areas[5]);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2570,6 +2842,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
     let reserved_height = 3_u16
         .saturating_add(activity)
         .saturating_add(input)
+        .saturating_add(INPUT_FOOTER_GAP)
         .saturating_add(1);
     let suggestions = u16::try_from(suggestion_count)
         .unwrap_or(u16::MAX)
@@ -2579,6 +2852,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
         .saturating_sub(suggestions)
         .saturating_sub(activity)
         .saturating_sub(input)
+        .saturating_sub(INPUT_FOOTER_GAP)
         .saturating_sub(1);
     UiSectionHeights {
         conversation,
@@ -3021,6 +3295,14 @@ fn approval_option_line(
 }
 
 fn footer_line(state: &UiState, width: usize) -> Line<'static> {
+    if state.quit_shortcut_active() {
+        return Line::from(Span::styled(
+            truncate_width("再按 Ctrl+C 退出", width),
+            Style::default()
+                .fg(THEME_YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let estimate = if state.usage_estimated { "~" } else { "" };
     let context_full = format!(
         "{estimate}{}/{} ({}%)",
@@ -4130,6 +4412,35 @@ fn truncate_for_ui(text: &str) -> String {
     }
 }
 
+fn truncate_error_for_ui(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    const MAX_LINES: usize = 3;
+    let mut output = String::new();
+    let mut truncated = false;
+    let mut remaining = MAX_CHARS;
+    let mut lines = text.lines();
+    for (index, line) in lines.by_ref().take(MAX_LINES).enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let prefix = line.chars().take(remaining).collect::<String>();
+        let count = prefix.chars().count();
+        output.push_str(&prefix);
+        remaining = remaining.saturating_sub(count);
+        if count < line.chars().count() || remaining == 0 {
+            truncated = true;
+            break;
+        }
+    }
+    if lines.next().is_some() {
+        truncated = true;
+    }
+    if truncated {
+        output.push_str("\n…");
+    }
+    output
+}
+
 fn trim_live_tool_output(text: &mut String) {
     const LIMIT: usize = 4_000;
     let count = text.chars().count();
@@ -4241,6 +4552,110 @@ mod tests {
     }
 
     #[test]
+    fn supports_codex_style_editor_shortcuts_and_yank() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.editor.insert_str("alpha beta");
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "alpha ");
+        handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "alpha beta");
+        handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut state,
+            None,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            &mut state,
+            None,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &mut state,
+            None,
+        );
+        assert_eq!(state.editor.text(), "alpha");
+    }
+
+    #[test]
+    fn prioritizes_popup_dismissal_and_queues_follow_up_input() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.running = true;
+        state.editor.insert('/');
+        let cancel = CancellationToken::new();
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            Some(&cancel),
+        );
+        assert!(!cancel.is_cancelled());
+        assert!(slash_suggestions(&state).is_empty());
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            Some(&cancel),
+        );
+        assert!(cancel.is_cancelled());
+
+        state.running = true;
+        state.editor.set_text("follow up");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert!(state.editor.is_empty());
+        assert_eq!(state.queued_submissions.len(), 1);
+        assert_eq!(
+            state.queued_submissions.front().unwrap().prompt,
+            "follow up"
+        );
+        assert!(state.activity_label().unwrap().contains("已排队 1"));
+
+        state.running = false;
+        state.editor.set_text("draft");
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut state,
+                None,
+            ),
+            UiAction::None
+        ));
+        assert!(state.editor.is_empty());
+        assert_eq!(
+            state.input_history.last().map(String::as_str),
+            Some("draft")
+        );
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut state,
+                None,
+            ),
+            UiAction::Quit
+        ));
+    }
+
+    #[test]
     fn slash_exit_quits_immediately_while_an_agent_is_running() {
         let mut state = UiState::new(
             "model".to_string(),
@@ -4294,6 +4709,37 @@ mod tests {
         assert!(completed.contains("已完成"));
         assert!(completed.contains("5m 22s"));
         assert_eq!(format_elapsed_compact(3_723), "1h 02m 03s");
+    }
+
+    #[test]
+    fn keeps_a_large_error_and_failure_status_in_the_current_view() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_user("你是？".to_string(), &[]);
+        state.begin_run("处理中");
+        state.apply_agent_event(AgentEvent::Error {
+            message: "Cloudflare error body ".repeat(100),
+        });
+        let error = state
+            .messages
+            .iter()
+            .find(|message| message.role == ViewRole::Error)
+            .unwrap();
+        assert!(error.content.chars().count() <= 242);
+        assert!(error.content.ends_with('…'));
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let rendered = rendered_terminal(&terminal);
+        // Wide CJK glyphs occupy two backend cells, so inspect their leading cells here.
+        assert!(rendered.contains('错'));
+        assert!(rendered.contains('失'));
+        assert!(rendered.contains('…'));
     }
 
     #[test]
@@ -4446,7 +4892,14 @@ mod tests {
             .enumerate()
             .find_map(|(index, cell)| (cell.symbol() == ">").then_some(index / 80))
             .unwrap();
+        let footer_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "上").then_some(index / 80))
+            .unwrap();
         assert!(input_y.saturating_sub(message_y) <= 2);
+        assert_eq!(footer_y.saturating_sub(input_y), 2);
         assert!(message_y > 0);
     }
 
