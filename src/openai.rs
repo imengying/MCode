@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::config::{ApiProtocol, ModelCompat, WebSearchMode, WebSearchSettings};
+use crate::config::{ApiProtocol, ModelCompat};
 use crate::event::AgentEvent;
 use crate::protocol::{
     ChatMessage, FunctionCall, MessageRole, ToolCall, ToolDefinition, Usage, WebSearchAction,
@@ -70,6 +70,7 @@ pub type Result<T> = std::result::Result<T, OpenAiError>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiModelConfig {
+    pub provider: String,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
@@ -83,13 +84,13 @@ pub(crate) struct OpenAiModelConfig {
 pub struct OpenAiClient {
     http: Client,
     endpoint: Url,
+    provider: String,
     api_key: Option<String>,
     model: String,
     api: ApiProtocol,
     max_output_tokens: Option<u64>,
     reasoning_effort: Option<String>,
     compat: ModelCompat,
-    web_search: WebSearchSettings,
     idle_timeout: Duration,
 }
 
@@ -111,23 +112,19 @@ pub enum AssistantStopReason {
 }
 
 impl OpenAiClient {
-    pub(crate) fn new(
-        config: OpenAiModelConfig,
-        web_search: WebSearchSettings,
-        timeout: Duration,
-    ) -> Result<Self> {
+    pub(crate) fn new(config: OpenAiModelConfig, timeout: Duration) -> Result<Self> {
         let endpoint = api_endpoint_url(&config.base_url, config.api)?;
         let http = build_http_client(&endpoint, timeout)?;
         Ok(Self {
             http,
             endpoint,
+            provider: config.provider,
             api_key: config.api_key,
             model: config.model,
             api: config.api,
             max_output_tokens: config.max_output_tokens,
             reasoning_effort: config.reasoning_effort,
             compat: config.compat,
-            web_search,
             idle_timeout: timeout,
         })
     }
@@ -156,6 +153,7 @@ impl OpenAiClient {
         let endpoint = api_endpoint_url(&config.base_url, config.api)?;
         self.http = build_http_client(&endpoint, self.idle_timeout)?;
         self.endpoint = endpoint;
+        self.provider = config.provider;
         self.api_key = config.api_key;
         self.model = config.model;
         self.api = config.api;
@@ -173,15 +171,6 @@ impl OpenAiClient {
     #[must_use]
     pub(crate) fn reasoning_effort(&self) -> Option<&str> {
         self.reasoning_effort.as_deref()
-    }
-
-    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) {
-        self.web_search.mode = mode;
-    }
-
-    #[must_use]
-    pub const fn web_search_mode(&self) -> WebSearchMode {
-        self.web_search.mode
     }
 
     async fn send_stream_request<T: Serialize + Sync + ?Sized>(
@@ -286,7 +275,7 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
-        allow_hosted_web_search: bool,
+        allow_native_web_search: bool,
     ) -> Result<AssistantTurn> {
         for attempt in 0..MAX_STREAM_ATTEMPTS {
             let result = self
@@ -296,7 +285,7 @@ impl OpenAiClient {
                     events,
                     cancel,
                     max_tokens,
-                    allow_hosted_web_search,
+                    allow_native_web_search,
                 )
                 .await;
             match result {
@@ -324,7 +313,7 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
-        allow_hosted_web_search: bool,
+        allow_native_web_search: bool,
     ) -> Result<AssistantTurn> {
         let mut api_tools = tools.to_vec();
         if !self.compat.strict_tools {
@@ -340,19 +329,22 @@ impl OpenAiClient {
                     events,
                     cancel,
                     max_tokens,
-                    allow_hosted_web_search,
+                    allow_native_web_search,
                 )
                 .await;
         }
         let api_messages: Vec<ApiMessage<'_>> = messages.iter().map(ApiMessage::from).collect();
+        let chat_tools = chat_tools(&api_tools, &self.provider, allow_native_web_search)?;
+        let kimi_web_search = allow_native_web_search && self.provider == "kimi";
         let body = ChatRequest {
             model: &self.model,
             messages: &api_messages,
-            tools: &api_tools,
+            tools: &chat_tools,
             reasoning_effort: self
                 .reasoning_effort
                 .as_deref()
-                .filter(|_| self.compat.reasoning_effort),
+                .filter(|_| self.compat.reasoning_effort && !kimi_web_search),
+            thinking: kimi_web_search.then_some(ChatThinking { kind: "disabled" }),
             max_tokens,
             stream: true,
             stream_options: self.compat.usage_in_streaming.then_some(StreamOptions {
@@ -365,12 +357,8 @@ impl OpenAiClient {
 
         let mut bytes = response.bytes_stream();
         let mut decoder = SseDecoder::default();
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls = BTreeMap::<usize, ToolCallBuilder>::new();
-        let mut usage = None;
+        let mut state = ChatAccumulator::default();
         let mut done = false;
-        let mut finish_reason = None;
 
         while !done {
             let chunk = tokio::select! {
@@ -390,16 +378,8 @@ impl OpenAiClient {
                     done = true;
                     break;
                 }
-                apply_stream_chunk(
-                    &data,
-                    &mut content,
-                    &mut reasoning,
-                    &mut tool_calls,
-                    &mut usage,
-                    &mut finish_reason,
-                    events,
-                )
-                .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
+                apply_stream_chunk(&data, &mut state, events)
+                    .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
             }
         }
 
@@ -408,26 +388,28 @@ impl OpenAiClient {
             .map_err(|error| attach_request_id(error, request_id.as_deref()))?
         {
             if data.trim() != "[DONE]" {
-                apply_stream_chunk(
-                    &data,
-                    &mut content,
-                    &mut reasoning,
-                    &mut tool_calls,
-                    &mut usage,
-                    &mut finish_reason,
-                    events,
-                )
-                .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
+                apply_stream_chunk(&data, &mut state, events)
+                    .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
             }
         }
 
-        let tool_calls = tool_calls
+        if state.web_search_started {
+            let _ = events.send(AgentEvent::WebSearchFinished {
+                id: "glm_web_search".to_string(),
+                action: WebSearchAction::Other,
+            });
+        }
+        let citations = std::mem::take(&mut state.web_search_citations);
+        append_chat_citations(&mut state.content, citations, events);
+
+        let tool_calls = state
+            .tool_calls
             .into_values()
             .map(ToolCallBuilder::finish)
             .collect::<Result<Vec<_>>>()
             .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
         let stop_reason = resolve_chat_stop_reason(
-            finish_reason,
+            state.finish_reason,
             self.compat.finish_reason,
             !tool_calls.is_empty(),
             done,
@@ -435,11 +417,11 @@ impl OpenAiClient {
         )?;
 
         Ok(AssistantTurn {
-            content: (!content.is_empty()).then_some(content),
-            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+            content: (!state.content.is_empty()).then_some(state.content),
+            reasoning_content: (!state.reasoning.is_empty()).then_some(state.reasoning),
             tool_calls,
             response_items: Vec::new(),
-            usage,
+            usage: state.usage,
             stop_reason,
         })
     }
@@ -451,11 +433,13 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
-        allow_hosted_web_search: bool,
+        allow_native_web_search: bool,
     ) -> Result<AssistantTurn> {
         let (instructions, input) = responses_input(messages)?;
-        let response_tools =
-            responses_tools(tools, allow_hosted_web_search.then_some(&self.web_search));
+        let response_tools = responses_tools(
+            tools,
+            allow_native_web_search && matches!(self.provider.as_str(), "xai" | "deepseek"),
+        );
         let has_tools = !response_tools.is_empty();
         let body = ResponsesRequest {
             model: &self.model,
@@ -614,16 +598,7 @@ enum ResponsesTool {
         #[serde(skip_serializing_if = "Option::is_none")]
         strict: Option<bool>,
     },
-    WebSearch {
-        external_web_access: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        filters: Option<ResponsesWebSearchFilters>,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesWebSearchFilters {
-    allowed_domains: Vec<String>,
+    WebSearch,
 }
 
 fn responses_input(messages: &[ChatMessage]) -> Result<(String, Vec<serde_json::Value>)> {
@@ -698,10 +673,7 @@ fn responses_input(messages: &[ChatMessage]) -> Result<(String, Vec<serde_json::
     Ok((instructions.join("\n\n"), input))
 }
 
-fn responses_tools(
-    definitions: &[ToolDefinition],
-    web_search: Option<&WebSearchSettings>,
-) -> Vec<ResponsesTool> {
+fn responses_tools(definitions: &[ToolDefinition], include_web_search: bool) -> Vec<ResponsesTool> {
     let mut tools = definitions
         .iter()
         .map(|definition| ResponsesTool::Function {
@@ -711,22 +683,38 @@ fn responses_tools(
             strict: definition.function.strict,
         })
         .collect::<Vec<_>>();
-    let Some(settings) = web_search.filter(|settings| settings.mode.is_enabled()) else {
-        return tools;
-    };
-    let external_web_access = match settings.mode {
-        WebSearchMode::Disabled => return tools,
-        WebSearchMode::Cached => false,
-        WebSearchMode::Live => true,
-    };
-    let allowed_domains = settings.allowed_domains.clone();
-    let filters =
-        (!allowed_domains.is_empty()).then_some(ResponsesWebSearchFilters { allowed_domains });
-    tools.push(ResponsesTool::WebSearch {
-        external_web_access,
-        filters,
-    });
+    if include_web_search {
+        tools.push(ResponsesTool::WebSearch);
+    }
     tools
+}
+
+fn chat_tools(
+    definitions: &[ToolDefinition],
+    provider: &str,
+    include_web_search: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let mut tools = definitions
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if include_web_search {
+        match provider {
+            "glm" => tools.push(serde_json::json!({
+                "type": "web_search",
+                "web_search": {
+                    "enable": true,
+                    "search_result": true
+                }
+            })),
+            "kimi" => tools.push(serde_json::json!({
+                "type": "builtin_function",
+                "function": {"name": "$web_search"}
+            })),
+            _ => {}
+        }
+    }
+    Ok(tools)
 }
 
 #[derive(Debug, Default)]
@@ -1253,15 +1241,23 @@ fn stream_transport_error(error: &reqwest::Error, request_id: Option<&str>) -> O
 struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ApiMessage<'a>],
-    #[serde(skip_serializing_if = "<[ToolDefinition]>::is_empty")]
-    tools: &'a [ToolDefinition],
+    #[serde(skip_serializing_if = "<[serde_json::Value]>::is_empty")]
+    tools: &'a [serde_json::Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ChatThinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatThinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1278,6 +1274,8 @@ struct ApiMessage<'a> {
     tool_calls: &'a [ToolCall],
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
 }
@@ -1322,6 +1320,7 @@ impl<'a> From<&'a ChatMessage> for ApiMessage<'a> {
             content,
             tool_calls: &message.tool_calls,
             tool_call_id: message.tool_call_id.as_deref(),
+            name: message.tool_name.as_deref(),
             reasoning_content: message.reasoning_content.as_deref(),
         }
     }
@@ -1331,8 +1330,29 @@ impl<'a> From<&'a ChatMessage> for ApiMessage<'a> {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    web_search: Vec<ChatWebSearchResult>,
     usage: Option<ChatUsage>,
     error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatWebSearchResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default, alias = "url")]
+    link: String,
+}
+
+#[derive(Debug, Default)]
+struct ChatAccumulator {
+    content: String,
+    reasoning: String,
+    tool_calls: BTreeMap<usize, ToolCallBuilder>,
+    web_search_citations: Vec<(String, String)>,
+    web_search_started: bool,
+    usage: Option<Usage>,
+    finish_reason: Option<AssistantStopReason>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1387,6 +1407,8 @@ struct StreamDelta {
 struct ToolCallDelta {
     index: usize,
     id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
     function: Option<FunctionDelta>,
 }
 
@@ -1399,6 +1421,7 @@ struct FunctionDelta {
 #[derive(Debug, Default)]
 struct ToolCallBuilder {
     id: String,
+    kind: String,
     name: String,
     arguments: String,
 }
@@ -1407,6 +1430,9 @@ impl ToolCallBuilder {
     fn apply(&mut self, delta: ToolCallDelta) {
         if let Some(id) = delta.id {
             self.id.push_str(&id);
+        }
+        if let Some(kind) = delta.kind {
+            self.kind.push_str(&kind);
         }
         if let Some(function) = delta.function {
             if let Some(name) = function.name {
@@ -1432,7 +1458,11 @@ impl ToolCallBuilder {
         }
         Ok(ToolCall {
             id: self.id,
-            kind: "function".to_string(),
+            kind: if self.kind.is_empty() {
+                "function".to_string()
+            } else {
+                self.kind
+            },
             function: FunctionCall {
                 name: self.name,
                 arguments: self.arguments,
@@ -1443,11 +1473,7 @@ impl ToolCallBuilder {
 
 fn apply_stream_chunk(
     data: &str,
-    content: &mut String,
-    reasoning: &mut String,
-    tool_calls: &mut BTreeMap<usize, ToolCallBuilder>,
-    usage: &mut Option<Usage>,
-    finish_reason: &mut Option<AssistantStopReason>,
+    state: &mut ChatAccumulator,
     events: &mpsc::UnboundedSender<AgentEvent>,
 ) -> Result<()> {
     let chunk: StreamChunk = serde_json::from_str(data)
@@ -1458,30 +1484,74 @@ fn apply_stream_chunk(
         )));
     }
     if let Some(next_usage) = chunk.usage {
-        *usage = Some(next_usage.into());
+        state.usage = Some(next_usage.into());
+    }
+    for result in chunk.web_search {
+        if result.link.trim().is_empty() {
+            continue;
+        }
+        if !state.web_search_started {
+            state.web_search_started = true;
+            let _ = events.send(AgentEvent::WebSearchStarted {
+                id: "glm_web_search".to_string(),
+            });
+        }
+        let title = if result.title.trim().is_empty() {
+            result.link.clone()
+        } else {
+            result.title
+        };
+        state.web_search_citations.push((result.link, title));
     }
     for choice in chunk.choices {
         if let Some(reason) = choice.finish_reason {
             let next = map_chat_finish_reason(&reason)?;
-            if finish_reason.is_some_and(|current| current != next) {
+            if state.finish_reason.is_some_and(|current| current != next) {
                 return Err(OpenAiError::Protocol(format!(
-                    "provider returned conflicting finish reasons: {finish_reason:?} and {reason:?}"
+                    "provider returned conflicting finish reasons: {:?} and {reason:?}",
+                    state.finish_reason
                 )));
             }
-            *finish_reason = Some(next);
+            state.finish_reason = Some(next);
         }
         if let Some(text) = choice.delta.content {
-            content.push_str(&text);
+            state.content.push_str(&text);
             let _ = events.send(AgentEvent::TextDelta { text });
         }
         if let Some(text) = choice.delta.reasoning_content.or(choice.delta.reasoning) {
-            reasoning.push_str(&text);
+            state.reasoning.push_str(&text);
         }
         for delta in choice.delta.tool_calls {
-            tool_calls.entry(delta.index).or_default().apply(delta);
+            state
+                .tool_calls
+                .entry(delta.index)
+                .or_default()
+                .apply(delta);
         }
     }
     Ok(())
+}
+
+fn append_chat_citations(
+    content: &mut String,
+    citations: Vec<(String, String)>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let mut cited_urls = BTreeSet::new();
+    let sources = citations
+        .into_iter()
+        .filter(|(url, _)| cited_urls.insert(url.clone()))
+        .map(|(url, title)| {
+            let title = title.replace([']', '\n', '\r'], " ");
+            format!("- [{title}]({url})")
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return;
+    }
+    let text = format!("\n\nSources:\n{}", sources.join("\n"));
+    content.push_str(&text);
+    let _ = events.send(AgentEvent::TextDelta { text });
 }
 
 fn resolve_chat_stop_reason(
@@ -1764,6 +1834,67 @@ mod tests {
     }
 
     #[test]
+    fn builds_native_search_tools_for_supported_provider_protocols() {
+        assert_eq!(
+            serde_json::to_value(responses_tools(&[], true)).unwrap(),
+            serde_json::json!([{"type": "web_search"}])
+        );
+        assert!(responses_tools(&[], false).is_empty());
+
+        let glm = chat_tools(&[], "glm", true).unwrap();
+        assert_eq!(
+            glm,
+            vec![serde_json::json!({
+                "type": "web_search",
+                "web_search": {"enable": true, "search_result": true}
+            })]
+        );
+        let kimi = chat_tools(&[], "kimi", true).unwrap();
+        assert_eq!(
+            kimi,
+            vec![serde_json::json!({
+                "type": "builtin_function",
+                "function": {"name": "$web_search"}
+            })]
+        );
+        let messages = Vec::<ApiMessage<'_>>::new();
+        let request = ChatRequest {
+            model: "kimi-test",
+            messages: &messages,
+            tools: &kimi,
+            reasoning_effort: None,
+            thinking: Some(ChatThinking { kind: "disabled" }),
+            max_tokens: None,
+            stream: true,
+            stream_options: None,
+        };
+        let request = serde_json::to_value(request).unwrap();
+        assert_eq!(request["thinking"]["type"], "disabled");
+        assert!(request.get("reasoning_effort").is_none());
+
+        let message = ChatMessage::named_tool_with_file_change(
+            "call_search",
+            "$web_search",
+            r#"{"query":"Rust"}"#,
+            None,
+        );
+        let api_message = serde_json::to_value(ApiMessage::from(&message)).unwrap();
+        assert_eq!(api_message["name"], "$web_search");
+
+        let mut builder = ToolCallBuilder::default();
+        builder.apply(ToolCallDelta {
+            index: 0,
+            id: Some("call_search".to_string()),
+            kind: Some("builtin_function".to_string()),
+            function: Some(FunctionDelta {
+                name: Some("$web_search".to_string()),
+                arguments: Some(r#"{"query":"Rust"}"#.to_string()),
+            }),
+        });
+        assert_eq!(builder.finish().unwrap().kind, "builtin_function");
+    }
+
+    #[test]
     fn infers_chat_stop_only_when_finish_reasons_are_disabled() {
         assert_eq!(
             resolve_chat_stop_reason(None, false, false, true, None).unwrap(),
@@ -1803,22 +1934,14 @@ mod tests {
     #[test]
     fn parses_cached_tokens_from_chat_and_responses_usage() {
         let (events, _receiver) = mpsc::unbounded_channel();
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls = BTreeMap::new();
-        let mut usage = None;
-        let mut finish_reason = None;
+        let mut chat = ChatAccumulator::default();
         apply_stream_chunk(
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}"#,
-            &mut content,
-            &mut reasoning,
-            &mut tool_calls,
-            &mut usage,
-            &mut finish_reason,
+            &mut chat,
             &events,
         )
         .unwrap();
-        assert_eq!(usage.unwrap().cached_prompt_tokens, Some(80));
+        assert_eq!(chat.usage.unwrap().cached_prompt_tokens, Some(80));
 
         let mut state = ResponsesAccumulator::default();
         apply_responses_stream_event(

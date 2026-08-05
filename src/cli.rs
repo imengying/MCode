@@ -14,7 +14,7 @@ const HELP_TEMPLATE: &str = "{before-help}{about-with-newline}\
     version = crate::VERSION,
     about = "MCode，支持 Grok、DeepSeek、GLM 和 Kimi 的终端编码 Agent",
     args_conflicts_with_subcommands = true,
-    after_help = "示例：\n  mcode\n  mcode -i screenshot.png \"检查这个界面\"\n  mcode --search \"检查依赖的最新版本\"\n  mcode exec \"修复失败的测试\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode sessions\n  mcode doctor\n  mcode update\n  mcode delete <SESSION_ID>"
+    after_help = "示例：\n  mcode\n  mcode -i screenshot.png \"检查这个界面\"\n  mcode exec \"修复失败的测试\"\n  mcode resume\n  mcode resume <SESSION_ID>\n  mcode sessions\n  mcode doctor\n  mcode update\n  mcode delete <SESSION_ID>"
 )]
 pub struct Cli {
     /// 附加到初始提示词的图片。
@@ -80,10 +80,6 @@ pub struct Cli {
     /// 供应商请求超时时间（秒）。
     #[arg(long, global = true, value_name = "秒")]
     pub request_timeout: Option<u64>,
-
-    /// 为所选 API 和供应商启用实时网页搜索。
-    #[arg(long, global = true)]
-    pub search: bool,
 
     /// 无需确认即可运行 shell 和 MCP 工具，并关闭执行保护。
     #[arg(

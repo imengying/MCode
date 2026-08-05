@@ -5,7 +5,6 @@ use mcode::agent::{Agent, RunStatus};
 use mcode::approval::ApprovalGate;
 use mcode::config::{
     ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ModelCompat, ReasoningEffort,
-    WebSearchMode, WebSearchSettings,
 };
 use mcode::event::AgentEvent;
 use mcode::protocol::{ChatMessage, FunctionCall, ToolCall, Usage};
@@ -86,7 +85,6 @@ async fn executes_a_tool_and_continues_the_model_turn() {
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
-        web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
         reload_overrides: ConfigOverrides::default(),
@@ -168,7 +166,7 @@ async fn executes_a_tool_and_continues_the_model_turn() {
 }
 
 #[tokio::test]
-async fn responses_api_runs_local_tools_and_hosted_web_search() {
+async fn responses_api_runs_local_tools_and_native_web_search() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -214,7 +212,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
                     }),
                     json!({
                         "type": "response.reasoning_text.done",
-                        "text": "I should use the hosted search result."
+                        "text": "I should use the native search result."
                     }),
                     json!({
                         "type": "response.output_item.done",
@@ -223,7 +221,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
                             "id": "rs_deepseek",
                             "content": [{
                                 "type": "reasoning_text",
-                                "text": "I should use the hosted search result."
+                                "text": "I should use the native search result."
                             }],
                             "summary": []
                         }
@@ -301,10 +299,6 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
-        web_search: WebSearchSettings {
-            mode: WebSearchMode::Live,
-            ..WebSearchSettings::default()
-        },
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
         reload_overrides: ConfigOverrides::default(),
@@ -333,8 +327,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
         .iter()
         .find(|tool| tool["type"] == "web_search")
         .unwrap();
-    assert_eq!(web_tool["external_web_access"], true);
-    assert!(web_tool.get("indexed_web_access").is_none());
+    assert_eq!(web_tool.as_object().unwrap().len(), 1);
     let read_tool = requests[0]["tools"]
         .as_array()
         .unwrap()
@@ -413,7 +406,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
     assert!(!events.iter().any(|event| matches!(
         event,
         AgentEvent::ReasoningSummaryDelta { text }
-            if text.contains("hosted search result")
+            if text.contains("native search result")
     )));
     assert!(
         agent
@@ -425,7 +418,7 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
     let final_message = agent.messages().last().unwrap();
     assert_eq!(
         final_message.reasoning_content.as_deref(),
-        Some("I should use the hosted search result.")
+        Some("I should use the native search result.")
     );
     assert!(final_message.response_items.iter().any(|item| {
         item["type"] == "reasoning"
@@ -435,19 +428,36 @@ async fn responses_api_runs_local_tools_and_hosted_web_search() {
 }
 
 #[tokio::test]
-async fn chat_completions_exposes_local_web_access_tools() {
+async fn glm_chat_completions_exposes_native_web_search() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request = read_json_request(&mut stream).await;
-        write_sse_text(&mut stream, "Search tools are available.", None).await;
+        let event = json!({
+            "choices": [{
+                "delta": {"content": "Search tools are available."},
+                "finish_reason": "stop"
+            }],
+            "web_search": [{
+                "title": "Rust Programming Language",
+                "link": "https://www.rust-lang.org/"
+            }]
+        });
+        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
         request
     });
 
     let project = tempdir().unwrap();
     let mut config = basic_chat_config(project.path(), address);
-    config.web_search.mode = WebSearchMode::Live;
+    config.provider = "glm".to_string();
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -465,17 +475,31 @@ async fn chat_completions_exposes_local_web_access_tools() {
 
     assert_eq!(status, RunStatus::Completed);
     let tools = request["tools"].as_array().unwrap();
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["function"]["name"] == "web_search")
-    );
+    let web_search = tools
+        .iter()
+        .find(|tool| tool["type"] == "web_search")
+        .unwrap();
+    assert_eq!(web_search["web_search"]["enable"], true);
+    assert_eq!(web_search["web_search"]["search_result"], true);
     assert!(
         tools
             .iter()
             .any(|tool| tool["function"]["name"] == "fetch_content")
     );
-    assert!(!tools.iter().any(|tool| tool["type"] == "web_search"));
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "web_search")
+    );
+    assert!(
+        agent
+            .messages()
+            .last()
+            .and_then(|message| message.content.as_deref())
+            .is_some_and(|content| {
+                content.contains("[Rust Programming Language](https://www.rust-lang.org/)")
+            })
+    );
 }
 
 #[tokio::test]
@@ -545,7 +569,6 @@ async fn shell_tool_is_denied_without_frontend_approval() {
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
-        web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
         reload_overrides: ConfigOverrides::default(),
@@ -639,7 +662,6 @@ async fn omits_request_fields_disabled_by_pi_compat() {
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
-        web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
         reload_overrides: ConfigOverrides::default(),
@@ -1288,7 +1310,7 @@ async fn resume_replays_a_safe_read_file_tool() {
 }
 
 #[tokio::test]
-async fn delete_command_removes_only_the_selected_project_session() {
+async fn delete_command_preserves_only_nonempty_project_session_directories() {
     let home = tempdir().unwrap();
     let project = tempdir().unwrap();
     let mcode_home = home.path().join(".mcode");
@@ -1300,7 +1322,9 @@ async fn delete_command_removes_only_the_selected_project_session() {
         Session::create_in(&base, project.path(), test_session_metadata("test-model")).unwrap();
     let selected_path = selected.path().unwrap().to_path_buf();
     let remaining_path = remaining.path().unwrap().to_path_buf();
+    let project_session_directory = selected_path.parent().unwrap().to_path_buf();
     let selected_id = selected.id();
+    let remaining_id = remaining.id();
 
     let listed = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcode"))
         .arg("sessions")
@@ -1336,7 +1360,13 @@ async fn delete_command_removes_only_the_selected_project_session() {
     );
     assert!(!selected_path.exists());
     assert!(remaining_path.exists());
+    assert!(project_session_directory.exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains(&selected_id.to_string()));
+
+    drop(remaining);
+    Session::delete_in(&base, project.path(), &remaining_id.to_string()).unwrap();
+    assert!(!remaining_path.exists());
+    assert!(!project_session_directory.exists());
 }
 
 fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
@@ -1356,7 +1386,6 @@ fn test_session_metadata(model: &str) -> SessionMetadata {
         model: model.to_string(),
         api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
-        web_search_mode: WebSearchMode::Disabled,
     }
 }
 
@@ -1433,7 +1462,6 @@ fn compaction_test_config(
             reserve_tokens,
             keep_recent_tokens,
         },
-        web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
         reload_overrides: ConfigOverrides::default(),
@@ -1461,7 +1489,6 @@ fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -
         cwd: project.canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
-        web_search: WebSearchSettings::default(),
         model_profiles: Vec::new(),
         mcp_servers: Vec::new(),
         reload_overrides: ConfigOverrides::default(),

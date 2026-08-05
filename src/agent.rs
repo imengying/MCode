@@ -17,13 +17,15 @@ use crate::compaction::{
 };
 use crate::config::{
     ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ModelProfile, ReasoningEffort,
-    WebSearchMode, find_model_profile, load_model_profiles,
+    find_model_profile, load_model_profiles,
 };
 use crate::event::{AgentEvent, CompactionReason};
 use crate::openai::{
     AssistantStopReason, AssistantTurn, OpenAiClient, OpenAiError, OpenAiModelConfig,
 };
-use crate::protocol::{ChatMessage, ImageAttachment, MessageRole, ToolDefinition, Usage};
+use crate::protocol::{
+    ChatMessage, FileChangeSummary, ImageAttachment, MessageRole, ToolCall, ToolDefinition, Usage,
+};
 use crate::session::{PendingToolCall, RunOutcome, Session, ToolReplayPolicy};
 use crate::tools::{McpStartupFailure, ToolRegistry};
 
@@ -31,6 +33,23 @@ use crate::tools::{McpStartupFailure, ToolRegistry};
 pub enum RunStatus {
     Completed,
     Cancelled,
+}
+
+fn tool_result_message(
+    call: &ToolCall,
+    content: String,
+    file_change: Option<FileChangeSummary>,
+) -> ChatMessage {
+    if call.function.name == "$web_search" {
+        ChatMessage::named_tool_with_file_change(
+            call.id.clone(),
+            call.function.name.clone(),
+            content,
+            file_change,
+        )
+    } else {
+        ChatMessage::tool_with_file_change(call.id.clone(), content, file_change)
+    }
 }
 
 pub struct Agent {
@@ -79,9 +98,9 @@ impl Agent {
     pub async fn new(config: &AppConfig, mut session: Session) -> Result<Self> {
         session.set_model(&config.provider, &config.model, config.api)?;
         session.set_reasoning_effort(config.reasoning_effort)?;
-        session.set_web_search_mode(config.web_search.mode)?;
         let client = OpenAiClient::new(
             OpenAiModelConfig {
+                provider: config.provider.clone(),
                 base_url: config.base_url.clone(),
                 api_key: config.api_key.clone(),
                 model: config.model.clone(),
@@ -90,16 +109,9 @@ impl Agent {
                 reasoning_effort: config.reasoning_value.clone(),
                 compat: config.compat,
             },
-            config.web_search.clone(),
             Duration::from_secs(config.request_timeout_secs),
         )?;
-        let tools = ToolRegistry::with_mcp(
-            &config.cwd,
-            &config.mcp_servers,
-            config.web_search.clone(),
-            config.api,
-        )
-        .await?;
+        let tools = ToolRegistry::with_mcp(&config.cwd, &config.mcp_servers).await?;
         let system_prompt = build_system_prompt(&config.cwd)?;
         let total_usage = session.total_usage();
         let selected_profile = config
@@ -156,7 +168,6 @@ impl Agent {
         if self.session.has_pending_run() {
             bail!("session has an unfinished run; resume it before starting another prompt");
         }
-        let _ = events.send(AgentEvent::RunStarted);
         self.auto_compaction_failed = false;
         let _ = self
             .maybe_auto_compact(CompactionReason::Threshold, events, cancel)
@@ -168,6 +179,7 @@ impl Agent {
         let run_id = self
             .session
             .begin_run(ChatMessage::user_with_images(prompt, images))?;
+        let _ = events.send(AgentEvent::RunStarted);
         let result = self.drive_run(run_id, events, cancel, approvals).await;
         self.finish_run_result(run_id, result, events)
     }
@@ -388,7 +400,7 @@ impl Agent {
                 call.function.name
             );
             self.session
-                .complete_tool(&intent, ChatMessage::tool(call.id.clone(), output.clone()))?;
+                .complete_tool(&intent, tool_result_message(&call, output.clone(), None))?;
             let _ = events.send(AgentEvent::ToolFinished {
                 id: call.id,
                 name: call.function.name,
@@ -453,7 +465,7 @@ impl Agent {
                         call.function.name
                     );
                     self.session
-                        .append(ChatMessage::tool(call.id.clone(), output.clone()))?;
+                        .append(tool_result_message(&call, output.clone(), None))?;
                     let _ = events.send(AgentEvent::ToolFinished {
                         id: call.id,
                         name: call.function.name,
@@ -492,8 +504,8 @@ impl Agent {
             };
             self.session.complete_tool(
                 &intent,
-                ChatMessage::tool_with_file_change(
-                    call.id.clone(),
+                tool_result_message(
+                    &call,
                     execution.output.clone(),
                     execution.file_change.clone(),
                 ),
@@ -835,6 +847,7 @@ impl Agent {
         let effective_effort = profile.default_reasoning_effort();
         let reasoning_value = profile.reasoning_value(effective_effort)?;
         self.client.reconfigure(OpenAiModelConfig {
+            provider: profile.provider.clone(),
             base_url: profile.base_url.clone(),
             api_key: profile.api_key.clone(),
             model: profile.id.clone(),
@@ -849,7 +862,6 @@ impl Agent {
         self.context_window = profile.context_window;
         self.max_input_tokens = profile.max_input_tokens;
         self.supports_images = profile.supports_images;
-        self.tools.set_api(self.client.api());
         let model = self.client.model().to_string();
         self.session
             .set_model(&self.provider, &model, self.client.api())?;
@@ -857,18 +869,6 @@ impl Agent {
         self.context_tokens = self.estimated_context_tokens();
         self.usage_estimated = true;
         Ok(())
-    }
-
-    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) -> Result<()> {
-        self.session.set_web_search_mode(mode)?;
-        self.client.set_web_search_mode(mode);
-        self.tools.set_web_search_mode(mode);
-        Ok(())
-    }
-
-    #[must_use]
-    pub const fn web_search_mode(&self) -> WebSearchMode {
-        self.client.web_search_mode()
     }
 
     pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
@@ -1220,7 +1220,6 @@ mod tests {
             cwd: project.path().canonicalize().unwrap(),
             request_timeout_secs: 10,
             compaction: CompactionSettings::default(),
-            web_search: crate::config::WebSearchSettings::default(),
             model_profiles: Vec::new(),
             mcp_servers: Vec::new(),
             reload_overrides: ConfigOverrides::default(),

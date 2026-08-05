@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::config::{ApiProtocol, AppConfig, ReasoningEffort, WebSearchMode, mcode_home_dir};
+use crate::config::{ApiProtocol, AppConfig, ReasoningEffort, mcode_home_dir};
 use crate::protocol::{ChatMessage, MessageRole, ToolCall, Usage};
 
 const SESSION_VERSION: u32 = 4;
@@ -25,7 +26,6 @@ pub struct SessionMetadata {
     pub model: String,
     pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
-    pub web_search_mode: WebSearchMode,
 }
 
 impl From<&AppConfig> for SessionMetadata {
@@ -35,7 +35,6 @@ impl From<&AppConfig> for SessionMetadata {
             model: config.model.clone(),
             api: config.api,
             reasoning_effort: config.reasoning_effort,
-            web_search_mode: config.web_search.mode,
         }
     }
 }
@@ -46,13 +45,37 @@ pub struct Session {
     cwd: PathBuf,
     metadata: SessionMetadata,
     created_at: u64,
+    persistence_base: Option<PathBuf>,
     path: Option<PathBuf>,
-    writer: Option<File>,
+    writer: Option<SessionWriter>,
     messages: Vec<ChatMessage>,
     context_excluded_messages: BTreeSet<usize>,
     latest_compaction: Option<CompactionCheckpoint>,
     total_usage: Usage,
     active_run: Option<ActiveRun>,
+}
+
+#[derive(Debug)]
+struct SessionWriter(File);
+
+impl Deref for SessionWriter {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SessionWriter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for SessionWriter {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,7 +139,6 @@ pub struct SessionSummary {
     pub model: String,
     pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
-    pub web_search_mode: WebSearchMode,
     pub message_count: usize,
     pub total_usage: Usage,
     pub has_pending_run: bool,
@@ -201,9 +223,6 @@ enum SessionRecord {
     ReasoningChanged {
         reasoning_effort: ReasoningEffort,
     },
-    WebSearchChanged {
-        web_search_mode: WebSearchMode,
-    },
     Compaction {
         #[serde(flatten)]
         checkpoint: CompactionCheckpoint,
@@ -215,55 +234,38 @@ impl Session {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
-        if !persist {
-            return Ok(Self {
-                id: Uuid::now_v7(),
-                cwd,
-                metadata,
-                created_at: unix_timestamp(),
-                path: None,
-                writer: None,
-                messages: Vec::new(),
-                context_excluded_messages: BTreeSet::new(),
-                latest_compaction: None,
-                total_usage: Usage::default(),
-                active_run: None,
-            });
-        }
-        let base = default_session_base()?;
-        Self::create_in(&base, &cwd, metadata)
+        let persistence_base = persist.then(default_session_base).transpose()?;
+        Ok(Self::new_pending(cwd, metadata, persistence_base))
     }
 
     pub fn create_in(base: &Path, cwd: &Path, metadata: SessionMetadata) -> Result<Self> {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
-        let id = Uuid::now_v7();
-        let created_at = unix_timestamp();
-        let directory = project_session_dir(base, &cwd);
-        create_private_directory(&directory)?;
-        let path = directory.join(rollout_filename(created_at, id)?);
-        let header = SessionRecord::Session {
-            version: SESSION_VERSION,
-            id,
-            cwd: cwd.clone(),
-            metadata: metadata.clone(),
-            created_at,
-        };
-        let writer = create_session_file(&path, &header)?;
-        Ok(Self {
-            id,
+        let mut session = Self::new_pending(cwd, metadata, Some(base.to_path_buf()));
+        session.materialize()?;
+        Ok(session)
+    }
+
+    fn new_pending(
+        cwd: PathBuf,
+        metadata: SessionMetadata,
+        persistence_base: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7(),
             cwd,
             metadata,
-            created_at,
-            path: Some(path),
-            writer: Some(writer),
+            created_at: unix_timestamp(),
+            persistence_base,
+            path: None,
+            writer: None,
             messages: Vec::new(),
             context_excluded_messages: BTreeSet::new(),
             latest_compaction: None,
             total_usage: Usage::default(),
             active_run: None,
-        })
+        }
     }
 
     pub fn resume(cwd: &Path, selector: Option<&str>) -> Result<Self> {
@@ -362,7 +364,6 @@ impl Session {
                     model: session.metadata.model,
                     api: session.metadata.api,
                     reasoning_effort: session.metadata.reasoning_effort,
-                    web_search_mode: session.metadata.web_search_mode,
                     message_count: session.messages.len(),
                     total_usage: session.total_usage,
                     has_pending_run: session.active_run.is_some(),
@@ -425,6 +426,7 @@ impl Session {
         drop(session);
         fs::remove_file(&path)
             .with_context(|| format!("failed to delete session: {}", path.display()))?;
+        remove_project_session_directory_if_empty(&directory)?;
         Ok(id)
     }
 
@@ -437,7 +439,7 @@ impl Session {
         Self::load_with_writer(path, Some(writer))
     }
 
-    fn load_with_writer(path: &Path, mut writer: Option<File>) -> Result<Self> {
+    fn load_with_writer(path: &Path, mut writer: Option<SessionWriter>) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         if bytes.is_empty() {
             bail!("session is empty: {}", path.display());
@@ -676,9 +678,6 @@ impl Session {
                 SessionRecord::ReasoningChanged {
                     reasoning_effort: next_effort,
                 } => metadata.reasoning_effort = next_effort,
-                SessionRecord::WebSearchChanged { web_search_mode } => {
-                    metadata.web_search_mode = web_search_mode;
-                }
                 SessionRecord::Compaction { checkpoint } => {
                     if checkpoint.message_count != messages.len() {
                         bail!(
@@ -723,6 +722,12 @@ impl Session {
             cwd,
             metadata,
             created_at,
+            persistence_base: Some(
+                path.parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| anyhow!("session path has no storage base: {}", path.display()))?
+                    .to_path_buf(),
+            ),
             path: Some(path.to_path_buf()),
             writer,
             messages,
@@ -817,6 +822,12 @@ impl Session {
         {
             return Ok(());
         }
+        if self.path.is_none() {
+            self.metadata.provider = provider.to_string();
+            self.metadata.model = model.to_string();
+            self.metadata.api = api;
+            return Ok(());
+        }
         self.persist_record(&SessionRecord::ModelChanged {
             provider: provider.to_string(),
             model: model.to_string(),
@@ -832,21 +843,14 @@ impl Session {
         if self.metadata.reasoning_effort == effort {
             return Ok(());
         }
+        if self.path.is_none() {
+            self.metadata.reasoning_effort = effort;
+            return Ok(());
+        }
         self.persist_record(&SessionRecord::ReasoningChanged {
             reasoning_effort: effort,
         })?;
         self.metadata.reasoning_effort = effort;
-        Ok(())
-    }
-
-    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) -> Result<()> {
-        if self.metadata.web_search_mode == mode {
-            return Ok(());
-        }
-        self.persist_record(&SessionRecord::WebSearchChanged {
-            web_search_mode: mode,
-        })?;
-        self.metadata.web_search_mode = mode;
         Ok(())
     }
 
@@ -1117,7 +1121,11 @@ impl Session {
     pub fn fresh_with_reasoning_effort(&self, reasoning_effort: ReasoningEffort) -> Result<Self> {
         let mut metadata = self.metadata.clone();
         metadata.reasoning_effort = reasoning_effort;
-        Self::create(&self.cwd, metadata, self.path.is_some())
+        Ok(Self::new_pending(
+            self.cwd.clone(),
+            metadata,
+            self.persistence_base.clone(),
+        ))
     }
 
     pub fn delete_current(&mut self) -> Result<Uuid> {
@@ -1126,11 +1134,12 @@ impl Session {
     }
 
     fn delete_current_in(&mut self, base: &Path) -> Result<Uuid> {
-        let path = self
-            .path
-            .as_ref()
-            .ok_or_else(|| anyhow!("this session is not persisted"))?
-            .clone();
+        let Some(path) = self.path.clone() else {
+            if self.persistence_base.take().is_some() {
+                return Ok(self.id);
+            }
+            bail!("this session is not persisted");
+        };
         let expected_directory = project_session_dir(base, &self.cwd);
         let actual_directory = path
             .parent()
@@ -1154,6 +1163,8 @@ impl Session {
         fs::remove_file(&path)
             .with_context(|| format!("failed to delete session: {}", path.display()))?;
         self.path = None;
+        self.persistence_base = None;
+        remove_project_session_directory_if_empty(&expected_directory)?;
         Ok(self.id)
     }
 
@@ -1243,11 +1254,6 @@ impl Session {
     }
 
     #[must_use]
-    pub const fn web_search_mode(&self) -> WebSearchMode {
-        self.metadata.web_search_mode
-    }
-
-    #[must_use]
     pub fn model_selector(&self) -> String {
         format!("{}/{}", self.provider(), self.model())
     }
@@ -1257,10 +1263,57 @@ impl Session {
         self.path.as_deref()
     }
 
-    fn persist_record(&mut self, record: &SessionRecord) -> Result<()> {
-        let Some(path) = self.path.as_deref() else {
+    pub(crate) fn persistence_path(&self) -> Result<Option<PathBuf>> {
+        if let Some(path) = &self.path {
+            return Ok(Some(path.clone()));
+        }
+        let Some(base) = self.persistence_base.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            project_session_dir(base, &self.cwd).join(rollout_filename(self.created_at, self.id)?),
+        ))
+    }
+
+    fn materialize(&mut self) -> Result<()> {
+        if self.writer.is_some() {
+            return Ok(());
+        }
+        let Some(base) = self.persistence_base.as_deref() else {
             return Ok(());
         };
+        if let Some(path) = &self.path {
+            bail!(
+                "persisted session does not hold its writer lock: {}",
+                path.display()
+            );
+        }
+
+        let directory = project_session_dir(base, &self.cwd);
+        create_private_directory(&directory)?;
+        let path = directory.join(rollout_filename(self.created_at, self.id)?);
+        let header = SessionRecord::Session {
+            version: SESSION_VERSION,
+            id: self.id,
+            cwd: self.cwd.clone(),
+            metadata: self.metadata.clone(),
+            created_at: self.created_at,
+        };
+        let writer = create_session_file(&path, &header)?;
+        self.path = Some(path);
+        self.writer = Some(writer);
+        Ok(())
+    }
+
+    fn persist_record(&mut self, record: &SessionRecord) -> Result<()> {
+        if self.persistence_base.is_none() {
+            return Ok(());
+        }
+        self.materialize()?;
+        let path = self
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow!("persisted session has no path"))?;
         let writer = self
             .writer
             .as_mut()
@@ -1277,7 +1330,7 @@ fn create_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_session_file(path: &Path, header: &SessionRecord) -> Result<File> {
+fn create_session_file(path: &Path, header: &SessionRecord) -> Result<SessionWriter> {
     let mut options = OpenOptions::new();
     options.read(true).append(true).create_new(true);
     #[cfg(unix)]
@@ -1288,10 +1341,10 @@ fn create_session_file(path: &Path, header: &SessionRecord) -> Result<File> {
     file.try_lock()
         .map_err(|error| anyhow!("failed to lock new session {}: {error}", path.display()))?;
     append_record(&mut file, path, header)?;
-    Ok(file)
+    Ok(SessionWriter(file))
 }
 
-fn open_session_writer(path: &Path) -> Result<File> {
+fn open_session_writer(path: &Path) -> Result<SessionWriter> {
     let file = OpenOptions::new()
         .read(true)
         .append(true)
@@ -1301,7 +1354,7 @@ fn open_session_writer(path: &Path) -> Result<File> {
         path: path.to_path_buf(),
         source: source.into(),
     })?;
-    Ok(file)
+    Ok(SessionWriter(file))
 }
 
 fn append_record(file: &mut File, path: &Path, record: &SessionRecord) -> Result<()> {
@@ -1353,6 +1406,26 @@ fn project_session_dir(base: &Path, cwd: &Path) -> PathBuf {
         let _ = write!(key, "{byte:02x}");
     }
     base.join(key)
+}
+
+fn remove_project_session_directory_if_empty(directory: &Path) -> Result<()> {
+    match fs::remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove empty session directory: {}",
+                directory.display()
+            )
+        }),
+    }
 }
 
 fn session_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
@@ -1440,7 +1513,7 @@ fn scan_session_candidate(path: &Path, expected_cwd: &Path) -> Result<SessionCan
                 has_messages = true;
             }
             "generation_started" | "tool_started" | "run_finished" | "model_changed"
-            | "reasoning_changed" | "web_search_changed" | "compaction" => {}
+            | "reasoning_changed" | "compaction" => {}
             "session" if !terminated => break,
             "session" => bail!(
                 "duplicate session header at {}:{line_number}",
@@ -1496,6 +1569,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistent_session_is_created_only_after_the_first_user_message() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let cwd = project.path().canonicalize().unwrap();
+        let directory = project_session_dir(base.path(), &cwd);
+        let metadata = SessionMetadata {
+            provider: "deepseek".to_string(),
+            model: "test-model".to_string(),
+            api: ApiProtocol::Responses,
+            reasoning_effort: ReasoningEffort::Low,
+        };
+
+        let blank = Session::new_pending(
+            cwd.clone(),
+            metadata.clone(),
+            Some(base.path().to_path_buf()),
+        );
+        assert!(blank.path().is_none());
+        drop(blank);
+        assert!(!directory.exists());
+
+        let mut session = Session::new_pending(cwd, metadata, Some(base.path().to_path_buf()));
+        session
+            .set_model("xai", "grok-test", ApiProtocol::Responses)
+            .unwrap();
+        session.set_reasoning_effort(ReasoningEffort::High).unwrap();
+        assert!(session.path().is_none());
+        assert!(!directory.exists());
+
+        let id = session.id();
+        session.begin_run(ChatMessage::user("hello")).unwrap();
+        assert!(session.path().is_some_and(Path::is_file));
+        drop(session);
+
+        let resumed =
+            Session::resume_in(base.path(), project.path(), Some(&id.to_string())).unwrap();
+        assert_eq!(resumed.provider(), "xai");
+        assert_eq!(resumed.model(), "grok-test");
+        assert_eq!(resumed.reasoning_effort(), ReasoningEffort::High);
+        assert_eq!(resumed.messages(), [ChatMessage::user("hello")]);
+    }
+
+    #[test]
     fn discarded_assistant_is_persisted_but_excluded_from_context() {
         let base = tempdir().unwrap();
         let project = tempdir().unwrap();
@@ -1504,7 +1620,6 @@ mod tests {
             model: "test-model".to_string(),
             api: ApiProtocol::Responses,
             reasoning_effort: ReasoningEffort::High,
-            web_search_mode: WebSearchMode::Disabled,
         };
         let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();
         let id = session.id();

@@ -1,12 +1,6 @@
 {
   "defaultProvider": "xai",
   "defaultModel": "grok-4.3",
-  "webSearch": "disabled",
-  "webSearchConfig": {
-    "provider": "auto",
-    "allowedDomains": [],
-    "trustEnvProxy": false
-  },
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,

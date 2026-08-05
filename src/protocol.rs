@@ -18,6 +18,8 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -50,6 +52,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_name: None,
             reasoning_content: None,
             images,
             response_items: Vec::new(),
@@ -78,6 +81,7 @@ impl ChatMessage {
             content,
             tool_calls,
             tool_call_id: None,
+            tool_name: None,
             reasoning_content,
             images: Vec::new(),
             response_items,
@@ -96,11 +100,31 @@ impl ChatMessage {
         content: impl Into<String>,
         file_change: Option<FileChangeSummary>,
     ) -> Self {
+        Self::tool_message(tool_call_id, None, content, file_change)
+    }
+
+    #[must_use]
+    pub fn named_tool_with_file_change(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+        file_change: Option<FileChangeSummary>,
+    ) -> Self {
+        Self::tool_message(tool_call_id, Some(tool_name.into()), content, file_change)
+    }
+
+    fn tool_message(
+        tool_call_id: impl Into<String>,
+        tool_name: Option<String>,
+        content: impl Into<String>,
+        file_change: Option<FileChangeSummary>,
+    ) -> Self {
         Self {
             role: MessageRole::Tool,
             content: Some(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            tool_name,
             reasoning_content: None,
             images: Vec::new(),
             response_items: Vec::new(),
@@ -114,6 +138,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_name: None,
             reasoning_content: None,
             images: Vec::new(),
             response_items: Vec::new(),

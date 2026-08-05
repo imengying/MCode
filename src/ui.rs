@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,7 @@ use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents, get_mi
 
 use crate::agent::{Agent, ModelChoice};
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
-use crate::config::{ApiProtocol, ReasoningEffort, WebSearchMode};
+use crate::config::{ApiProtocol, ReasoningEffort};
 use crate::event::{AgentEvent, CompactionReason};
 use crate::highlight::highlight_code;
 use crate::protocol::{
@@ -101,7 +101,10 @@ pub fn run_interactive(
     let model = agent.model().to_string();
     let endpoint = agent.endpoint().to_string();
     let cwd = agent.session().cwd().to_path_buf();
-    let mut resumable_session_id = agent.session().path().map(|_| agent.session().id());
+    let mut resume_candidate = agent
+        .session()
+        .persistence_path()?
+        .map(|path| (agent.session().id(), path));
     let has_pending_run = agent.has_pending_run();
     let pending_tool_ids = if has_pending_run {
         agent
@@ -303,19 +306,6 @@ pub fn run_interactive(
                         },
                         Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
-                    UiAction::SetWebSearch(mode) => match agent.try_lock() {
-                        Ok(mut agent) => match agent.set_web_search_mode(mode) {
-                            Ok(()) => {
-                                state.sync_from_agent(&agent);
-                                state.push_notice(format!(
-                                    "网页搜索模式已切换为 {}。",
-                                    state.web_search_mode.label_zh()
-                                ));
-                            }
-                            Err(error) => state.push_error(format!("{error:#}")),
-                        },
-                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
-                    },
                     UiAction::Compact(instructions) => {
                         start_compaction(
                             Arc::clone(&agent),
@@ -328,8 +318,10 @@ pub fn run_interactive(
                     UiAction::NewSession => match agent.try_lock() {
                         Ok(mut agent) => match agent.new_session() {
                             Ok(()) => {
-                                resumable_session_id =
-                                    agent.session().path().map(|_| agent.session().id());
+                                resume_candidate = agent
+                                    .session()
+                                    .persistence_path()?
+                                    .map(|path| (agent.session().id(), path));
                                 state.reset_session();
                                 state.sync_from_agent(&agent);
                                 clear_terminal_view(&mut terminal)?;
@@ -382,10 +374,17 @@ pub fn run_interactive(
     drop(screen);
     if let Some(id) = deleted_session {
         println!("已删除会话 {id}。");
-    } else if let Some(id) = resumable_session_id {
+    } else if let Some((id, _)) =
+        resume_candidate.filter(|(_, path)| session_path_is_resumable(path))
+    {
         println!("继续此会话：mcode resume {id}");
     }
     Ok(())
+}
+
+fn session_path_is_resumable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
 // Some PTYs do not answer cursor-position queries; retain Ratatui's last position as a fallback.
@@ -651,7 +650,6 @@ enum UiAction {
     ListModels,
     SelectModel(String),
     SetReasoning(ReasoningEffort),
-    SetWebSearch(WebSearchMode),
     Compact(String),
     NewSession,
     DeleteSession,
@@ -684,11 +682,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "effort",
         accepts_argument: true,
         description: "查看或设置 effort",
-    },
-    SlashCommand {
-        name: "search",
-        accepts_argument: true,
-        description: "查看或设置网页搜索模式",
     },
     SlashCommand {
         name: "compact",
@@ -818,15 +811,6 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                         markers.join("、")
                     },
                 }
-            })
-            .collect(),
-        "search" => WebSearchMode::ALL
-            .into_iter()
-            .filter(|mode| mode.as_str().starts_with(&query))
-            .map(|mode| SlashSuggestion {
-                label: format!("/search {mode}"),
-                replacement: format!("/search {mode}"),
-                description: mode.label_zh().to_string(),
             })
             .collect(),
         _ => Vec::new(),
@@ -1221,22 +1205,6 @@ fn submit_editor(state: &mut UiState) -> UiAction {
             ));
             UiAction::None
         }
-        "search" if argument.is_empty() => {
-            state.push_notice(format!(
-                "网页搜索：{}\n使用 /search <disabled|cached|live> 选择。",
-                state.web_search_mode.label_zh()
-            ));
-            UiAction::None
-        }
-        "search" => {
-            if let Some(mode) = parse_web_search_mode(argument) {
-                return UiAction::SetWebSearch(mode);
-            }
-            state.push_error(format!(
-                "未知的网页搜索模式 {argument:?}。可用值：disabled、cached、live。"
-            ));
-            UiAction::None
-        }
         "status" => {
             let notice = state.status_notice();
             state.push_notice(notice);
@@ -1244,7 +1212,7 @@ fn submit_editor(state: &mut UiState) -> UiAction {
         }
         "help" => {
             state.push_notice(
-                "命令：/model [ID]、/effort [级别]、/search [模式]、/compact [说明]、/status、/new、/delete、/clear、/help、/exit",
+                "命令：/model [ID]、/effort [级别]、/compact [说明]、/status、/new、/delete、/clear、/help、/exit",
             );
             UiAction::None
         }
@@ -1425,12 +1393,6 @@ fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
     ReasoningEffort::ALL
         .into_iter()
         .find(|effort| effort.as_str().eq_ignore_ascii_case(value))
-}
-
-fn parse_web_search_mode(value: &str) -> Option<WebSearchMode> {
-    WebSearchMode::ALL
-        .into_iter()
-        .find(|mode| mode.as_str().eq_ignore_ascii_case(value))
 }
 
 #[derive(Debug, Clone)]
@@ -1794,7 +1756,6 @@ struct UiState {
     api: ApiProtocol,
     reasoning_effort: ReasoningEffort,
     default_reasoning_effort: ReasoningEffort,
-    web_search_mode: WebSearchMode,
     endpoint: String,
     cwd: std::path::PathBuf,
     model_choices: Vec<ModelChoice>,
@@ -1841,7 +1802,6 @@ impl UiState {
             api: ApiProtocol::ChatCompletions,
             reasoning_effort: ReasoningEffort::Off,
             default_reasoning_effort: ReasoningEffort::Off,
-            web_search_mode: WebSearchMode::Disabled,
             endpoint,
             cwd,
             model_choices: Vec::new(),
@@ -1887,7 +1847,6 @@ impl UiState {
         self.api = agent.api();
         self.reasoning_effort = agent.reasoning_effort();
         self.default_reasoning_effort = agent.default_reasoning_effort();
-        self.web_search_mode = agent.web_search_mode();
         self.endpoint = sanitize_terminal_text(agent.endpoint());
         self.model_choices = agent.model_choices();
         self.reasoning_choices = agent.available_reasoning_efforts();
@@ -2378,10 +2337,9 @@ impl UiState {
                 )
             });
         format!(
-            "模型：{qualified_model}\nAPI：{}\neffort：{}\n网页搜索：{}\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
+            "模型：{qualified_model}\nAPI：{}\neffort：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
             self.api,
             self.reasoning_effort,
-            self.web_search_mode.label_zh(),
             format_tokens(self.context_tokens),
             format_tokens(self.max_input_tokens),
             format_tokens(self.context_window),
@@ -3894,7 +3852,9 @@ fn tool_action_title(name: &str, running: bool, failed: bool) -> String {
         "read_file" => ("正在读取文件", "已读取文件", "读取文件失败"),
         "write_file" => ("正在写入文件", "已写入文件", "写入文件失败"),
         "edit_file" => ("正在编辑文件", "已编辑文件", "编辑文件失败"),
-        "web_search" | "网页搜索" => ("正在搜索网页", "已搜索网页", "网页搜索失败"),
+        "web_search" | "$web_search" | "网页搜索" => {
+            ("正在搜索网页", "已搜索网页", "网页搜索失败")
+        }
         "fetch_content" => ("正在读取网页", "已读取网页", "读取网页失败"),
         _ => {
             return if failed {
@@ -4052,7 +4012,7 @@ fn format_tool_input(name: &str, arguments: &str) -> String {
         "read_file" | "write_file" | "edit_file" => {
             value.get("path")?.as_str().map(ToString::to_string)
         }
-        "web_search" => value
+        "web_search" | "$web_search" => value
             .get("query")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string),
@@ -4527,6 +4487,19 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn resume_hint_requires_a_nonempty_session_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+
+        assert!(!session_path_is_resumable(&path));
+        std::fs::File::create(&path).unwrap();
+        assert!(!session_path_is_resumable(&path));
+        std::fs::write(&path, "{}\n").unwrap();
+        assert!(session_path_is_resumable(&path));
+        assert!(!session_path_is_resumable(temp.path()));
     }
 
     #[test]

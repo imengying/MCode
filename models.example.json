@@ -2,7 +2,7 @@
   "providers": {
     "xai": {
       "baseUrl": "https://api.x.ai/v1",
-      "api": "openai-completions",
+      "api": "openai-responses",
       "apiKey": "$XAI_API_KEY",
       "compat": {
         "supportsReasoningEffort": true,
@@ -79,7 +79,7 @@
       "api": "openai-completions",
       "apiKey": "$MOONSHOT_API_KEY",
       "compat": {
-        "supportsReasoningEffort": true,
+        "supportsReasoningEffort": false,
         "supportsUsageInStreaming": false,
         "supportsStrictTools": false
       },
@@ -87,18 +87,10 @@
         {
           "id": "kimi-k3",
           "name": "Kimi K3",
-          "reasoning": true,
-          "default": "high",
+          "reasoning": false,
+          "default": "off",
           "contextWindow": 1000000,
-          "maxInputTokens": 1000000,
-          "thinkingLevelMap": {
-            "minimal": null,
-            "low": "low",
-            "medium": null,
-            "high": "high",
-            "xhigh": null,
-            "max": "max"
-          }
+          "maxInputTokens": 1000000
         }
       ]
     },

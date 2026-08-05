@@ -7,12 +7,12 @@ Kimi。
 
 - 交互式 TUI 与非交互 `exec`
 - `read_file`、`write_file`、`edit_file`、`shell` 内置工具
-- Responses 托管搜索，兼容端点本地 Web Search 与网页正文提取
+- 四家模型原生 Web Search 与网页正文提取
 - 图片输入、Wayland/X11 剪贴板和本地 stdio MCP
 - shell/MCP 执行审批
 - Pi 风格自动上下文压缩和溢出恢复
 - JSONL 会话、崩溃恢复、累计 token 与缓存命中统计
-- 模型、effort 和搜索模式独立切换
+- 模型与 effort 切换
 - 当前正式支持 Linux x86_64 与 ARM64
 
 ## 安装
@@ -98,7 +98,6 @@ MCode 不会把 API 密钥写入配置或会话。
 - `thinkingLevelMap`：当前推理模型可选的 effort，`default` 必须是其中的非 `null` 等级
 - `compat`：控制 reasoning effort、流式 usage、`finish_reason` 和 strict tools；仅当端点确实
   省略结束原因时将 `supportsFinishReason` 设为 `false`
-- `webSearch`：`disabled`、`cached` 或 `live`
 - `compaction`：自动压缩开关、预留 token 和最近历史预算
 - `mcpServers`：本地 stdio MCP；项目配置按服务名称逐字段合并全局配置
 
@@ -110,12 +109,12 @@ V4 Flash 与 V4 Pro 均使用 Responses API。未知 provider 会被拒绝。
 `MCODE_MAX_INPUT_TOKENS` 和 `MCODE_MAX_OUTPUT_TOKENS` 可覆盖当前选择；`--api-key-env`
 可临时指定密钥环境变量。
 
-Web Search 依 API 协议分流：
+Web Search 默认开启，不需要配置：
 
-- `openai-responses` 使用模型供应商的托管搜索，并提供 `fetch_content`。
-- `openai-completions` 提供本地 `web_search` 和 `fetch_content`。
-- 本地搜索支持 Exa 零配置 MCP、`EXA_API_KEY`、`BRAVE_API_KEY` 或
-  `SEARXNG_BASE_URL`；`provider: "auto"` 会按可用性回退。
+- Grok 与 DeepSeek 通过 Responses API 使用原生 `web_search`。
+- GLM 使用原生 `web_search`，Kimi 使用内置 `$web_search`。
+- Kimi 的 `$web_search` 要求关闭 thinking，MCode 会在搜索可用时自动处理。
+- 四家模型均可使用 `fetch_content` 读取公开网页正文。
 
 当前工作目录中的普通 UTF-8 `AGENTS.md` 会加入 system instructions，大小上限 64 KiB；不会
 读取父目录、目录项或符号链接。
@@ -128,7 +127,6 @@ Web Search 依 API 协议分流：
 mcode
 mcode "检查当前项目"
 mcode -i screenshot.png "检查这个界面"
-mcode --search "检查依赖的最新版本"
 
 # 非交互模式
 mcode exec "修复失败的测试"
@@ -156,7 +154,6 @@ TUI 命令：
 |---|---|
 | `/model [provider/model]` | 查看或切换模型 |
 | `/effort [LEVEL]` | 查看或切换思考强度 |
-| `/search [disabled\|cached\|live]` | 查看或切换网页搜索 |
 | `/compact [INSTRUCTIONS]` | 手动压缩上下文 |
 | `/status` | 显示模型、端点和 token |
 | `/new` | 新建会话 |

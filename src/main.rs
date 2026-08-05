@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use mcode::agent::{Agent, RunStatus};
 use mcode::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
 use mcode::cli::{Cli, Command, join_prompt};
-use mcode::config::{AppConfig, ConfigOverrides, McpServerConfig, WebSearchMode};
+use mcode::config::{AppConfig, ConfigOverrides, McpServerConfig};
 use mcode::event::{AgentEvent, CompactionReason};
 use mcode::protocol::{ImageAttachment, sanitize_terminal_text};
 use mcode::session::{Session, SessionMetadata};
@@ -35,7 +35,6 @@ async fn run() -> Result<()> {
         cli.model.is_some() || env::var("MCODE_MODEL").is_ok_and(|value| !value.trim().is_empty());
     let reasoning_was_overridden = cli.reasoning_effort.is_some()
         || env::var("MCODE_REASONING_EFFORT").is_ok_and(|value| !value.trim().is_empty());
-    let search_was_overridden = cli.search;
     let overrides = ConfigOverrides {
         model: cli.model.clone(),
         reasoning_effort: cli.reasoning_effort,
@@ -46,7 +45,6 @@ async fn run() -> Result<()> {
         max_output_tokens: cli.max_output_tokens,
         cwd: cli.cwd.clone(),
         request_timeout_secs: cli.request_timeout,
-        web_search: cli.search.then_some(WebSearchMode::Live),
     };
     let mut config = AppConfig::load(&overrides)?;
     let bypass_approvals = cli.dangerously_bypass_approvals;
@@ -62,9 +60,6 @@ async fn run() -> Result<()> {
         }
         Some(Command::Resume(args)) => {
             let session = Session::resume(&config.cwd, args.session.as_deref())?;
-            if !search_was_overridden {
-                config.web_search.mode = session.web_search_mode();
-            }
             let saved_model = session.model_selector();
             match (model_was_overridden, reasoning_was_overridden) {
                 (false, false) => {
@@ -198,7 +193,6 @@ fn run_doctor(config: &AppConfig, json: bool) -> Result<()> {
             "contextWindow": config.context_window,
             "maxInputTokens": config.max_input_tokens,
             "maxOutputTokens": config.max_output_tokens,
-            "webSearch": config.web_search.mode.to_string(),
         },
     }));
     let endpoint_status = url::Url::parse(&config.base_url).map_or_else(
@@ -311,13 +305,12 @@ fn localized_doctor_name(name: &str) -> &str {
 fn localized_doctor_detail(status: &str, name: &str, detail: &serde_json::Value) -> String {
     match name {
         "model" => format!(
-            "提供商 {}，模型 {}，API {}，上下文窗口 {}，最大输入 {}，网页搜索 {}",
+            "提供商 {}，模型 {}，API {}，上下文窗口 {}，最大输入 {}，原生网页搜索已开启",
             detail["provider"].as_str().unwrap_or("未指定"),
             detail["id"].as_str().unwrap_or("未知"),
             detail["api"].as_str().unwrap_or("未知"),
             detail["contextWindow"],
-            detail["maxInputTokens"],
-            localized_web_search_mode(detail["webSearch"].as_str().unwrap_or(""))
+            detail["maxInputTokens"]
         ),
         "api_key" if detail.as_str() == Some("configured (value hidden)") => {
             "已配置（值已隐藏）".to_string()
@@ -333,15 +326,6 @@ fn localized_doctor_detail(status: &str, name: &str, detail: &serde_json::Value)
         _ => detail
             .as_str()
             .map_or_else(|| detail.to_string(), ToString::to_string),
-    }
-}
-
-fn localized_web_search_mode(mode: &str) -> &str {
-    match mode {
-        "disabled" => "禁用",
-        "cached" => "缓存",
-        "live" => "实时",
-        _ => "未知",
     }
 }
 

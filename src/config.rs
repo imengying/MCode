@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -97,70 +97,6 @@ impl fmt::Display for ApiProtocol {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-#[value(rename_all = "lower")]
-pub enum WebSearchMode {
-    #[default]
-    Disabled,
-    Cached,
-    Live,
-}
-
-impl WebSearchMode {
-    pub const ALL: [Self; 3] = [Self::Disabled, Self::Cached, Self::Live];
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::Cached => "cached",
-            Self::Live => "live",
-        }
-    }
-
-    #[must_use]
-    pub const fn label_zh(self) -> &'static str {
-        match self {
-            Self::Disabled => "禁用",
-            Self::Cached => "缓存",
-            Self::Live => "实时",
-        }
-    }
-
-    #[must_use]
-    pub const fn is_enabled(self) -> bool {
-        !matches!(self, Self::Disabled)
-    }
-}
-
-impl fmt::Display for WebSearchMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WebSearchProvider {
-    #[default]
-    Auto,
-    Exa,
-    Brave,
-    Searxng,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WebSearchSettings {
-    pub mode: WebSearchMode,
-    pub provider: WebSearchProvider,
-    pub allowed_domains: Vec<String>,
-    pub exa_api_key: Option<String>,
-    pub brave_api_key: Option<String>,
-    pub searxng_base_url: Option<String>,
-    pub trust_env_proxy: bool,
 }
 
 #[derive(Clone)]
@@ -274,7 +210,6 @@ pub struct AppConfig {
     pub cwd: PathBuf,
     pub request_timeout_secs: u64,
     pub compaction: CompactionSettings,
-    pub web_search: WebSearchSettings,
     pub model_profiles: Vec<ModelProfile>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub reload_overrides: ConfigOverrides,
@@ -299,7 +234,6 @@ pub struct ConfigOverrides {
     pub max_output_tokens: Option<u64>,
     pub cwd: Option<PathBuf>,
     pub request_timeout_secs: Option<u64>,
-    pub web_search: Option<WebSearchMode>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -312,10 +246,6 @@ struct SettingsFile {
     mcp_servers: BTreeMap<String, McpServerFile>,
     #[serde(default)]
     compaction: CompactionSettingsFile,
-    #[serde(rename = "webSearch")]
-    web_search: Option<WebSearchMode>,
-    #[serde(default, rename = "webSearchConfig")]
-    web_search_config: WebSearchSettingsFile,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -324,17 +254,6 @@ struct CompactionSettingsFile {
     enabled: Option<bool>,
     reserve_tokens: Option<u64>,
     keep_recent_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WebSearchSettingsFile {
-    provider: Option<WebSearchProvider>,
-    allowed_domains: Option<Vec<String>>,
-    exa_api_key: Option<String>,
-    brave_api_key: Option<String>,
-    searxng_base_url: Option<String>,
-    trust_env_proxy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -368,31 +287,6 @@ impl SettingsFile {
         overlay_option(
             &mut self.compaction.keep_recent_tokens,
             other.compaction.keep_recent_tokens,
-        );
-        overlay_option(&mut self.web_search, other.web_search);
-        overlay_option(
-            &mut self.web_search_config.provider,
-            other.web_search_config.provider,
-        );
-        overlay_option(
-            &mut self.web_search_config.allowed_domains,
-            other.web_search_config.allowed_domains,
-        );
-        overlay_option(
-            &mut self.web_search_config.exa_api_key,
-            other.web_search_config.exa_api_key,
-        );
-        overlay_option(
-            &mut self.web_search_config.brave_api_key,
-            other.web_search_config.brave_api_key,
-        );
-        overlay_option(
-            &mut self.web_search_config.searxng_base_url,
-            other.web_search_config.searxng_base_url,
-        );
-        overlay_option(
-            &mut self.web_search_config.trust_env_proxy,
-            other.web_search_config.trust_env_proxy,
         );
         for (name, server) in other.mcp_servers {
             if let Some(current) = self.mcp_servers.get_mut(&name) {
@@ -528,7 +422,6 @@ impl AppConfig {
             .with_context(|| format!("模型 {model:?} 不在 ~/.mcode/models.json 中"))?;
         let selected_model = selected_profile.id.clone();
         let provider = selected_profile.provider.clone();
-        let configured_web_search = overrides.web_search.or(settings.web_search);
         let api = selected_profile.api;
 
         let environment_reasoning = env_reasoning("MCODE_REASONING_EFFORT").transpose()?;
@@ -558,29 +451,6 @@ impl AppConfig {
                 .keep_recent_tokens
                 .unwrap_or(defaults.keep_recent_tokens),
         };
-        let web_search = WebSearchSettings {
-            mode: configured_web_search.unwrap_or_default(),
-            provider: settings.web_search_config.provider.unwrap_or_default(),
-            allowed_domains: normalize_allowed_web_search_domains(
-                settings
-                    .web_search_config
-                    .allowed_domains
-                    .unwrap_or_default(),
-            )?,
-            exa_api_key: resolve_web_search_secret(
-                settings.web_search_config.exa_api_key.as_deref(),
-                "EXA_API_KEY",
-            ),
-            brave_api_key: resolve_web_search_secret(
-                settings.web_search_config.brave_api_key.as_deref(),
-                "BRAVE_API_KEY",
-            ),
-            searxng_base_url: settings
-                .web_search_config
-                .searxng_base_url
-                .or_else(|| env_non_empty("SEARXNG_BASE_URL")),
-            trust_env_proxy: settings.web_search_config.trust_env_proxy.unwrap_or(false),
-        };
         let mcp_servers = build_mcp_servers(settings.mcp_servers)?;
 
         if selected_model.trim().is_empty() {
@@ -608,8 +478,6 @@ impl AppConfig {
         if compaction.keep_recent_tokens == 0 {
             bail!("compaction.keepRecentTokens must be at least 1");
         }
-        validate_web_search(&web_search)?;
-
         Ok(Self {
             model: selected_model,
             provider,
@@ -625,7 +493,6 @@ impl AppConfig {
             cwd,
             request_timeout_secs,
             compaction,
-            web_search,
             model_profiles,
             mcp_servers,
             reload_overrides,
@@ -762,75 +629,6 @@ fn build_mcp_servers(servers: BTreeMap<String, McpServerFile>) -> Result<Vec<Mcp
         });
     }
     Ok(configured)
-}
-
-fn validate_web_search(settings: &WebSearchSettings) -> Result<()> {
-    normalize_allowed_web_search_domains(settings.allowed_domains.clone())?;
-    if settings.provider == WebSearchProvider::Brave && settings.brave_api_key.is_none() {
-        bail!("webSearchConfig.provider is brave but BRAVE_API_KEY is not configured");
-    }
-    if settings.provider == WebSearchProvider::Searxng {
-        let base_url = settings.searxng_base_url.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "webSearchConfig.provider is searxng but searxngBaseUrl is not configured"
-            )
-        })?;
-        validate_http_base_url(base_url, "webSearchConfig.searxngBaseUrl")?;
-    } else if let Some(base_url) = settings.searxng_base_url.as_deref() {
-        validate_http_base_url(base_url, "webSearchConfig.searxngBaseUrl")?;
-    }
-    Ok(())
-}
-
-fn normalize_allowed_web_search_domains(domains: Vec<String>) -> Result<Vec<String>> {
-    normalize_web_search_domains(domains, false)
-}
-
-pub(crate) fn normalize_web_search_domain_filters(domains: Vec<String>) -> Result<Vec<String>> {
-    normalize_web_search_domains(domains, true)
-}
-
-fn normalize_web_search_domains(
-    domains: Vec<String>,
-    allow_exclusions: bool,
-) -> Result<Vec<String>> {
-    if domains.len() > 20 {
-        bail!("web search domain filters cannot contain more than 20 domains");
-    }
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::with_capacity(domains.len());
-    for domain in domains {
-        let domain = domain.trim();
-        let (excluded, hostname) = domain
-            .strip_prefix('-')
-            .map_or((false, domain), |hostname| (true, hostname));
-        if excluded && !allow_exclusions {
-            bail!("invalid allowed domain {domain:?}; exclusions are only valid in tool filters");
-        }
-        let url::Host::Domain(hostname) = url::Host::parse(hostname).map_err(|_| {
-            anyhow::anyhow!(
-                "invalid web search domain {domain:?}; use a hostname without a URL scheme"
-            )
-        })?
-        else {
-            bail!("invalid web search domain {domain:?}; use a DNS hostname");
-        };
-        let normalized_domain = if excluded {
-            format!("-{hostname}")
-        } else {
-            hostname
-        };
-        if seen.insert(normalized_domain.clone()) {
-            normalized.push(normalized_domain);
-        }
-    }
-    Ok(normalized)
-}
-
-fn resolve_web_search_secret(configured: Option<&str>, environment: &str) -> Option<String> {
-    configured
-        .map_or_else(|| env_non_empty(environment), resolve_static_config_value)
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn validate_http_base_url(value: &str, field: &str) -> Result<()> {
@@ -1140,6 +938,8 @@ fn interpolate_environment(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]

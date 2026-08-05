@@ -17,7 +17,7 @@ use tokio::process::{ChildStderr, Command};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ApiProtocol, McpServerConfig, WebSearchMode, WebSearchSettings};
+use crate::config::McpServerConfig;
 use crate::event::AgentEvent;
 use crate::protocol::{
     FileChangeKind, FileChangeLine, FileChangeLineKind, FileChangeSummary, FunctionDefinition,
@@ -35,7 +35,6 @@ const SHELL_EXIT_PIPE_IDLE_GRACE: Duration = Duration::from_millis(100);
 pub struct ToolRegistry {
     root: PathBuf,
     definitions: Vec<ToolDefinition>,
-    api: ApiProtocol,
     web_access: WebAccess,
     mcp_servers: Vec<McpService>,
     mcp_routes: BTreeMap<String, McpToolRoute>,
@@ -91,29 +90,16 @@ impl ToolExecution {
 
 impl ToolRegistry {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
-        Self::with_web_access(
-            root,
-            WebSearchSettings::default(),
-            ApiProtocol::ChatCompletions,
-        )
-    }
-
-    fn with_web_access(
-        root: impl AsRef<Path>,
-        web_search: WebSearchSettings,
-        api: ApiProtocol,
-    ) -> Result<Self> {
         let root = root
             .as_ref()
             .canonicalize()
             .with_context(|| format!("invalid tool root: {}", root.as_ref().display()))?;
-        let web_access = WebAccess::new(web_search)?;
+        let web_access = WebAccess::new();
         let mut definitions = Self::builtin_definitions();
-        definitions.extend(web_access.definitions(api));
+        definitions.extend(web_access.definitions());
         Ok(Self {
             root,
             definitions,
-            api,
             web_access,
             mcp_servers: Vec::new(),
             mcp_routes: BTreeMap::new(),
@@ -121,13 +107,8 @@ impl ToolRegistry {
         })
     }
 
-    pub async fn with_mcp(
-        root: impl AsRef<Path>,
-        servers: &[McpServerConfig],
-        web_search: WebSearchSettings,
-        api: ApiProtocol,
-    ) -> Result<Self> {
-        let mut registry = Self::with_web_access(root, web_search, api)?;
+    pub async fn with_mcp(root: impl AsRef<Path>, servers: &[McpServerConfig]) -> Result<Self> {
+        let mut registry = Self::new(root)?;
         for server in servers {
             let result = async {
                 let service = connect_mcp_server(server, &registry.root).await?;
@@ -162,19 +143,6 @@ impl ToolRegistry {
     #[must_use]
     pub fn mcp_startup_failures(&self) -> &[McpStartupFailure] {
         &self.mcp_startup_failures
-    }
-
-    pub fn set_web_search_mode(&mut self, mode: WebSearchMode) {
-        self.web_access.set_mode(mode);
-        self.refresh_web_access_definitions();
-    }
-
-    pub fn set_api(&mut self, api: ApiProtocol) {
-        if self.api == api {
-            return;
-        }
-        self.api = api;
-        self.refresh_web_access_definitions();
     }
 
     #[must_use]
@@ -277,6 +245,9 @@ impl ToolRegistry {
         cancel: &CancellationToken,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> ToolExecution {
+        if call.function.name == "$web_search" {
+            return ToolExecution::success(call.function.arguments.clone());
+        }
         if is_web_access_tool(&call.function.name)
             && self
                 .definitions
@@ -381,18 +352,6 @@ impl ToolRegistry {
         }
         self.mcp_servers.push(service);
         Ok(())
-    }
-
-    fn refresh_web_access_definitions(&mut self) {
-        self.definitions
-            .retain(|definition| !is_web_access_tool(&definition.function.name));
-        let insert_at = self
-            .definitions
-            .iter()
-            .position(|definition| self.mcp_routes.contains_key(&definition.function.name))
-            .unwrap_or(self.definitions.len());
-        self.definitions
-            .splice(insert_at..insert_at, self.web_access.definitions(self.api));
     }
 
     async fn execute_mcp(
@@ -842,7 +801,7 @@ fn unique_mcp_tool_name(server: &str, tool: &str, used: &BTreeSet<String>) -> St
 }
 
 fn is_web_access_tool(name: &str) -> bool {
-    matches!(name, "web_search" | "fetch_content")
+    name == "fetch_content"
 }
 
 fn sanitize_tool_component(value: &str) -> String {
