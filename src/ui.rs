@@ -1,4 +1,4 @@
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -97,6 +97,7 @@ pub fn run_interactive(
     let model = agent.model().to_string();
     let endpoint = agent.endpoint().to_string();
     let cwd = agent.session().cwd().to_path_buf();
+    let mut resumable_session_id = agent.session().path().map(|_| agent.session().id());
     let has_pending_run = agent.has_pending_run();
     let pending_tool_ids = if has_pending_run {
         agent
@@ -305,6 +306,8 @@ pub fn run_interactive(
                     UiAction::NewSession => match agent.try_lock() {
                         Ok(mut agent) => match agent.new_session() {
                             Ok(()) => {
+                                resumable_session_id =
+                                    agent.session().path().map(|_| agent.session().id());
                                 state.reset_session();
                                 state.sync_from_agent(&agent);
                                 clear_terminal_view(&mut terminal)?;
@@ -357,26 +360,28 @@ pub fn run_interactive(
     drop(screen);
     if let Some(id) = deleted_session {
         println!("已删除会话 {id}。");
+    } else if let Some(id) = resumable_session_id {
+        println!("继续此会话：mcode resume {id}");
     }
     Ok(())
 }
 
 // Some PTYs do not answer cursor-position queries; retain Ratatui's last position as a fallback.
-struct UiBackend {
-    inner: CrosstermBackend<io::Stdout>,
+struct UiBackend<W: Write> {
+    inner: CrosstermBackend<W>,
     cursor: Option<Position>,
 }
 
-impl UiBackend {
-    fn new(stdout: io::Stdout) -> Self {
+impl<W: Write> UiBackend<W> {
+    fn new(writer: W) -> Self {
         Self {
-            inner: CrosstermBackend::new(stdout),
+            inner: CrosstermBackend::new(writer),
             cursor: None,
         }
     }
 }
 
-impl Backend for UiBackend {
+impl<W: Write> Backend for UiBackend<W> {
     type Error = io::Error;
 
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
@@ -384,9 +389,10 @@ impl Backend for UiBackend {
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
         let mut positions = DrawPositionAdapter::default();
-        self.inner.draw(content.map(|(x, y, cell)| {
-            let position = positions.map(x, y, cell.symbol());
-            (position.x, position.y, cell)
+        self.inner.draw(content.filter_map(|(x, y, cell)| {
+            positions
+                .map(x, y, cell.symbol())
+                .map(|position| (position.x, position.y, cell))
         }))
     }
 
@@ -439,7 +445,7 @@ impl Backend for UiBackend {
     }
 }
 
-type UiTerminal = Terminal<UiBackend>;
+type UiTerminal = Terminal<UiBackend<io::Stdout>>;
 
 fn clear_terminal_view(terminal: &mut UiTerminal) -> Result<()> {
     execute!(
@@ -454,8 +460,8 @@ fn clear_terminal_view(terminal: &mut UiTerminal) -> Result<()> {
     terminal.clear().context("重置终端视口失败")
 }
 
-// Ratatui omits the trailing cells of wide glyphs, while Crossterm assumes every yielded cell is
-// one column wide. Report adjacent virtual positions so it does not reposition between CJK glyphs.
+// Normal diffs omit wide-glyph trailing cells, but history insertion can yield them. Skip those
+// cells and report adjacent virtual positions so Crossterm neither inserts spaces nor repositions.
 #[derive(Debug, Default)]
 struct DrawPositionAdapter {
     actual_end: Option<Position>,
@@ -463,8 +469,14 @@ struct DrawPositionAdapter {
 }
 
 impl DrawPositionAdapter {
-    fn map(&mut self, x: u16, y: u16, symbol: &str) -> Position {
+    fn map(&mut self, x: u16, y: u16, symbol: &str) -> Option<Position> {
         let actual = Position::new(x, y);
+        if self
+            .actual_end
+            .is_some_and(|end| end.y == y && actual.x < end.x)
+        {
+            return None;
+        }
         let reported = if self.actual_end == Some(actual) {
             Position::new(
                 self.reported
@@ -477,7 +489,7 @@ impl DrawPositionAdapter {
         let width = u16::try_from(UnicodeWidthStr::width(symbol).max(1)).unwrap_or(u16::MAX);
         self.actual_end = Some(Position::new(x.saturating_add(width), y));
         self.reported = Some(reported);
-        reported
+        Some(reported)
     }
 }
 
@@ -4182,6 +4194,20 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn rendered_terminal(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -4372,14 +4398,26 @@ mod tests {
     }
 
     #[test]
-    fn writes_adjacent_wide_glyphs_without_intermediate_cursor_moves() {
-        let mut positions = DrawPositionAdapter::default();
+    fn writes_raw_history_buffers_without_cjk_spacing() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 8, 1));
+        buffer.set_string(0, 0, "你好", Style::default());
+        let output = CaptureWriter::default();
+        let mut backend = UiBackend::new(output.clone());
+        let width = usize::from(buffer.area.width);
 
-        assert_eq!(positions.map(0, 2, "你"), Position::new(0, 2));
-        assert_eq!(positions.map(2, 2, "好"), Position::new(1, 2));
-        assert_eq!(positions.map(4, 2, "!"), Position::new(2, 2));
-        assert_eq!(positions.map(7, 2, "x"), Position::new(7, 2));
-        assert_eq!(positions.map(0, 3, "新"), Position::new(0, 3));
+        backend
+            .draw(buffer.content.iter().enumerate().map(|(index, cell)| {
+                (
+                    u16::try_from(index % width).unwrap(),
+                    u16::try_from(index / width).unwrap(),
+                    cell,
+                )
+            }))
+            .unwrap();
+
+        let bytes = output.0.borrow();
+        let output = std::str::from_utf8(&bytes).unwrap();
+        assert!(output.contains("你好"), "terminal output was {output:?}");
     }
 
     #[test]
