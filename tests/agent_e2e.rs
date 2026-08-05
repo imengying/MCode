@@ -667,33 +667,37 @@ async fn omits_request_fields_disabled_by_pi_compat() {
 }
 
 #[tokio::test]
-async fn retries_a_truncated_stream_without_persisting_partial_output() {
+async fn recovers_from_stalled_requests_and_truncated_streams_without_persisting_partial_output() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for attempt in 0..2 {
+        for attempt in 0..4 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let _ = read_json_request(&mut stream).await;
-            if attempt == 0 {
-                let body = concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"discard-me\"}}]}\n\n",
-                    "data: [DONE]\n\n"
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-                stream.shutdown().await.unwrap();
-            } else {
-                write_sse_text(&mut stream, "kept-after-retry", Some((30, 5))).await;
+            match attempt {
+                0 => tokio::time::sleep(std::time::Duration::from_millis(1_100)).await,
+                1 => write_http_error(&mut stream, 503, "temporarily unavailable").await,
+                2 => {
+                    let body = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"discard-me\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+                _ => write_sse_text(&mut stream, "kept-after-retry", Some((30, 5))).await,
             }
         }
     });
 
     let base = tempdir().unwrap();
     let project = tempdir().unwrap();
-    let config = basic_chat_config(project.path(), address);
+    let mut config = basic_chat_config(project.path(), address);
+    config.request_timeout_secs = 1;
     let session =
         Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
     let session_path = session.path().unwrap().to_path_buf();
@@ -723,7 +727,24 @@ async fn retries_a_truncated_stream_without_persisting_partial_output() {
     let jsonl = std::fs::read_to_string(session_path).unwrap();
     assert!(!jsonl.contains("discard-me"));
     assert!(jsonl.contains("kept-after-retry"));
-    assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AssistantRetrying {
+            attempt: 2,
+            max_attempts: 4,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AssistantRetrying {
+            attempt: 3,
+            max_attempts: 4,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::AssistantRetrying {
             attempt: 2,

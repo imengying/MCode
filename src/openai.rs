@@ -89,7 +89,7 @@ pub struct OpenAiClient {
     reasoning_effort: Option<String>,
     compat: ModelCompat,
     web_search: WebSearchSettings,
-    timeout: Duration,
+    idle_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +116,7 @@ impl OpenAiClient {
         timeout: Duration,
     ) -> Result<Self> {
         let endpoint = api_endpoint_url(&config.base_url, config.api)?;
-        let http = build_http_client(&endpoint)?;
+        let http = build_http_client(&endpoint, timeout)?;
         Ok(Self {
             http,
             endpoint,
@@ -127,7 +127,7 @@ impl OpenAiClient {
             reasoning_effort: config.reasoning_effort,
             compat: config.compat,
             web_search,
-            timeout,
+            idle_timeout: timeout,
         })
     }
 
@@ -153,7 +153,7 @@ impl OpenAiClient {
 
     pub(crate) fn reconfigure(&mut self, config: OpenAiModelConfig) -> Result<()> {
         let endpoint = api_endpoint_url(&config.base_url, config.api)?;
-        self.http = build_http_client(&endpoint)?;
+        self.http = build_http_client(&endpoint, self.idle_timeout)?;
         self.endpoint = endpoint;
         self.api_key = config.api_key;
         self.model = config.model;
@@ -186,13 +186,13 @@ impl OpenAiClient {
     async fn send_stream_request<T: Serialize + Sync + ?Sized>(
         &self,
         body: &T,
+        events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<Response> {
         for attempt in 0..MAX_REQUEST_ATTEMPTS {
             let mut request = self
                 .http
                 .post(self.endpoint.clone())
-                .timeout(self.timeout)
                 .header("Accept", "text/event-stream")
                 .json(body);
             if let Some(api_key) = &self.api_key {
@@ -221,6 +221,11 @@ impl OpenAiClient {
                     if !is_retryable_status(status) || attempt + 1 == MAX_REQUEST_ATTEMPTS {
                         return Err(error);
                     }
+                    let _ = events.send(AgentEvent::AssistantRetrying {
+                        attempt: attempt + 2,
+                        max_attempts: MAX_REQUEST_ATTEMPTS,
+                        message: error.to_string(),
+                    });
                     wait_before_retry(
                         retry_after.unwrap_or_else(|| retry_backoff(attempt)),
                         cancel,
@@ -231,6 +236,11 @@ impl OpenAiClient {
                     if error.is_builder() || attempt + 1 == MAX_REQUEST_ATTEMPTS {
                         return Err(OpenAiError::Http(error));
                     }
+                    let _ = events.send(AgentEvent::AssistantRetrying {
+                        attempt: attempt + 2,
+                        max_attempts: MAX_REQUEST_ATTEMPTS,
+                        message: error.to_string(),
+                    });
                     wait_before_retry(retry_backoff(attempt), cancel).await?;
                 }
             }
@@ -349,7 +359,7 @@ impl OpenAiClient {
             }),
         };
 
-        let response = self.send_stream_request(&body, cancel).await?;
+        let response = self.send_stream_request(&body, events, cancel).await?;
         let request_id = response_request_id(response.headers());
 
         let mut bytes = response.bytes_stream();
@@ -467,7 +477,7 @@ impl OpenAiClient {
             stream: true,
         };
 
-        let response = self.send_stream_request(&body, cancel).await?;
+        let response = self.send_stream_request(&body, events, cancel).await?;
         let request_id = response_request_id(response.headers());
 
         let mut bytes = response.bytes_stream();
@@ -1158,9 +1168,13 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-fn build_http_client(endpoint: &Url) -> std::result::Result<Client, reqwest::Error> {
+fn build_http_client(
+    endpoint: &Url,
+    idle_timeout: Duration,
+) -> std::result::Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(20))
+        .connect_timeout(idle_timeout.min(Duration::from_secs(20)))
+        .read_timeout(idle_timeout)
         .user_agent(format!("mcode/{}", crate::VERSION));
     if endpoint.host_str().is_some_and(is_loopback_host) {
         builder = builder.no_proxy();
