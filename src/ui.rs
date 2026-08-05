@@ -54,7 +54,6 @@ const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_QUEUED_SUBMISSIONS: usize = 8;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
-const ACTIVE_VIEWPORT_HEIGHT: u16 = 16;
 const PREVIEW_LINE_CHARS: usize = 240;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
@@ -230,7 +229,9 @@ pub fn run_interactive(
         }
 
         if needs_draw {
+            resize_ui_terminal_to_content(&mut terminal, &state)?;
             archive_transcript_overflow(&mut terminal, &mut state)?;
+            resize_ui_terminal_to_content(&mut terminal, &state)?;
         }
         if state.run_started_at.is_some() && last_frame.elapsed() >= ELAPSED_REFRESH_INTERVAL {
             needs_draw = true;
@@ -527,11 +528,54 @@ fn resize_ui_terminal(terminal: &mut UiTerminal, width: u16, height: u16) -> Res
 }
 
 fn minimum_active_viewport_height(screen_height: u16) -> u16 {
-    if screen_height <= MIN_TERMINAL_HEIGHT {
-        screen_height
-    } else {
-        ACTIVE_VIEWPORT_HEIGHT.min(screen_height.saturating_sub(1))
+    screen_height.min(4)
+}
+
+fn minimum_ui_height(state: &UiState, width: u16) -> u16 {
+    let sections = ui_section_heights(state, width, u16::MAX);
+    sections
+        .suggestions
+        .saturating_add(sections.activity)
+        .saturating_add(sections.input)
+        .saturating_add(INPUT_FOOTER_GAP)
+        .saturating_add(1)
+}
+
+fn resize_ui_terminal_to_content<B>(terminal: &mut Terminal<B>, state: &UiState) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let current = terminal.get_frame().area();
+    if current.y == 0 {
+        return Ok(());
     }
+    let screen = terminal.backend().size().context("读取终端尺寸失败")?;
+    let desired = desired_ui_height(state, current.width.max(1));
+    let height = desired
+        .max(minimum_ui_height(state, current.width.max(1)))
+        .min(screen.height.saturating_sub(current.y).max(1));
+    if height == current.height {
+        return Ok(());
+    }
+    if height < current.height {
+        let blank_height = current.height.saturating_sub(height);
+        let blank = Buffer::empty(Rect::new(0, 0, current.width, blank_height));
+        draw_history_rows(
+            terminal.backend_mut(),
+            &blank,
+            0,
+            blank_height,
+            current.y.saturating_add(height),
+        )?;
+        terminal
+            .backend_mut()
+            .flush()
+            .context("清理终端活动区失败")?;
+    }
+    terminal
+        .resize(Rect::new(current.x, current.y, current.width, height))
+        .context("调整终端活动区高度失败")
 }
 
 fn clear_terminal_view(terminal: &mut UiTerminal) -> Result<()> {
@@ -624,7 +668,8 @@ where
         count
     };
     let lines = conversation_lines_for_messages(&state.messages[..count], width);
-    if !insert_transcript_lines(terminal, lines, width)? {
+    let minimum_active = minimum_ui_height(state, width);
+    if !insert_transcript_lines(terminal, lines, width, minimum_active)? {
         return Ok(false);
     }
     state.messages.drain(..count);
@@ -651,6 +696,7 @@ fn insert_transcript_lines<B>(
     terminal: &mut Terminal<B>,
     lines: Vec<Line<'static>>,
     width: u16,
+    minimum_active: u16,
 ) -> Result<bool>
 where
     B: Backend,
@@ -667,8 +713,9 @@ where
 
     let screen = terminal.backend().size().context("读取终端尺寸失败")?;
     let mut viewport = terminal.get_frame().area();
-    let minimum_active = minimum_active_viewport_height(screen.height);
-    let maximum_history = screen.height.saturating_sub(minimum_active);
+    let maximum_history = screen
+        .height
+        .saturating_sub(minimum_active.min(screen.height));
     if maximum_history == 0 {
         return Ok(false);
     }
@@ -809,7 +856,8 @@ where
     };
     let mut lines = conversation_lines_for_messages(std::slice::from_ref(&fragment), width);
     lines.pop();
-    if !insert_transcript_lines(terminal, lines, width)? {
+    let minimum_active = minimum_ui_height(state, width);
+    if !insert_transcript_lines(terminal, lines, width, minimum_active)? {
         return Ok(false);
     }
     if let Some(message) = state.messages.first_mut() {
@@ -3218,7 +3266,12 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         Block::default().style(Style::default().fg(THEME_TEXT).bg(THEME_BASE)),
         area,
     );
-    if area.width < 24 || area.height < MIN_TERMINAL_HEIGHT {
+    let minimum_render_height = if area.y == 0 {
+        MIN_TERMINAL_HEIGHT
+    } else {
+        minimum_ui_height(state, area.width).max(1)
+    };
+    if area.width < 24 || area.height < minimum_render_height {
         frame.render_widget(
             Paragraph::new("终端窗口过小")
                 .style(Style::default().fg(THEME_RED))
@@ -4205,46 +4258,34 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
     } else {
         THEME_GREEN
     };
-    lines.push(Line::from(vec![
-        Span::styled(
-            "• ",
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            tool_action_title(&message.title, message.running, failed),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    if message.title == "shell" {
+        append_shell_tool_header(lines, message, failed, color);
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "• ",
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                tool_action_title(&message.title, message.running, failed),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
 
     if let Some(arguments) = message
         .tool_arguments
         .as_deref()
-        .filter(|arguments| !arguments.is_empty())
+        .filter(|arguments| !arguments.is_empty() && message.title != "shell")
     {
-        let first_prefix = if message.title == "shell" {
-            "  $ "
-        } else {
-            "  ↳ "
-        };
-        if message.title == "shell" {
-            append_code_preview_lines(
-                lines,
-                arguments,
-                "bash",
-                TOOL_ARGUMENT_PREVIEW_LINES,
-                first_prefix,
-                "    ",
-            );
-        } else {
-            append_preview_lines(
-                lines,
-                arguments,
-                TOOL_ARGUMENT_PREVIEW_LINES,
-                first_prefix,
-                "    ",
-                Style::default().fg(THEME_SUBTEXT),
-            );
-        }
+        append_preview_lines(
+            lines,
+            arguments,
+            TOOL_ARGUMENT_PREVIEW_LINES,
+            "  ↳ ",
+            "    ",
+            Style::default().fg(THEME_SUBTEXT),
+        );
     }
     if !message.content.is_empty() {
         let style = if failed {
@@ -4271,6 +4312,51 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
                 style,
             );
         }
+    }
+}
+
+fn append_shell_tool_header(
+    lines: &mut Vec<Line<'static>>,
+    message: &ViewMessage,
+    failed: bool,
+    color: Color,
+) {
+    let title = if failed {
+        "命令失败"
+    } else if message.running {
+        "正在运行"
+    } else {
+        "已运行"
+    };
+    let mut header = vec![
+        Span::styled(
+            "• ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{title} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let command_lines = message
+        .tool_arguments
+        .as_deref()
+        .filter(|command| !command.is_empty())
+        .map(|command| highlight_code(command, "bash"))
+        .unwrap_or_default();
+    if let Some(first) = command_lines.first() {
+        header.extend(first.spans.iter().cloned());
+    }
+    lines.push(Line::from(header));
+    for line in command_lines
+        .into_iter()
+        .skip(1)
+        .take(TOOL_ARGUMENT_PREVIEW_LINES - 1)
+    {
+        let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
+        spans.push(Span::styled("    ", Style::default().fg(THEME_MUTED)));
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
     }
 }
 
@@ -4478,51 +4564,6 @@ fn append_tail_preview_lines(
     }
 }
 
-fn append_code_preview_lines(
-    lines: &mut Vec<Line<'static>>,
-    content: &str,
-    language: &str,
-    limit: usize,
-    first_prefix: &str,
-    continuation_prefix: &str,
-) {
-    let content_lines = content.lines().collect::<Vec<_>>();
-    let preview = content_lines
-        .iter()
-        .take(limit)
-        .map(|line| truncate_preview_line(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for (index, highlighted) in highlight_code(&preview, language).into_iter().enumerate() {
-        let prefix = if index == 0 {
-            first_prefix
-        } else {
-            continuation_prefix
-        };
-        let mut spans = Vec::with_capacity(highlighted.spans.len().saturating_add(1));
-        spans.push(Span::styled(
-            prefix.to_string(),
-            Style::default().fg(THEME_MUTED),
-        ));
-        spans.extend(highlighted.spans);
-        lines.push(Line::from(spans));
-    }
-    if content_lines.len() > limit {
-        lines.push(Line::from(vec![
-            Span::styled(
-                continuation_prefix.to_string(),
-                Style::default().fg(THEME_MUTED),
-            ),
-            Span::styled(
-                "…",
-                Style::default()
-                    .fg(THEME_MUTED)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-    }
-}
-
 fn truncate_preview_line(line: &str) -> String {
     let mut characters = line.chars();
     let preview = characters
@@ -4685,14 +4726,14 @@ impl MarkdownRenderer {
                 self.flush_line(false);
                 let depth = self.lists.len().saturating_sub(1);
                 let marker = self.lists.last_mut().map_or_else(
-                    || "- ".to_string(),
+                    || "• ".to_string(),
                     |list| match list.next.as_mut() {
                         Some(next) => {
                             let marker = format!("{next}. ");
                             *next = next.saturating_add(1);
                             marker
                         }
-                        None => "- ".to_string(),
+                        None => "• ".to_string(),
                     },
                 );
                 let indentation = "  ".repeat(depth);
@@ -5385,7 +5426,9 @@ mod tests {
         assert!(tail.content.contains("第 30 行"));
         let conversation_height = usize::from(ui_section_heights(&state, 40, 24).conversation);
         assert!(transcript_line_count(&state, &state.messages, 40) <= conversation_height);
-        assert_eq!(terminal.get_frame().area().y, 8);
+        let active_area = terminal.get_frame().area();
+        assert!(active_area.y > 0);
+        assert!(active_area.height >= minimum_ui_height(&state, 40));
         assert!(
             terminal
                 .backend()
@@ -5678,7 +5721,8 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("Heading"));
-        assert!(rendered.contains("- one"));
+        assert!(rendered.contains("• one"));
+        assert!(!rendered.contains("- one"));
         assert!(rendered.contains("│ quote"));
         assert!(rendered.contains("docs (https://example.com)"));
         assert!(rendered.contains("let value = 1;"));
@@ -5738,7 +5782,8 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(running.contains("• 正在运行命令"));
+        assert!(running.contains("• 正在运行 "));
+        assert!(running.contains("first"));
         state.apply_agent_event(AgentEvent::ToolFinished {
             id: "call_shell".to_string(),
             name: "shell".to_string(),
@@ -5755,8 +5800,10 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("• 已运行命令"));
-        assert!(rendered.contains("$ first"));
+        assert!(rendered.contains("• 已运行 "));
+        assert!(!rendered.contains("已运行命令"));
+        assert!(rendered.contains("first"));
+        assert!(!rendered.contains("$ first"));
         assert!(rendered.contains("second"));
         assert!(!rendered.contains("third"));
         assert!(rendered.contains("output 0"));
@@ -5765,7 +5812,7 @@ mod tests {
         assert!(!rendered.contains("output 11"));
         assert_eq!(
             rendered.lines().filter(|line| line.trim() == "…").count(),
-            2
+            1
         );
         assert!(!rendered.contains("折叠"));
     }

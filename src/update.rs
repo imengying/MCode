@@ -39,7 +39,7 @@ pub async fn run() -> Result<()> {
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_mins(5))
         .https_only(true)
-        .user_agent(format!("mcode/{}", crate::VERSION))
+        .user_agent(crate::USER_AGENT)
         .build()
         .context("创建更新客户端失败")?;
 

@@ -5,6 +5,8 @@ pub const VERSION: &str = match option_env!("MCODE_BUILD_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+pub const USER_AGENT: &str = "mcode/0.146.1";
+
 pub mod agent;
 pub mod approval;
 pub mod cli;

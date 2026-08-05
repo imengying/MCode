@@ -227,7 +227,7 @@ fn http_client(no_proxy: bool, hostname: Option<&str>, addresses: &[SocketAddr])
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(WEB_REQUEST_TIMEOUT)
-        .user_agent(format!("mcode/{}", crate::VERSION));
+        .user_agent(crate::USER_AGENT);
     if no_proxy {
         builder = builder.no_proxy();
     }

@@ -685,7 +685,7 @@ async fn omits_request_fields_disabled_by_pi_compat() {
     assert_eq!(status, RunStatus::Completed);
     assert!(request.get("reasoning_effort").is_none());
     assert!(request.get("stream_options").is_none());
-    assert_eq!(user_agent, format!("mcode/{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(user_agent, mcode::USER_AGENT);
 }
 
 #[tokio::test]

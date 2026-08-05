@@ -1164,7 +1164,7 @@ fn build_http_client(
     let mut builder = Client::builder()
         .connect_timeout(idle_timeout.min(Duration::from_secs(20)))
         .read_timeout(idle_timeout)
-        .user_agent(format!("mcode/{}", crate::VERSION));
+        .user_agent(crate::USER_AGENT);
     if endpoint.host_str().is_some_and(is_loopback_host) {
         builder = builder.no_proxy();
     }
