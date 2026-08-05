@@ -19,7 +19,7 @@ use pulldown_cmark::{
     TagEnd,
 };
 use ratatui::backend::{Backend, ClearType as BackendClearType, WindowSize};
-use ratatui::buffer::Cell;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -369,8 +369,10 @@ pub fn run_interactive(
                 paste_text_or_image(&mut state, &text);
             }
             Event::FocusGained => needs_draw = true,
-            Event::Resize(..) => {
-                if !compact_viewport {
+            Event::Resize(width, height) => {
+                if compact_viewport {
+                    resize_ui_terminal(&mut terminal, width, height)?;
+                } else {
                     terminal = create_ui_terminal(false)?;
                 }
                 needs_draw = true;
@@ -486,34 +488,50 @@ impl<W: Write> Backend for UiBackend<W> {
 
 type UiTerminal = Terminal<UiBackend<io::Stdout>>;
 
-fn create_ui_terminal(compact: bool) -> Result<UiTerminal> {
+fn create_ui_terminal(_compact: bool) -> Result<UiTerminal> {
     let mut backend = UiBackend::new(io::stdout());
     let size = backend.size().context("读取终端尺寸失败")?;
-    let viewport_height = if compact {
-        ACTIVE_VIEWPORT_HEIGHT.min(size.height)
-    } else {
-        size.height
-    }
-    .max(1);
-    let top = size.height.saturating_sub(viewport_height);
+    let area = Rect::new(0, 0, size.width.max(1), size.height.max(1));
     execute!(
         io::stdout(),
         MoveTo(0, 0),
         Clear(TerminalClearType::All),
         Clear(TerminalClearType::Purge),
-        MoveTo(0, top)
+        MoveTo(0, 0)
     )
     .context("重置终端页面失败")?;
-    backend.cursor = Some(Position::new(0, top));
+    backend.cursor = Some(Position::ORIGIN);
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
+            viewport: Viewport::Fixed(area),
         },
     )
     .context("初始化终端失败")?;
     terminal.clear().context("重置终端视口失败")?;
     Ok(terminal)
+}
+
+fn resize_ui_terminal(terminal: &mut UiTerminal, width: u16, height: u16) -> Result<()> {
+    let current = terminal.get_frame().area();
+    let minimum_active = minimum_active_viewport_height(height);
+    let top = current.y.min(height.saturating_sub(minimum_active));
+    terminal
+        .resize(Rect::new(
+            0,
+            top,
+            width.max(1),
+            height.saturating_sub(top).max(1),
+        ))
+        .context("调整终端视口失败")
+}
+
+fn minimum_active_viewport_height(screen_height: u16) -> u16 {
+    if screen_height <= MIN_TERMINAL_HEIGHT {
+        screen_height
+    } else {
+        ACTIVE_VIEWPORT_HEIGHT.min(screen_height.saturating_sub(1))
+    }
 }
 
 fn clear_terminal_view(terminal: &mut UiTerminal) -> Result<()> {
@@ -567,16 +585,16 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    terminal.autoresize().context("调整终端视口失败")?;
-    let area = terminal.get_frame().area();
-    let conversation_height =
-        usize::from(ui_section_heights(state, area.width, area.height).conversation);
-    let width = area.width.max(1);
-
     loop {
+        let area = terminal.get_frame().area();
+        let conversation_height =
+            usize::from(ui_section_heights(state, area.width, area.height).conversation);
+        let width = area.width.max(1);
         let count = transcript_archive_count(state, width, conversation_height);
         if count > 0 {
-            archive_message_prefix(terminal, state, count, width)?;
+            if !archive_message_prefix(terminal, state, count, width)? {
+                break;
+            }
             continue;
         }
         if !archive_protected_turn_overflow(terminal, state, width, conversation_height)? {
@@ -591,13 +609,24 @@ fn archive_message_prefix<B>(
     state: &mut UiState,
     count: usize,
     width: u16,
-) -> Result<()>
+) -> Result<bool>
 where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let lines = conversation_lines_for_messages(&state.messages[..count]);
-    insert_transcript_lines(terminal, lines, width)?;
+    let count = if state
+        .messages
+        .get(count)
+        .is_some_and(|message| is_turn_boundary(message.role))
+    {
+        count.saturating_add(1)
+    } else {
+        count
+    };
+    let lines = conversation_lines_for_messages(&state.messages[..count], width);
+    if !insert_transcript_lines(terminal, lines, width)? {
+        return Ok(false);
+    }
     state.messages.drain(..count);
     state.current_assistant = state
         .current_assistant
@@ -608,29 +637,107 @@ where
     state.protected_turn_start = state
         .protected_turn_start
         .map(|index| index.saturating_sub(count));
-    Ok(())
+    Ok(true)
+}
+
+fn is_turn_boundary(role: ViewRole) -> bool {
+    matches!(
+        role,
+        ViewRole::Separator | ViewRole::RunCompleted | ViewRole::RunCancelled | ViewRole::RunFailed
+    )
 }
 
 fn insert_transcript_lines<B>(
     terminal: &mut Terminal<B>,
     lines: Vec<Line<'static>>,
     width: u16,
-) -> Result<()>
+) -> Result<bool>
 where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     if lines.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let height = paragraph.line_count(width);
     let height = u16::try_from(height).context("单条终端历史记录过长")?;
+    let mut history = Buffer::empty(Rect::new(0, 0, width, height));
+    paragraph.render(history.area, &mut history);
+
+    let screen = terminal.backend().size().context("读取终端尺寸失败")?;
+    let mut viewport = terminal.get_frame().area();
+    let minimum_active = minimum_active_viewport_height(screen.height);
+    let maximum_history = screen.height.saturating_sub(minimum_active);
+    if maximum_history == 0 {
+        return Ok(false);
+    }
+
+    let grow = height.min(maximum_history.saturating_sub(viewport.y));
+    if grow > 0 {
+        draw_history_rows(terminal.backend_mut(), &history, 0, grow, viewport.y)?;
+        viewport.y = viewport.y.saturating_add(grow);
+        viewport.width = screen.width;
+        viewport.height = screen.height.saturating_sub(viewport.y);
+        terminal.resize(viewport).context("下移终端活动区失败")?;
+    }
+
+    let mut source_row = grow;
+    while source_row < height {
+        let chunk = height.saturating_sub(source_row).min(viewport.y);
+        if chunk == 0 {
+            return Ok(false);
+        }
+        terminal
+            .backend_mut()
+            .scroll_region_up(0..viewport.y, chunk)
+            .context("滚动终端历史区失败")?;
+        draw_history_rows(
+            terminal.backend_mut(),
+            &history,
+            source_row,
+            chunk,
+            viewport.y.saturating_sub(chunk),
+        )?;
+        source_row = source_row.saturating_add(chunk);
+    }
     terminal
-        .insert_before(height, move |buffer| {
-            paragraph.render(buffer.area, buffer);
-        })
-        .context("写入终端滚动历史失败")
+        .backend_mut()
+        .flush()
+        .context("刷新终端历史区失败")?;
+    Ok(true)
+}
+
+fn draw_history_rows<B>(
+    backend: &mut B,
+    history: &Buffer,
+    source_row: u16,
+    row_count: u16,
+    target_y: u16,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let width = usize::from(history.area.width);
+    let start = usize::from(source_row).saturating_mul(width);
+    let count = usize::from(row_count).saturating_mul(width);
+    let end = start.saturating_add(count).min(history.content.len());
+    backend
+        .draw(
+            history.content[start..end]
+                .iter()
+                .enumerate()
+                .map(|(index, cell)| {
+                    (
+                        u16::try_from(index % width).unwrap_or(u16::MAX),
+                        target_y.saturating_add(u16::try_from(index / width).unwrap_or(u16::MAX)),
+                        cell,
+                    )
+                }),
+        )
+        .context("写入终端历史行失败")?;
+    Ok(())
 }
 
 fn archive_protected_turn_overflow<B>(
@@ -667,8 +774,7 @@ where
         return Ok(false);
     };
     if anchor > 0 {
-        archive_message_prefix(terminal, state, anchor, width)?;
-        return Ok(true);
+        return archive_message_prefix(terminal, state, anchor, width);
     }
 
     let Some(message) = state.messages.first() else {
@@ -688,8 +794,7 @@ where
         return Ok(false);
     };
     if suffix.is_empty() {
-        archive_message_prefix(terminal, state, 1, width)?;
-        return Ok(true);
+        return archive_message_prefix(terminal, state, 1, width);
     }
 
     let fragment = ViewMessage {
@@ -702,9 +807,11 @@ where
         file_change: None,
         running: false,
     };
-    let mut lines = conversation_lines_for_messages(std::slice::from_ref(&fragment));
+    let mut lines = conversation_lines_for_messages(std::slice::from_ref(&fragment), width);
     lines.pop();
-    insert_transcript_lines(terminal, lines, width)?;
+    if !insert_transcript_lines(terminal, lines, width)? {
+        return Ok(false);
+    }
     if let Some(message) = state.messages.first_mut() {
         message.content = suffix;
         message.reasoning.clear();
@@ -1920,6 +2027,7 @@ enum ViewRole {
     Tool,
     Notice,
     Error,
+    Separator,
     RunCompleted,
     RunCancelled,
     RunFailed,
@@ -2232,6 +2340,7 @@ impl UiState {
         match message.role {
             MessageRole::System => {}
             MessageRole::User => {
+                self.push_turn_separator_if_needed();
                 let prompt = message.content.unwrap_or_default();
                 self.record_input(prompt.clone());
                 let content = sanitize_terminal_text(&format_user_content(prompt, &message.images));
@@ -2319,6 +2428,7 @@ impl UiState {
 
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
         self.show_welcome = false;
+        self.push_turn_separator_if_needed();
         self.record_input(prompt.clone());
         self.messages.push(ViewMessage {
             role: ViewRole::User,
@@ -2330,6 +2440,34 @@ impl UiState {
             file_change: None,
             running: false,
         });
+    }
+
+    fn push_turn_separator_if_needed(&mut self) {
+        let has_previous_turn = self
+            .messages
+            .iter()
+            .any(|message| message.role == ViewRole::User);
+        let already_separated = self.messages.last().is_some_and(|message| {
+            matches!(
+                message.role,
+                ViewRole::Separator
+                    | ViewRole::RunCompleted
+                    | ViewRole::RunCancelled
+                    | ViewRole::RunFailed
+            )
+        });
+        if has_previous_turn && !already_separated {
+            self.messages.push(ViewMessage {
+                role: ViewRole::Separator,
+                title: String::new(),
+                content: String::new(),
+                reasoning: String::new(),
+                tool_arguments: None,
+                tool_id: None,
+                file_change: None,
+                running: false,
+            });
+        }
     }
 
     fn take_pending_images(&mut self) -> Vec<ImageAttachment> {
@@ -3090,7 +3228,17 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         return;
     }
 
-    let heights = ui_section_heights(state, area.width, area.height);
+    let layout_area = if area.y == 0 {
+        area
+    } else {
+        Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            desired_ui_height(state, area.width).min(area.height),
+        )
+    };
+    let heights = ui_section_heights(state, layout_area.width, layout_area.height);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3101,12 +3249,24 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
             Constraint::Length(INPUT_FOOTER_GAP),
             Constraint::Length(1),
         ])
-        .split(area);
+        .split(layout_area);
     render_conversation(frame, state, areas[0]);
     render_slash_suggestions(frame, state, areas[1]);
     render_activity_status(frame, state, areas[2]);
     render_input(frame, state, areas[3]);
     render_footer(frame, state, areas[5]);
+}
+
+fn desired_ui_height(state: &UiState, width: u16) -> u16 {
+    let sections = ui_section_heights(state, width, u16::MAX);
+    let conversation =
+        u16::try_from(transcript_line_count(state, &state.messages, width)).unwrap_or(u16::MAX);
+    conversation
+        .saturating_add(sections.suggestions)
+        .saturating_add(sections.activity)
+        .saturating_add(sections.input)
+        .saturating_add(INPUT_FOOTER_GAP)
+        .saturating_add(1)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3221,7 +3381,7 @@ fn transcript_lines_for_messages(
             lines.push(Line::default());
         }
     }
-    lines.extend(conversation_lines_for_messages(messages));
+    lines.extend(conversation_lines_for_messages(messages, content_width));
     lines
 }
 
@@ -3872,18 +4032,23 @@ fn split_reasoning_summary_parts(parts: &[String]) -> (String, String) {
 
 #[cfg(test)]
 fn conversation_lines(state: &UiState) -> Vec<Line<'static>> {
-    conversation_lines_for_messages(&state.messages)
+    conversation_lines_for_messages(&state.messages, 80)
 }
 
-fn conversation_lines_for_messages(messages: &[ViewMessage]) -> Vec<Line<'static>> {
+fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for message in messages {
+        if message.role == ViewRole::Separator {
+            remove_trailing_blank_line(&mut lines);
+            append_turn_separator(&mut lines, width);
+            continue;
+        }
         if matches!(
             message.role,
             ViewRole::RunCompleted | ViewRole::RunCancelled | ViewRole::RunFailed
         ) {
-            append_run_summary(&mut lines, message);
-            lines.push(Line::default());
+            remove_trailing_blank_line(&mut lines);
+            append_run_summary(&mut lines, message, width);
             continue;
         }
 
@@ -3926,6 +4091,7 @@ fn conversation_lines_for_messages(messages: &[ViewMessage]) -> Vec<Line<'static
             ViewRole::Error => (THEME_RED, Style::default().fg(THEME_RED)),
             ViewRole::User
             | ViewRole::Assistant
+            | ViewRole::Separator
             | ViewRole::RunCompleted
             | ViewRole::RunCancelled
             | ViewRole::RunFailed => unreachable!(),
@@ -3946,14 +4112,27 @@ fn conversation_lines_for_messages(messages: &[ViewMessage]) -> Vec<Line<'static
     lines
 }
 
-fn append_run_summary(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
+fn remove_trailing_blank_line(lines: &mut Vec<Line<'static>>) {
+    if lines.last().is_some_and(|line| line.width() == 0) {
+        lines.pop();
+    }
+}
+
+fn append_turn_separator(lines: &mut Vec<Line<'static>>, width: u16) {
+    lines.push(Line::from(Span::styled(
+        "─".repeat(usize::from(width)),
+        Style::default().fg(THEME_MUTED),
+    )));
+}
+
+fn append_run_summary(lines: &mut Vec<Line<'static>>, message: &ViewMessage, width: u16) {
     let (label, color) = match message.role {
         ViewRole::RunCompleted => ("已完成", THEME_GREEN),
         ViewRole::RunCancelled => ("已取消", THEME_YELLOW),
         ViewRole::RunFailed => ("失败", THEME_RED),
         _ => return,
     };
-    lines.push(Line::from(vec![
+    let mut line = Line::from(vec![
         Span::styled("─ ", Style::default().fg(THEME_MUTED)),
         Span::styled(
             label,
@@ -3961,7 +4140,16 @@ fn append_run_summary(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
         ),
         Span::styled(" · 用时 ", Style::default().fg(THEME_MUTED)),
         Span::styled(message.content.clone(), Style::default().fg(THEME_SUBTEXT)),
-    ]));
+        Span::styled(" ", Style::default().fg(THEME_MUTED)),
+    ]);
+    let remaining = usize::from(width).saturating_sub(line.width());
+    if remaining > 0 {
+        line.spans.push(Span::styled(
+            "─".repeat(remaining),
+            Style::default().fg(THEME_MUTED),
+        ));
+    }
+    lines.push(line);
 }
 
 fn append_reasoning_summary(lines: &mut Vec<Line<'static>>, reasoning: &str) {
@@ -4848,6 +5036,82 @@ mod tests {
     }
 
     #[test]
+    fn restores_compact_turn_separators_and_keeps_them_for_the_next_input() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_history(ChatMessage::user("旧问题"));
+        state.push_history(ChatMessage::assistant(
+            Some("旧回答".to_string()),
+            None,
+            Vec::new(),
+        ));
+        state.push_history(ChatMessage::user("后续问题"));
+        state.push_history(ChatMessage::assistant(
+            Some("后续回答".to_string()),
+            None,
+            Vec::new(),
+        ));
+        state.push_user("恢复后继续".to_string(), &[]);
+
+        let rendered = conversation_lines_for_messages(&state.messages, 32)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let separators = rendered
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| (line == &"─".repeat(32)).then_some(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(separators.len(), 2);
+        for index in separators {
+            assert!(index > 0);
+            assert!(!rendered[index - 1].is_empty());
+            assert!(rendered.get(index + 1).is_some_and(|line| !line.is_empty()));
+        }
+
+        let backend = TestBackend::new(32, 24);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 32, 24)),
+            },
+        )
+        .unwrap();
+        archive_message_prefix(&mut terminal, &mut state, 2, 32).unwrap();
+
+        assert_eq!(
+            state.messages.first().map(|message| message.role),
+            Some(ViewRole::User)
+        );
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(32)
+            .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+            .collect::<Vec<_>>();
+        let separator = rows.iter().position(|row| row == &"─".repeat(32)).unwrap();
+        assert!(separator > 0);
+        assert!(!rows[separator - 1].trim().is_empty());
+
+        let active_top = usize::from(terminal.get_frame().area().y);
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let next_turn = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "后").then_some(index / 32))
+            .unwrap();
+        assert_eq!(next_turn, active_top);
+    }
+
+    #[test]
     fn submitting_a_collapsed_paste_sends_its_full_contents() {
         let pasted = "full pasted content\n".repeat(COLLAPSED_PASTE_LINE_THRESHOLD);
         let mut state = UiState::new(
@@ -5104,11 +5368,11 @@ mod tests {
         }
         state.apply_agent_event(AgentEvent::TextDelta { text: output });
 
-        let backend = TestBackend::new(40, 12);
+        let backend = TestBackend::new(40, 24);
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(12),
+                viewport: Viewport::Fixed(Rect::new(0, 0, 40, 24)),
             },
         )
         .unwrap();
@@ -5119,8 +5383,18 @@ mod tests {
         assert_eq!(tail.role, ViewRole::Assistant);
         assert!(!tail.content.lines().any(|line| line == "第 1 行稳定输出"));
         assert!(tail.content.contains("第 30 行"));
-        let conversation_height = usize::from(ui_section_heights(&state, 40, 12).conversation);
+        let conversation_height = usize::from(ui_section_heights(&state, 40, 24).conversation);
         assert!(transcript_line_count(&state, &state.messages, 40) <= conversation_height);
+        assert_eq!(terminal.get_frame().area().y, 8);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .take(40)
+                .any(|cell| !cell.symbol().trim().is_empty())
+        );
 
         let mut code_state = UiState::new(
             "model".to_string(),
@@ -5139,11 +5413,11 @@ mod tests {
         code_state.apply_agent_event(AgentEvent::TextDelta { text: code });
         code_state.apply_agent_event(AgentEvent::RunFinished);
 
-        let backend = TestBackend::new(40, 12);
+        let backend = TestBackend::new(40, 24);
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(12),
+                viewport: Viewport::Fixed(Rect::new(0, 0, 40, 24)),
             },
         )
         .unwrap();
@@ -5156,10 +5430,12 @@ mod tests {
                 .all(|message| message.role != ViewRole::Assistant)
         );
         assert!(
-            code_state
-                .messages
+            terminal
+                .backend()
+                .buffer()
+                .content
                 .iter()
-                .any(|message| message.role == ViewRole::RunCompleted)
+                .any(|cell| cell.symbol() == "已")
         );
     }
 
@@ -5268,7 +5544,7 @@ mod tests {
         state.start_assistant_message();
 
         assert_eq!(transcript_archive_count(&state, 40, 5), 1);
-        let lines = conversation_lines_for_messages(&state.messages);
+        let lines = conversation_lines_for_messages(&state.messages, 40);
         let user_span = lines
             .iter()
             .flat_map(|line| &line.spans)
@@ -5286,7 +5562,7 @@ mod tests {
             file_change: None,
             running: false,
         };
-        let assistant_lines = conversation_lines_for_messages(&[assistant]);
+        let assistant_lines = conversation_lines_for_messages(&[assistant], 40);
         let assistant_span = assistant_lines
             .iter()
             .flat_map(|line| &line.spans)
@@ -5525,7 +5801,7 @@ mod tests {
             running: false,
         };
 
-        let lines = conversation_lines_for_messages(&[message]);
+        let lines = conversation_lines_for_messages(&[message], 80);
         let rendered = lines
             .iter()
             .map(Line::to_string)
