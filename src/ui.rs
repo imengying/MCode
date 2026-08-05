@@ -18,13 +18,14 @@ use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions, Parser, Tag,
     TagEnd,
 };
-use ratatui::backend::{Backend, ClearType as BackendClearType, CrosstermBackend, WindowSize};
+use ratatui::backend::{Backend, ClearType as BackendClearType, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui_crossterm::CrosstermBackend;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -53,6 +54,7 @@ const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_QUEUED_SUBMISSIONS: usize = 8;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
+const ACTIVE_VIEWPORT_HEIGHT: u16 = 16;
 const PREVIEW_LINE_CHARS: usize = 240;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
@@ -136,16 +138,15 @@ pub fn run_interactive(
     };
 
     let screen = ScreenGuard::enter()?;
-    let backend = UiBackend::new(io::stdout());
-    let viewport_height = backend.size().context("读取终端尺寸失败")?.height;
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
-        },
-    )
-    .context("初始化终端失败")?;
-    clear_terminal_view(&mut terminal)?;
+    let has_initial_prompt = initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty());
+    let mut compact_viewport = has_pending_run
+        || has_initial_prompt
+        || historical_compaction.is_some()
+        || !historical_messages.is_empty()
+        || !state.messages.is_empty();
+    let mut terminal = create_ui_terminal(compact_viewport)?;
 
     if let Some(checkpoint) = historical_compaction {
         state.push_notice(format!(
@@ -157,6 +158,7 @@ pub fn run_interactive(
     for message in historical_messages {
         state.push_history(message);
     }
+    state.protect_resumed_turn();
     state.hold_pending_tools(&pending_tool_ids);
     let mut active_cancel = None;
     if has_pending_run {
@@ -260,6 +262,10 @@ pub fn run_interactive(
                         break;
                     }
                     UiAction::Submit { prompt, images } => {
+                        if !compact_viewport {
+                            terminal = create_ui_terminal(true)?;
+                            compact_viewport = true;
+                        }
                         start_run(
                             Arc::clone(&agent),
                             prompt,
@@ -325,8 +331,8 @@ pub fn run_interactive(
                                     .map(|path| (agent.session().id(), path));
                                 state.reset_session();
                                 state.sync_from_agent(&agent);
-                                clear_terminal_view(&mut terminal)?;
-                                state.push_notice("已新建会话。");
+                                terminal = create_ui_terminal(false)?;
+                                compact_viewport = false;
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
                         },
@@ -344,7 +350,7 @@ pub fn run_interactive(
                     },
                     UiAction::Clear => {
                         state.clear_view();
-                        clear_terminal_view(&mut terminal)?;
+                        terminal = create_ui_terminal(compact_viewport)?;
                     }
                     UiAction::PasteClipboard => paste_from_clipboard(&mut state),
                     UiAction::ResolveApproval(decision) => {
@@ -364,6 +370,9 @@ pub fn run_interactive(
             }
             Event::FocusGained => needs_draw = true,
             Event::Resize(..) => {
+                if !compact_viewport {
+                    terminal = create_ui_terminal(false)?;
+                }
                 needs_draw = true;
             }
             _ => {}
@@ -422,6 +431,14 @@ impl<W: Write> Backend for UiBackend<W> {
         self.inner.append_lines(count)
     }
 
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_up(region, amount)
+    }
+
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_down(region, amount)
+    }
+
     fn hide_cursor(&mut self) -> io::Result<()> {
         self.inner.hide_cursor()
     }
@@ -469,6 +486,36 @@ impl<W: Write> Backend for UiBackend<W> {
 
 type UiTerminal = Terminal<UiBackend<io::Stdout>>;
 
+fn create_ui_terminal(compact: bool) -> Result<UiTerminal> {
+    let mut backend = UiBackend::new(io::stdout());
+    let size = backend.size().context("读取终端尺寸失败")?;
+    let viewport_height = if compact {
+        ACTIVE_VIEWPORT_HEIGHT.min(size.height)
+    } else {
+        size.height
+    }
+    .max(1);
+    let top = size.height.saturating_sub(viewport_height);
+    execute!(
+        io::stdout(),
+        MoveTo(0, 0),
+        Clear(TerminalClearType::All),
+        Clear(TerminalClearType::Purge),
+        MoveTo(0, top)
+    )
+    .context("重置终端页面失败")?;
+    backend.cursor = Some(Position::new(0, top));
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )
+    .context("初始化终端失败")?;
+    terminal.clear().context("重置终端视口失败")?;
+    Ok(terminal)
+}
+
 fn clear_terminal_view(terminal: &mut UiTerminal) -> Result<()> {
     execute!(
         io::stdout(),
@@ -515,29 +562,42 @@ impl DrawPositionAdapter {
     }
 }
 
-fn archive_transcript_overflow(terminal: &mut UiTerminal, state: &mut UiState) -> Result<()> {
+fn archive_transcript_overflow<B>(terminal: &mut Terminal<B>, state: &mut UiState) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     terminal.autoresize().context("调整终端视口失败")?;
-    let size = terminal.size().context("读取终端尺寸失败")?;
+    let area = terminal.get_frame().area();
     let conversation_height =
-        usize::from(ui_section_heights(state, size.width, size.height).conversation);
-    let width = size.width.max(1);
-    let count = transcript_archive_count(state, width, conversation_height);
-    if count == 0 {
-        return Ok(());
-    }
+        usize::from(ui_section_heights(state, area.width, area.height).conversation);
+    let width = area.width.max(1);
 
+    loop {
+        let count = transcript_archive_count(state, width, conversation_height);
+        if count > 0 {
+            archive_message_prefix(terminal, state, count, width)?;
+            continue;
+        }
+        if !archive_protected_turn_overflow(terminal, state, width, conversation_height)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn archive_message_prefix<B>(
+    terminal: &mut Terminal<B>,
+    state: &mut UiState,
+    count: usize,
+    width: u16,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let lines = conversation_lines_for_messages(&state.messages[..count]);
-    if !lines.is_empty() {
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        let height = paragraph.line_count(width);
-        let height = u16::try_from(height).context("单条终端历史记录过长")?;
-        terminal
-            .insert_before(height, move |buffer| {
-                paragraph.render(buffer.area, buffer);
-            })
-            .context("写入终端滚动历史失败")?;
-    }
-
+    insert_transcript_lines(terminal, lines, width)?;
     state.messages.drain(..count);
     state.current_assistant = state
         .current_assistant
@@ -547,8 +607,196 @@ fn archive_transcript_overflow(terminal: &mut UiTerminal, state: &mut UiState) -
         .and_then(|index| index.checked_sub(count));
     state.protected_turn_start = state
         .protected_turn_start
-        .and_then(|index| index.checked_sub(count));
+        .map(|index| index.saturating_sub(count));
     Ok(())
+}
+
+fn insert_transcript_lines<B>(
+    terminal: &mut Terminal<B>,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let height = paragraph.line_count(width);
+    let height = u16::try_from(height).context("单条终端历史记录过长")?;
+    terminal
+        .insert_before(height, move |buffer| {
+            paragraph.render(buffer.area, buffer);
+        })
+        .context("写入终端滚动历史失败")
+}
+
+fn archive_protected_turn_overflow<B>(
+    terminal: &mut Terminal<B>,
+    state: &mut UiState,
+    width: u16,
+    conversation_height: usize,
+) -> Result<bool>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    if transcript_line_count(state, &state.messages, width) <= conversation_height {
+        return Ok(false);
+    }
+    let Some(protected_start) = state.protected_turn_start else {
+        return Ok(false);
+    };
+    if protected_start > 0 {
+        return Ok(false);
+    }
+
+    let anchor = state
+        .messages
+        .iter()
+        .position(|message| message.running)
+        .or_else(|| {
+            state
+                .messages
+                .iter()
+                .rposition(|message| message.role == ViewRole::Assistant)
+        });
+    let Some(anchor) = anchor else {
+        return Ok(false);
+    };
+    if anchor > 0 {
+        archive_message_prefix(terminal, state, anchor, width)?;
+        return Ok(true);
+    }
+
+    let Some(message) = state.messages.first() else {
+        return Ok(false);
+    };
+    if message.role != ViewRole::Assistant || message.content.is_empty() {
+        return Ok(false);
+    }
+    let following_height = transcript_line_count(state, &state.messages[1..], width);
+    let tail_height = conversation_height
+        .saturating_sub(following_height)
+        .saturating_sub(1)
+        .max(1);
+    let Some((prefix, suffix)) =
+        split_markdown_for_scrollback(&message.content, width, tail_height, !message.running)
+    else {
+        return Ok(false);
+    };
+    if suffix.is_empty() {
+        archive_message_prefix(terminal, state, 1, width)?;
+        return Ok(true);
+    }
+
+    let fragment = ViewMessage {
+        role: ViewRole::Assistant,
+        title: String::new(),
+        content: prefix,
+        reasoning: message.reasoning.clone(),
+        tool_arguments: None,
+        tool_id: None,
+        file_change: None,
+        running: false,
+    };
+    let mut lines = conversation_lines_for_messages(std::slice::from_ref(&fragment));
+    lines.pop();
+    insert_transcript_lines(terminal, lines, width)?;
+    if let Some(message) = state.messages.first_mut() {
+        message.content = suffix;
+        message.reasoning.clear();
+    }
+    Ok(true)
+}
+
+fn split_markdown_for_scrollback(
+    content: &str,
+    width: u16,
+    tail_height: usize,
+    allow_inline_split: bool,
+) -> Option<(String, String)> {
+    let mut candidates = markdown_line_split_candidates(content);
+    if candidates.is_empty() && allow_inline_split && !contains_fenced_code(content) {
+        candidates.extend(
+            content
+                .char_indices()
+                .filter_map(|(index, character)| character.is_whitespace().then_some(index)),
+        );
+    }
+    if allow_inline_split {
+        candidates.push(content.len());
+    }
+    candidates.retain(|offset| *offset > 0 && *offset <= content.len());
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let suffix_height = |offset: usize| {
+        let suffix = content[offset..].trim_start_matches(['\r', '\n']);
+        let lines = MarkdownRenderer::new(Style::default().fg(THEME_TEXT)).render(suffix);
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .line_count(width.max(1))
+    };
+    let index = candidates.partition_point(|offset| suffix_height(*offset) > tail_height);
+    let offset = *candidates.get(index)?;
+    let prefix = content[..offset].trim_end_matches(['\r', '\n']);
+    let suffix = content[offset..].trim_start_matches(['\r', '\n']);
+    (!prefix.is_empty()).then(|| (prefix.to_string(), suffix.to_string()))
+}
+
+fn markdown_line_split_candidates(content: &str) -> Vec<usize> {
+    let mut candidates = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = trimmed
+            .chars()
+            .next()
+            .filter(|character| matches!(character, '`' | '~'));
+        if let Some(marker) = marker {
+            let count = trimmed
+                .chars()
+                .take_while(|character| *character == marker)
+                .count();
+            if count >= 3 {
+                match fence {
+                    Some((active, length)) if active == marker && count >= length => fence = None,
+                    None => fence = Some((marker, count)),
+                    _ => {}
+                }
+            }
+        }
+        offset = offset.saturating_add(line.len());
+        if fence.is_none() && offset < content.len() {
+            candidates.push(offset);
+        }
+    }
+    candidates
+}
+
+fn contains_fenced_code(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let Some(marker) = trimmed
+            .chars()
+            .next()
+            .filter(|character| matches!(character, '`' | '~'))
+        else {
+            return false;
+        };
+        trimmed
+            .chars()
+            .take_while(|character| *character == marker)
+            .count()
+            >= 3
+    })
 }
 
 fn transcript_archive_count(state: &UiState, width: u16, conversation_height: usize) -> usize {
@@ -4556,6 +4804,8 @@ impl Drop for ScreenGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -4835,6 +5085,82 @@ mod tests {
             .find_map(|(index, cell)| (cell.symbol() == "已").then_some(index / 40))
             .unwrap();
         assert!(completed_y.saturating_sub(final_line_y) <= 2);
+    }
+
+    #[test]
+    fn moves_stable_output_to_scrollback_and_keeps_the_live_tail_visible() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.protect_new_turn();
+        state.push_user("写一段长内容".to_string(), &[]);
+        state.begin_run("处理中");
+        state.apply_agent_event(AgentEvent::AssistantStarted);
+        let mut output = String::new();
+        for line in 1..=30 {
+            writeln!(output, "第 {line} 行稳定输出").unwrap();
+        }
+        state.apply_agent_event(AgentEvent::TextDelta { text: output });
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(12),
+            },
+        )
+        .unwrap();
+        archive_transcript_overflow(&mut terminal, &mut state).unwrap();
+
+        assert_eq!(state.messages.len(), 1);
+        let tail = &state.messages[0];
+        assert_eq!(tail.role, ViewRole::Assistant);
+        assert!(!tail.content.lines().any(|line| line == "第 1 行稳定输出"));
+        assert!(tail.content.contains("第 30 行"));
+        let conversation_height = usize::from(ui_section_heights(&state, 40, 12).conversation);
+        assert!(transcript_line_count(&state, &state.messages, 40) <= conversation_height);
+
+        let mut code_state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        code_state.protect_new_turn();
+        code_state.push_user("输出代码".to_string(), &[]);
+        code_state.begin_run("处理中");
+        code_state.apply_agent_event(AgentEvent::AssistantStarted);
+        let mut code = String::from("```rust\n");
+        for line in 1..=30 {
+            writeln!(code, "let value_{line} = {line};").unwrap();
+        }
+        code.push_str("```\n");
+        code_state.apply_agent_event(AgentEvent::TextDelta { text: code });
+        code_state.apply_agent_event(AgentEvent::RunFinished);
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(12),
+            },
+        )
+        .unwrap();
+        archive_transcript_overflow(&mut terminal, &mut code_state).unwrap();
+
+        assert!(
+            code_state
+                .messages
+                .iter()
+                .all(|message| message.role != ViewRole::Assistant)
+        );
+        assert!(
+            code_state
+                .messages
+                .iter()
+                .any(|message| message.role == ViewRole::RunCompleted)
+        );
     }
 
     #[test]

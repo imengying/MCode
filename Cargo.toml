@@ -30,9 +30,9 @@ futures-util = "0.3"
 infer = { version = "0.22", default-features = false }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = [
-    "crossterm",
     "unstable-rendered-line-info",
 ] }
+ratatui-crossterm = { version = "0.1", features = ["scrolling-regions"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process"] }
 semver = "1.0"
