@@ -205,6 +205,9 @@ pub fn run_interactive(
                 state.clear_pending_approval();
             }
         }
+        if state.advance_usage_animation(Instant::now()) {
+            needs_draw = true;
+        }
         if pending_approval.is_none()
             && let Ok(request) = approval_rx.try_recv()
         {
@@ -2187,6 +2190,9 @@ struct UiState {
     usage: Usage,
     live_prompt_tokens: u64,
     live_completion: String,
+    animated_prompt_tokens: u64,
+    animated_completion_tokens: u64,
+    usage_animation_updated_at: Instant,
     context_tokens: u64,
     context_window: u64,
     max_input_tokens: u64,
@@ -2236,6 +2242,9 @@ impl UiState {
             usage: Usage::default(),
             live_prompt_tokens: 0,
             live_completion: String::new(),
+            animated_prompt_tokens: 0,
+            animated_completion_tokens: 0,
+            usage_animation_updated_at: Instant::now(),
             context_tokens: 0,
             context_window: 128_000,
             max_input_tokens: 128_000,
@@ -2272,6 +2281,7 @@ impl UiState {
         self.model_choices = agent.model_choices();
         self.reasoning_choices = agent.available_reasoning_efforts();
         self.usage = agent.total_usage();
+        self.sync_usage_animation();
         self.context_tokens = agent.context_tokens();
         self.context_window = agent.context_window();
         self.max_input_tokens = agent.max_input_tokens();
@@ -2327,6 +2337,40 @@ impl UiState {
             total_tokens: self.live_prompt_tokens.saturating_add(completion_tokens),
             cached_prompt_tokens: None,
         })
+    }
+
+    fn animated_usage(&self) -> Usage {
+        Usage {
+            prompt_tokens: self.animated_prompt_tokens,
+            completion_tokens: self.animated_completion_tokens,
+            total_tokens: self
+                .animated_prompt_tokens
+                .saturating_add(self.animated_completion_tokens),
+            cached_prompt_tokens: self.usage.cached_prompt_tokens,
+        }
+    }
+
+    fn sync_usage_animation(&mut self) {
+        let target = self.displayed_usage();
+        self.animated_prompt_tokens = target.prompt_tokens;
+        self.animated_completion_tokens = target.completion_tokens;
+        self.usage_animation_updated_at = Instant::now();
+    }
+
+    fn advance_usage_animation(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.usage_animation_updated_at) < FRAME_INTERVAL {
+            return false;
+        }
+        self.usage_animation_updated_at = now;
+        let target = self.displayed_usage();
+        let prompt = animate_token_count(self.animated_prompt_tokens, target.prompt_tokens);
+        let completion =
+            animate_token_count(self.animated_completion_tokens, target.completion_tokens);
+        let changed =
+            prompt != self.animated_prompt_tokens || completion != self.animated_completion_tokens;
+        self.animated_prompt_tokens = prompt;
+        self.animated_completion_tokens = completion;
+        changed
     }
 
     fn displayed_context_tokens(&self) -> u64 {
@@ -2573,6 +2617,7 @@ impl UiState {
         self.protected_turn_start = None;
         self.usage = Usage::default();
         self.clear_live_usage();
+        self.sync_usage_animation();
         self.context_tokens = 0;
         self.usage_estimated = false;
         self.status = "就绪".to_string();
@@ -3825,7 +3870,7 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    let usage_values = state.displayed_usage();
+    let usage_values = state.animated_usage();
     let context_tokens = state.displayed_context_tokens();
     let estimate = if state.displayed_usage_is_estimated() {
         "~"
@@ -3950,6 +3995,13 @@ fn context_usage_color(tokens: u64, limit: u64) -> Color {
     } else {
         THEME_GREEN
     }
+}
+
+fn animate_token_count(current: u64, target: u64) -> u64 {
+    if target <= current {
+        return target;
+    }
+    current.saturating_add(target.saturating_sub(current).div_ceil(4))
 }
 
 fn format_elapsed_compact(elapsed_secs: u64) -> String {
@@ -4133,19 +4185,19 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
                     Style::default().fg(THEME_TEXT),
                 );
             }
-            lines.push(Line::default());
+            append_message_gap(&mut lines);
             continue;
         }
 
         if matches!(message.role, ViewRole::Tool | ViewRole::Error) && message.tool_id.is_some() {
             append_tool_message(&mut lines, message);
-            lines.push(Line::default());
+            append_message_gap(&mut lines);
             continue;
         }
 
         if message.role == ViewRole::User {
             append_user_message(&mut lines, &message.content);
-            lines.push(Line::default());
+            append_message_gap(&mut lines);
             continue;
         }
 
@@ -4171,9 +4223,16 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
             Span::styled(running, Style::default().fg(THEME_MUTED)),
         ]));
         append_markdown_lines(&mut lines, &message.content, content_style);
-        lines.push(Line::default());
+        append_message_gap(&mut lines);
     }
     lines
+}
+
+fn append_message_gap(lines: &mut Vec<Line<'static>>) {
+    while lines.last().is_some_and(|line| line.width() == 0) {
+        lines.pop();
+    }
+    lines.push(Line::default());
 }
 
 fn remove_trailing_blank_line(lines: &mut Vec<Line<'static>>) {
@@ -4304,10 +4363,24 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
         } else {
             Style::default().fg(THEME_MUTED)
         };
-        if message.running {
+        if message.title == "shell"
+            && !message.running
+            && let Some(output) = parse_shell_output(&message.content)
+        {
+            append_shell_output(lines, &output, style);
+        } else if message.running {
+            let content = if message.title == "shell" {
+                message
+                    .content
+                    .strip_prefix("\nstderr:\n")
+                    .unwrap_or(&message.content)
+                    .replace("\nstderr:\n", "\n")
+            } else {
+                message.content.clone()
+            };
             append_tail_preview_lines(
                 lines,
-                &message.content,
+                &content,
                 TOOL_OUTPUT_PREVIEW_LINES,
                 "  └ ",
                 "    ",
@@ -4324,6 +4397,47 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
             );
         }
     }
+}
+
+struct ShellOutput<'a> {
+    exit_code: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
+fn parse_shell_output(content: &str) -> Option<ShellOutput<'_>> {
+    let content = content.strip_prefix("exit code: ")?;
+    let (exit_code, streams) = content.split_once("\nstdout:\n")?;
+    let (stdout, stderr) = streams.rsplit_once("\nstderr:\n")?;
+    Some(ShellOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn append_shell_output(lines: &mut Vec<Line<'static>>, output: &ShellOutput<'_>, style: Style) {
+    let mut preview = Vec::new();
+    if output.exit_code != "0" {
+        preview.push(format!("exit code: {}", output.exit_code));
+    }
+    for stream in [output.stdout, output.stderr] {
+        let stream = stream.trim_matches('\n');
+        if !stream.is_empty() && stream != "<empty>" {
+            preview.extend(stream.lines().map(ToString::to_string));
+        }
+    }
+    if preview.is_empty() {
+        preview.push("(无输出)".to_string());
+    }
+    append_preview_lines(
+        lines,
+        &preview.join("\n"),
+        TOOL_OUTPUT_PREVIEW_LINES,
+        "  └ ",
+        "    ",
+        style,
+    );
 }
 
 fn append_shell_tool_header(
@@ -5434,6 +5548,33 @@ mod tests {
     }
 
     #[test]
+    fn animates_live_input_and_output_token_counts() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.begin_live_usage(400);
+        state.append_live_completion(&"a".repeat(400));
+        let target = state.displayed_usage();
+        let mut now = Instant::now();
+        state.usage_animation_updated_at = now.checked_sub(FRAME_INTERVAL).unwrap();
+
+        assert!(state.advance_usage_animation(now));
+        let first_frame = state.animated_usage();
+        assert!(first_frame.prompt_tokens > 0);
+        assert!(first_frame.prompt_tokens < target.prompt_tokens);
+        assert!(first_frame.completion_tokens > 0);
+        assert!(first_frame.completion_tokens < target.completion_tokens);
+
+        for _ in 0..32 {
+            now += FRAME_INTERVAL;
+            state.advance_usage_animation(now);
+        }
+        assert_eq!(state.animated_usage(), target);
+    }
+
+    #[test]
     fn moves_stable_output_to_scrollback_and_keeps_the_live_tail_visible() {
         let mut state = UiState::new(
             "model".to_string(),
@@ -5790,6 +5931,37 @@ mod tests {
     }
 
     #[test]
+    fn keeps_one_blank_row_between_live_output_and_activity() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_user("继续".to_string(), &[]);
+        state.apply_agent_event(AgentEvent::RunStarted);
+        state.apply_agent_event(AgentEvent::AssistantStarted);
+        state.apply_agent_event(AgentEvent::TextDelta {
+            text: "正在输出的最后一行\n\n".to_string(),
+        });
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+            .collect::<Vec<_>>();
+        let output_y = rows.iter().position(|row| row.contains('最')).unwrap();
+        let activity_y = rows.iter().position(|row| row.contains('生')).unwrap();
+        assert_eq!(activity_y.saturating_sub(output_y), 2);
+        assert!(rows[output_y + 1].trim().is_empty());
+    }
+
+    #[test]
     fn pasted_image_paths_become_removable_attachments() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -5902,10 +6074,13 @@ mod tests {
         state.apply_agent_event(AgentEvent::ToolFinished {
             id: "call_shell".to_string(),
             name: "shell".to_string(),
-            output: (0..12)
-                .map(|index| format!("output {index}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            output: format!(
+                "exit code: 0\nstdout:\n{}\nstderr:\n<empty>",
+                (0..12)
+                    .map(|index| format!("output {index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
             is_error: false,
             file_change: None,
         });
@@ -5917,6 +6092,9 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("• 已运行 "));
         assert!(!rendered.contains("已运行命令"));
+        assert!(!rendered.contains("exit code:"));
+        assert!(!rendered.contains("stdout:"));
+        assert!(!rendered.contains("stderr:"));
         assert!(rendered.contains("first"));
         assert!(!rendered.contains("$ first"));
         assert!(rendered.contains("second"));
@@ -5930,6 +6108,29 @@ mod tests {
             1
         );
         assert!(!rendered.contains("折叠"));
+
+        state.apply_agent_event(AgentEvent::ToolStarted {
+            id: "call_empty".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({
+                "command": "true",
+                "timeout_seconds": 30
+            })
+            .to_string(),
+        });
+        state.apply_agent_event(AgentEvent::ToolFinished {
+            id: "call_empty".to_string(),
+            name: "shell".to_string(),
+            output: "exit code: 0\nstdout:\n<empty>\nstderr:\n<empty>".to_string(),
+            is_error: false,
+            file_change: None,
+        });
+        let no_output = conversation_lines(&state)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(no_output.contains("└ (无输出)"));
     }
 
     #[test]
