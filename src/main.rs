@@ -517,6 +517,13 @@ async fn run_exec(
                     sanitize_terminal_text(&message)
                 );
             }
+            AgentEvent::AssistantDiscarded => {
+                if streamed_text {
+                    println!();
+                    streamed_text = false;
+                }
+                eprintln!("[工具重试] 模型声明了本地操作但未调用工具，正在重试");
+            }
             AgentEvent::ResponseTruncated { had_tool_calls } => eprintln!(
                 "[响应不完整] {}",
                 if had_tool_calls {

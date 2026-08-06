@@ -16,6 +16,7 @@ pub enum AgentEvent {
     RunStarted,
     RunResumed,
     AssistantStarted,
+    AssistantDiscarded,
     AssistantRetrying {
         attempt: usize,
         max_attempts: usize,

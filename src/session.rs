@@ -213,6 +213,8 @@ enum SessionRecord {
     RunFinished {
         run_id: Uuid,
         outcome: RunOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
         created_at: u64,
     },
     ModelChanged {
@@ -652,6 +654,7 @@ impl Session {
                 SessionRecord::RunFinished {
                     run_id,
                     outcome: _,
+                    error: _,
                     created_at: _,
                 } => {
                     let active = active_run.as_ref().ok_or_else(|| {
@@ -1012,6 +1015,15 @@ impl Session {
     }
 
     pub fn finish_run(&mut self, run_id: Uuid, outcome: RunOutcome) -> Result<()> {
+        self.finish_run_with_error(run_id, outcome, None)
+    }
+
+    pub fn finish_run_with_error(
+        &mut self,
+        run_id: Uuid,
+        outcome: RunOutcome,
+        error: Option<String>,
+    ) -> Result<()> {
         let active = self
             .active_run
             .as_ref()
@@ -1025,6 +1037,7 @@ impl Session {
         self.persist_record(&SessionRecord::RunFinished {
             run_id,
             outcome,
+            error,
             created_at: unix_timestamp(),
         })?;
         self.active_run = None;
@@ -1650,5 +1663,36 @@ mod tests {
         assert_eq!(resumed.context_messages(), [ChatMessage::user("continue")]);
         assert!(!resumed.active_run_has_final_response());
         assert_eq!(resumed.total_usage(), usage);
+    }
+
+    #[test]
+    fn persists_run_failure_details_without_affecting_resume() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let metadata = SessionMetadata {
+            provider: "deepseek".to_string(),
+            model: "test-model".to_string(),
+            api: ApiProtocol::Responses,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();
+        let id = session.id();
+        let run_id = session.begin_run(ChatMessage::user("写入文件")).unwrap();
+        let path = session.path().unwrap().to_path_buf();
+        session
+            .finish_run_with_error(
+                run_id,
+                RunOutcome::Failed,
+                Some("provider completed without a tool call".to_string()),
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"error\":\"provider completed without a tool call\""));
+        drop(session);
+
+        let resumed =
+            Session::resume_in(base.path(), project.path(), Some(&id.to_string())).unwrap();
+        assert_eq!(resumed.messages(), [ChatMessage::user("写入文件")]);
     }
 }

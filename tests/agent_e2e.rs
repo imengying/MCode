@@ -166,6 +166,190 @@ async fn executes_a_tool_and_continues_the_model_turn() {
 }
 
 #[tokio::test]
+async fn retries_a_deferred_file_action_with_a_required_local_tool() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+
+    let server = tokio::spawn(async move {
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_requests
+                .lock()
+                .await
+                .push(read_json_request(&mut stream).await);
+            let event = match index {
+                0 => json!({
+                    "choices": [{
+                        "delta": {"content": "好的，这就追加到 result.txt。"},
+                        "finish_reason": "stop"
+                    }]
+                }),
+                1 => json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_retry_write",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": "{\"path\":\"result.txt\",\"content\":\"retried by tool\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                _ => json!({
+                    "choices": [{
+                        "delta": {"content": "已完成。"},
+                        "finish_reason": "stop"
+                    }]
+                }),
+            };
+            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+
+    let project = tempdir().unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let status = agent
+        .run(
+            "把结果写入 result.txt",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap();
+    drop(tx);
+    server.await.unwrap();
+
+    assert_eq!(status, RunStatus::Completed);
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("result.txt")).unwrap(),
+        "retried by tool"
+    );
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].get("tool_choice").is_none());
+    assert_eq!(requests[1]["tool_choice"], "required");
+    let retry_tool_names = requests[1]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retry_tool_names,
+        ["read_file", "write_file", "edit_file", "shell"]
+    );
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("did not call a tool"))
+            })
+    );
+    assert!(
+        drain_events(&mut rx)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantDiscarded))
+    );
+}
+
+#[tokio::test]
+async fn persists_an_error_when_a_deferred_action_retry_still_skips_tools() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+
+    let server = tokio::spawn(async move {
+        for response_text in ["好的，这就写入 result.txt。", "我暂时无法执行这个操作。"]
+        {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_requests
+                .lock()
+                .await
+                .push(read_json_request(&mut stream).await);
+            let event = json!({
+                "choices": [{
+                    "delta": {"content": response_text},
+                    "finish_reason": "stop"
+                }]
+            });
+            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+
+    let base = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let config = basic_chat_config(project.path(), address);
+    let metadata = SessionMetadata::from(&config);
+    let session = Session::create_in(base.path(), project.path(), metadata).unwrap();
+    let mut agent = Agent::new(&config, session).await.unwrap();
+    let session_path = agent.session().path().unwrap().to_path_buf();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let error = agent
+        .run(
+            "把结果写入 result.txt",
+            Vec::new(),
+            &tx,
+            &CancellationToken::new(),
+            &ApprovalGate::default(),
+        )
+        .await
+        .unwrap_err();
+    drop(tx);
+    server.await.unwrap();
+
+    assert!(error.to_string().contains("重试后仍未调用任何工具"));
+    assert_eq!(requests.lock().await.len(), 2);
+    let records = std::fs::read_to_string(session_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let finished = records
+        .iter()
+        .rev()
+        .find(|record| record["type"] == "run_finished")
+        .unwrap();
+    assert_eq!(finished["outcome"], "failed");
+    assert!(
+        finished["error"]
+            .as_str()
+            .unwrap()
+            .contains("重试后仍未调用任何工具")
+    );
+}
+
+#[tokio::test]
 async fn responses_api_runs_local_tools_and_native_web_search() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

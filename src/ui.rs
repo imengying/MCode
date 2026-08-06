@@ -2880,6 +2880,10 @@ impl UiState {
                 self.start_reasoning_summary();
                 self.status = "正在思考".to_string();
             }
+            AgentEvent::AssistantDiscarded => {
+                self.discard_current_assistant();
+                self.status = "正在继续执行".to_string();
+            }
             AgentEvent::AssistantRetrying {
                 attempt,
                 max_attempts,
@@ -3241,6 +3245,15 @@ impl UiState {
             }
         }
         self.current_assistant = None;
+    }
+
+    fn discard_current_assistant(&mut self) {
+        self.reset_reasoning_summary();
+        if let Some(index) = self.generation_start.take() {
+            self.messages.truncate(index);
+        }
+        self.current_assistant = None;
+        self.live_completion.clear();
     }
 }
 
@@ -5334,6 +5347,32 @@ mod tests {
         assert!(completed.contains("已完成"));
         assert!(completed.contains("5m 22s"));
         assert_eq!(format_elapsed_compact(3_723), "1h 02m 03s");
+    }
+
+    #[test]
+    fn removes_a_deferred_assistant_message_when_the_agent_retries_with_a_tool() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/chat/completions".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.apply_agent_event(AgentEvent::RunStarted);
+        state.apply_agent_event(AgentEvent::AssistantStarted);
+        state.apply_agent_event(AgentEvent::TextDelta {
+            text: "好的，这就写入 result.txt。".to_string(),
+        });
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "好的，这就写入 result.txt。");
+        assert!(state.current_assistant.is_some());
+
+        state.apply_agent_event(AgentEvent::AssistantDiscarded);
+
+        assert!(state.messages.is_empty());
+        assert!(state.current_assistant.is_none());
+        assert!(state.live_completion.is_empty());
+        assert_eq!(state.status, "正在继续执行");
+        assert!(state.running);
     }
 
     #[test]

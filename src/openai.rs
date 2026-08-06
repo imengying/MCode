@@ -94,6 +94,12 @@ pub struct OpenAiClient {
     idle_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StreamFeatures {
+    native_web_search: bool,
+    require_local_tool: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantTurn {
     pub content: Option<String>,
@@ -251,7 +257,31 @@ impl OpenAiClient {
             events,
             cancel,
             self.max_output_tokens,
-            true,
+            StreamFeatures {
+                native_web_search: true,
+                require_local_tool: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn stream_chat_requiring_local_tool(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<AssistantTurn> {
+        self.stream_chat_with_options(
+            messages,
+            tools,
+            events,
+            cancel,
+            self.max_output_tokens,
+            StreamFeatures {
+                native_web_search: false,
+                require_local_tool: true,
+            },
         )
         .await
     }
@@ -264,8 +294,18 @@ impl OpenAiClient {
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
     ) -> Result<AssistantTurn> {
-        self.stream_chat_with_options(messages, tools, events, cancel, max_tokens, false)
-            .await
+        self.stream_chat_with_options(
+            messages,
+            tools,
+            events,
+            cancel,
+            max_tokens,
+            StreamFeatures {
+                native_web_search: false,
+                require_local_tool: false,
+            },
+        )
+        .await
     }
 
     async fn stream_chat_with_options(
@@ -275,17 +315,12 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
-        allow_native_web_search: bool,
+        features: StreamFeatures,
     ) -> Result<AssistantTurn> {
         for attempt in 0..MAX_STREAM_ATTEMPTS {
             let result = self
                 .stream_chat_once_with_max_tokens(
-                    messages,
-                    tools,
-                    events,
-                    cancel,
-                    max_tokens,
-                    allow_native_web_search,
+                    messages, tools, events, cancel, max_tokens, features,
                 )
                 .await;
             match result {
@@ -313,7 +348,7 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
-        allow_native_web_search: bool,
+        features: StreamFeatures,
     ) -> Result<AssistantTurn> {
         let mut api_tools = tools.to_vec();
         if !self.compat.strict_tools {
@@ -323,23 +358,18 @@ impl OpenAiClient {
         }
         if self.api == ApiProtocol::Responses {
             return self
-                .stream_responses(
-                    messages,
-                    &api_tools,
-                    events,
-                    cancel,
-                    max_tokens,
-                    allow_native_web_search,
-                )
+                .stream_responses(messages, &api_tools, events, cancel, max_tokens, features)
                 .await;
         }
         let api_messages: Vec<ApiMessage<'_>> = messages.iter().map(ApiMessage::from).collect();
-        let chat_tools = chat_tools(&api_tools, &self.provider, allow_native_web_search)?;
-        let kimi_web_search = allow_native_web_search && self.provider == "kimi";
+        let chat_tools = chat_tools(&api_tools, &self.provider, features.native_web_search)?;
+        let has_tools = !chat_tools.is_empty();
+        let kimi_web_search = features.native_web_search && self.provider == "kimi";
         let body = ChatRequest {
             model: &self.model,
             messages: &api_messages,
             tools: &chat_tools,
+            tool_choice: (has_tools && features.require_local_tool).then_some("required"),
             reasoning_effort: self
                 .reasoning_effort
                 .as_deref()
@@ -433,12 +463,12 @@ impl OpenAiClient {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
-        allow_native_web_search: bool,
+        features: StreamFeatures,
     ) -> Result<AssistantTurn> {
         let (instructions, input) = responses_input(messages)?;
         let response_tools = responses_tools(
             tools,
-            allow_native_web_search && matches!(self.provider.as_str(), "xai" | "deepseek"),
+            features.native_web_search && matches!(self.provider.as_str(), "xai" | "deepseek"),
         );
         let has_tools = !response_tools.is_empty();
         let body = ResponsesRequest {
@@ -446,7 +476,11 @@ impl OpenAiClient {
             instructions: &instructions,
             input: &input,
             tools: &response_tools,
-            tool_choice: has_tools.then_some("auto"),
+            tool_choice: has_tools.then_some(if features.require_local_tool {
+                "required"
+            } else {
+                "auto"
+            }),
             parallel_tool_calls: has_tools.then_some(true),
             reasoning: self
                 .reasoning_effort
@@ -1244,6 +1278,8 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "<[serde_json::Value]>::is_empty")]
     tools: &'a [serde_json::Value],
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ChatThinking>,
@@ -1862,6 +1898,7 @@ mod tests {
             model: "kimi-test",
             messages: &messages,
             tools: &kimi,
+            tool_choice: None,
             reasoning_effort: None,
             thinking: Some(ChatThinking { kind: "disabled" }),
             max_tokens: None,

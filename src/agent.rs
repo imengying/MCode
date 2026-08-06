@@ -224,14 +224,28 @@ impl Agent {
         cancel: &CancellationToken,
         approvals: &ApprovalGate,
     ) -> Result<RunStatus> {
+        const DEFERRED_ACTION_CORRECTION: &str = "You said you would perform a local file or command action but did not call a tool. Perform that action now with an available local tool. Do not respond with another promise or status update.";
+
         let definitions = self.tools.definitions().to_vec();
+        let local_definitions = definitions
+            .iter()
+            .filter(|definition| {
+                matches!(
+                    definition.function.name.as_str(),
+                    "read_file" | "write_file" | "edit_file" | "shell"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let mut overflow_recovery_attempted = false;
+        let mut deferred_action_retry_attempted = false;
+        let mut force_local_tool = false;
 
         loop {
             if cancel.is_cancelled() {
                 return Ok(RunStatus::Cancelled);
             }
-            let (turn, context) = loop {
+            let (turn, context, generation_requires_tool) = loop {
                 let _ = self
                     .maybe_auto_compact(CompactionReason::Threshold, events, cancel)
                     .await;
@@ -239,11 +253,20 @@ impl Agent {
                     return Ok(RunStatus::Cancelled);
                 }
 
-                let active_messages = self.session.context_messages();
+                let mut active_messages = self.session.context_messages();
+                let generation_requires_tool = force_local_tool;
+                if generation_requires_tool {
+                    active_messages.push(ChatMessage::user(DEFERRED_ACTION_CORRECTION));
+                }
+                let request_definitions = if generation_requires_tool {
+                    &local_definitions
+                } else {
+                    &definitions
+                };
                 let selection = select_context(
                     self.system_prompt.as_deref(),
                     &active_messages,
-                    &definitions,
+                    request_definitions,
                     self.max_input_tokens,
                 )?;
                 if selection.dropped_messages > 0
@@ -259,12 +282,25 @@ impl Agent {
                 let context = selection.messages;
                 self.session.start_generation(run_id)?;
                 let _ = events.send(AgentEvent::AssistantStarted);
-                match self
-                    .client
-                    .stream_chat(&context, &definitions, events, cancel)
-                    .await
-                {
-                    Ok(turn) => break (turn, context),
+                let response = if generation_requires_tool {
+                    self.client
+                        .stream_chat_requiring_local_tool(
+                            &context,
+                            request_definitions,
+                            events,
+                            cancel,
+                        )
+                        .await
+                } else {
+                    self.client
+                        .stream_chat(&context, &definitions, events, cancel)
+                        .await
+                };
+                match response {
+                    Ok(turn) => {
+                        force_local_tool = false;
+                        break (turn, context, generation_requires_tool);
+                    }
                     Err(OpenAiError::Cancelled) => return Ok(RunStatus::Cancelled),
                     Err(error) if error.is_context_overflow() && !overflow_recovery_attempted => {
                         overflow_recovery_attempted = true;
@@ -294,6 +330,12 @@ impl Agent {
                 |usage| (normalize_usage(usage), false),
             );
             let tool_calls = turn.tool_calls.clone();
+            let deferred_local_action = stop_reason == AssistantStopReason::Stop
+                && tool_calls.is_empty()
+                && turn
+                    .content
+                    .as_deref()
+                    .is_some_and(is_deferred_local_action);
             let assistant_message = ChatMessage::assistant_with_response_items(
                 turn.content,
                 turn.reasoning_content,
@@ -336,6 +378,27 @@ impl Agent {
                     }
                 }
             }
+            if deferred_local_action {
+                self.session
+                    .discard_generation(run_id, assistant_message, usage)?;
+                self.total_usage = self.total_usage.saturating_add(usage);
+                self.context_tokens = self.estimated_context_tokens();
+                self.usage_estimated = true;
+                let _ = events.send(AgentEvent::AssistantDiscarded);
+                let _ = events.send(AgentEvent::Usage {
+                    usage,
+                    context_tokens: self.context_tokens,
+                    context_window: self.context_window,
+                    max_input_tokens: self.max_input_tokens,
+                    estimated,
+                });
+                if deferred_action_retry_attempted {
+                    return Err(anyhow!("模型重试后仍只声明要执行本地操作，未实际调用工具"));
+                }
+                deferred_action_retry_attempted = true;
+                force_local_tool = true;
+                continue;
+            }
             self.session
                 .complete_generation(run_id, assistant_message, usage)?;
             self.total_usage = self.total_usage.saturating_add(usage);
@@ -358,6 +421,9 @@ impl Agent {
             }
 
             if tool_calls.is_empty() {
+                if generation_requires_tool {
+                    return Err(anyhow!("模型声明要执行本地操作，但重试后仍未调用任何工具"));
+                }
                 let _ = self
                     .maybe_auto_compact(CompactionReason::Threshold, events, cancel)
                     .await;
@@ -543,7 +609,12 @@ impl Agent {
                 Ok(RunStatus::Cancelled)
             }
             Err(error) => {
-                if let Err(finish_error) = self.session.finish_run(run_id, RunOutcome::Failed) {
+                let persisted_error = format!("{error:#}");
+                if let Err(finish_error) = self.session.finish_run_with_error(
+                    run_id,
+                    RunOutcome::Failed,
+                    Some(persisted_error),
+                ) {
                     return Err(error.context(format!(
                         "the run also could not be closed durably: {finish_error:#}"
                     )));
@@ -1005,6 +1076,66 @@ fn build_system_prompt(cwd: &Path) -> Result<Option<String>> {
         .then(|| format!("Project instructions from AGENTS.md:\n\n{instructions}")))
 }
 
+fn is_deferred_local_action(content: &str) -> bool {
+    let normalized = content.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    let action = [
+        "追加",
+        "写入",
+        "保存到",
+        "保存为",
+        "生成文件",
+        "创建文件",
+        "修改文件",
+        "编辑文件",
+        "执行命令",
+        "运行命令",
+        "新增章节",
+        "续写",
+        "append",
+        "write ",
+        "save ",
+        "create ",
+        "edit ",
+        "modify ",
+        "run ",
+    ];
+    let deferred = [
+        "马上",
+        "这就",
+        "我来",
+        "我会",
+        "接下来",
+        "直接",
+        "将为",
+        "i'll",
+        "i will",
+        "let me",
+        "going to",
+        "next i",
+    ];
+    let completed = [
+        "已完成",
+        "已经完成",
+        "已写入",
+        "已保存",
+        "已生成",
+        "已创建",
+        "已修改",
+        "已更新",
+        "done",
+        "completed",
+        "saved",
+        "created",
+        "updated",
+    ];
+    action.iter().any(|term| normalized.contains(term))
+        && deferred.iter().any(|term| normalized.contains(term))
+        && !completed.iter().any(|term| normalized.contains(term))
+}
+
 fn normalize_usage(mut usage: Usage) -> Usage {
     if usage.total_tokens == 0 {
         usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
@@ -1196,6 +1327,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn detects_deferred_local_actions_without_flagging_completed_work() {
+        assert!(is_deferred_local_action(
+            "好的，这就直接追加到后宫·烛影摇红.txt末尾。"
+        ));
+        assert!(is_deferred_local_action(
+            "I will write the result to the requested file next."
+        ));
+        assert!(!is_deferred_local_action("已完成，文件已写入。"));
+        assert!(!is_deferred_local_action("我来解释这个 API 的工作方式。"));
+    }
 
     #[tokio::test]
     async fn new_session_restores_the_configured_default_reasoning_effort() {
