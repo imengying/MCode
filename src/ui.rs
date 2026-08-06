@@ -229,9 +229,9 @@ pub fn run_interactive(
         }
 
         if needs_draw {
-            resize_ui_terminal_to_content(&mut terminal, &state)?;
+            ensure_ui_terminal_capacity(&mut terminal, &state)?;
             archive_transcript_overflow(&mut terminal, &mut state)?;
-            resize_ui_terminal_to_content(&mut terminal, &state)?;
+            ensure_ui_terminal_capacity(&mut terminal, &state)?;
         }
         if state.run_started_at.is_some() && last_frame.elapsed() >= ELAPSED_REFRESH_INTERVAL {
             needs_draw = true;
@@ -539,9 +539,10 @@ fn minimum_ui_height(state: &UiState, width: u16) -> u16 {
         .saturating_add(sections.input)
         .saturating_add(INPUT_FOOTER_GAP)
         .saturating_add(1)
+        .saturating_add(1)
 }
 
-fn resize_ui_terminal_to_content<B>(terminal: &mut Terminal<B>, state: &UiState) -> Result<()>
+fn ensure_ui_terminal_capacity<B>(terminal: &mut Terminal<B>, state: &UiState) -> Result<()>
 where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -551,30 +552,26 @@ where
         return Ok(());
     }
     let screen = terminal.backend().size().context("读取终端尺寸失败")?;
-    let desired = desired_ui_height(state, current.width.max(1));
-    let height = desired
-        .max(minimum_ui_height(state, current.width.max(1)))
-        .min(screen.height.saturating_sub(current.y).max(1));
-    if height == current.height {
+    let required_height = minimum_ui_height(state, current.width.max(1)).min(screen.height);
+    if current.height >= required_height && current.bottom() == screen.height {
         return Ok(());
     }
-    if height < current.height {
-        let blank_height = current.height.saturating_sub(height);
-        let blank = Buffer::empty(Rect::new(0, 0, current.width, blank_height));
-        draw_history_rows(
-            terminal.backend_mut(),
-            &blank,
-            0,
-            blank_height,
-            current.y.saturating_add(height),
-        )?;
+
+    let height = current.height.max(required_height).min(screen.height);
+    let top = screen.height.saturating_sub(height);
+    if top < current.y {
+        let reclaimed = current.y.saturating_sub(top);
+        terminal
+            .backend_mut()
+            .scroll_region_up(0..current.y, reclaimed)
+            .context("扩展终端活动区失败")?;
         terminal
             .backend_mut()
             .flush()
-            .context("清理终端活动区失败")?;
+            .context("刷新终端历史区失败")?;
     }
     terminal
-        .resize(Rect::new(current.x, current.y, current.width, height))
+        .resize(Rect::new(0, top, screen.width.max(1), height.max(1)))
         .context("调整终端活动区高度失败")
 }
 
@@ -3284,11 +3281,12 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     let layout_area = if area.y == 0 {
         area
     } else {
+        let height = desired_ui_height(state, area.width).min(area.height);
         Rect::new(
             area.x,
-            area.y,
+            area.bottom().saturating_sub(height),
             area.width,
-            desired_ui_height(state, area.width).min(area.height),
+            height,
         )
     };
     let heights = ui_section_heights(state, layout_area.width, layout_area.height);
@@ -5139,17 +5137,21 @@ mod tests {
         assert!(separator > 0);
         assert!(!rows[separator - 1].trim().is_empty());
 
-        let active_top = usize::from(terminal.get_frame().area().y);
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let next_turn = terminal
-            .backend()
-            .buffer()
+        let buffer = terminal.backend().buffer();
+        let next_turn = buffer
             .content
             .iter()
             .enumerate()
             .find_map(|(index, cell)| (cell.symbol() == "后").then_some(index / 32))
             .unwrap();
-        assert_eq!(next_turn, active_top);
+        let footer_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "上").then_some(index / 32))
+            .unwrap();
+        assert!(next_turn < footer_y);
     }
 
     #[test]
@@ -5480,6 +5482,80 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "已")
         );
+    }
+
+    #[test]
+    fn expands_the_compact_viewport_for_slash_suggestions() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_user("此前内容".to_string(), &[]);
+        state.editor.insert('/');
+        let required_height = minimum_ui_height(&state, 40);
+        assert!(required_height > 4);
+
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 20, 40, 4)),
+            },
+        )
+        .unwrap();
+
+        ensure_ui_terminal_capacity(&mut terminal, &state).unwrap();
+        let active_area = terminal.get_frame().area();
+        assert_eq!(active_area.bottom(), 24);
+        assert!(active_area.height >= required_height);
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let rendered = rendered_terminal(&terminal).replace(' ', "");
+        assert!(!rendered.contains("终端窗口过小"));
+    }
+
+    #[test]
+    fn anchors_a_compact_layout_to_the_terminal_bottom() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.push_user("贴底内容".to_string(), &[]);
+        let backend = TestBackend::new(40, 32);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 8, 40, 24)),
+            },
+        )
+        .unwrap();
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let message_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "贴").then_some(index / 40))
+            .unwrap();
+        let input_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == ">").then_some(index / 40))
+            .unwrap();
+        let footer_y = buffer
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| (cell.symbol() == "上").then_some(index / 40))
+            .unwrap();
+        assert_eq!(footer_y, 31);
+        assert_eq!(input_y, 29);
+        assert_eq!(message_y, 27);
     }
 
     #[test]
