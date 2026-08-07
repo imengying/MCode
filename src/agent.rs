@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,6 +26,7 @@ use crate::openai::{
 use crate::protocol::{
     ChatMessage, FileChangeSummary, ImageAttachment, MessageRole, ToolCall, ToolDefinition, Usage,
 };
+use crate::sandbox::PermissionProfile;
 use crate::session::{PendingToolCall, RunOutcome, Session, ToolReplayPolicy};
 use crate::tools::{McpStartupFailure, ToolRegistry};
 
@@ -982,6 +983,57 @@ impl Agent {
         Ok(())
     }
 
+    pub fn resume_session(&mut self, selector: &str) -> Result<()> {
+        let session = Session::resume(self.session.cwd(), Some(selector))?;
+        let model_selector = session.model_selector();
+        let profile = find_model_profile(
+            &self.model_profiles,
+            Some(session.provider()),
+            &model_selector,
+        )?
+        .with_context(|| format!("模型 {model_selector:?} 不在 ~/.mcode/models.json 中"))?
+        .clone();
+        let reasoning_effort = profile.clamp_reasoning_effort(session.reasoning_effort());
+        let default_reasoning_effort = profile.default_reasoning_effort();
+        let reasoning_value = profile.reasoning_value(reasoning_effort)?;
+        self.client.reconfigure(OpenAiModelConfig {
+            provider: profile.provider.clone(),
+            base_url: profile.base_url.clone(),
+            api_key: profile.api_key.clone(),
+            model: profile.id.clone(),
+            api: session.api(),
+            max_output_tokens: profile.max_output_tokens,
+            reasoning_effort: reasoning_value,
+            compat: profile.compat,
+        })?;
+        self.provider = profile.provider;
+        self.reasoning_effort = reasoning_effort;
+        self.default_reasoning_effort = default_reasoning_effort;
+        self.context_window = profile.context_window;
+        self.max_input_tokens = profile.max_input_tokens;
+        self.supports_images = profile.supports_images;
+        self.total_usage = session.total_usage();
+        self.session = session;
+        self.context_tokens = self.estimated_context_tokens();
+        self.usage_estimated = true;
+        self.approved_tools.clear();
+        self.last_context_dropped = 0;
+        self.auto_compaction_failed = false;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn permission_profile(&self) -> PermissionProfile {
+        self.tools.permission_profile()
+    }
+
+    pub fn set_permission_profile(&mut self, profile: PermissionProfile) {
+        if self.tools.permission_profile() != profile {
+            self.tools.set_permission_profile(profile);
+            self.approved_tools.clear();
+        }
+    }
+
     pub fn delete_session(&mut self) -> Result<uuid::Uuid> {
         self.session.delete_current()
     }
@@ -1051,29 +1103,93 @@ impl Agent {
 fn build_system_prompt(cwd: &Path) -> Result<Option<String>> {
     const MAX_PROJECT_INSTRUCTIONS_BYTES: u64 = 64 * 1024;
 
-    let instructions_path = cwd.join("AGENTS.md");
-    let metadata = match fs::symlink_metadata(&instructions_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect {}", instructions_path.display()));
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", cwd.display()))?;
+    let repository_root = find_repository_root(&cwd)?;
+    let mut directories = Vec::new();
+    let mut directory = cwd.as_path();
+    loop {
+        directories.push(directory.to_path_buf());
+        if directory == repository_root {
+            break;
         }
-    };
-    if !metadata.file_type().is_file() {
-        return Ok(None);
+        directory = directory.parent().with_context(|| {
+            format!(
+                "{} is not inside repository root {}",
+                cwd.display(),
+                repository_root.display()
+            )
+        })?;
     }
-    if metadata.len() > MAX_PROJECT_INSTRUCTIONS_BYTES {
-        bail!(
-            "project instructions exceed the 64 KiB limit: {}",
-            instructions_path.display()
-        );
+    directories.reverse();
+
+    let mut sections = Vec::new();
+    let mut total_bytes = 0_u64;
+    for directory in directories {
+        let mut selected = None;
+        for filename in ["AGENTS.override.md", "AGENTS.md"] {
+            let path = directory.join(filename);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to inspect {}", path.display()));
+                }
+            };
+            if metadata.file_type().is_file() {
+                selected = Some((path, metadata));
+                break;
+            }
+        }
+        let Some((instructions_path, metadata)) = selected else {
+            continue;
+        };
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > MAX_PROJECT_INSTRUCTIONS_BYTES {
+            bail!(
+                "project instructions exceed the combined 64 KiB limit at {}",
+                instructions_path.display()
+            );
+        }
+        let instructions = fs::read_to_string(&instructions_path)
+            .with_context(|| format!("failed to read {}", instructions_path.display()))?;
+        let instructions = instructions.trim();
+        if instructions.is_empty() {
+            continue;
+        }
+        let source = instructions_path
+            .strip_prefix(&repository_root)
+            .unwrap_or(&instructions_path)
+            .to_string_lossy();
+        sections.push(format!(
+            "Project instructions from {source}:\n\n{instructions}"
+        ));
     }
-    let instructions = fs::read_to_string(&instructions_path)
-        .with_context(|| format!("failed to read {}", instructions_path.display()))?;
-    let instructions = instructions.trim();
-    Ok((!instructions.is_empty())
-        .then(|| format!("Project instructions from AGENTS.md:\n\n{instructions}")))
+    Ok((!sections.is_empty()).then(|| sections.join("\n\n")))
+}
+
+fn find_repository_root(cwd: &Path) -> Result<PathBuf> {
+    for directory in cwd.ancestors() {
+        let marker = directory.join(".git");
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata)
+                if metadata.file_type().is_dir()
+                    || metadata.file_type().is_file()
+                    || metadata.file_type().is_symlink() =>
+            {
+                return Ok(directory.to_path_buf());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", marker.display()));
+            }
+        }
+    }
+    Ok(cwd.to_path_buf())
 }
 
 fn is_deferred_local_action(content: &str) -> bool {
@@ -1329,15 +1445,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_deferred_local_actions_without_flagging_completed_work() {
-        assert!(is_deferred_local_action(
-            "好的，这就直接追加到后宫·烛影摇红.txt末尾。"
-        ));
-        assert!(is_deferred_local_action(
-            "I will write the result to the requested file next."
-        ));
-        assert!(!is_deferred_local_action("已完成，文件已写入。"));
-        assert!(!is_deferred_local_action("我来解释这个 API 的工作方式。"));
+    fn project_override_instructions_replace_agents_md() {
+        let project = tempdir().unwrap();
+        fs::write(project.path().join("AGENTS.md"), "base instructions").unwrap();
+        fs::write(
+            project.path().join("AGENTS.override.md"),
+            "override instructions",
+        )
+        .unwrap();
+
+        let prompt = build_system_prompt(project.path()).unwrap().unwrap();
+        assert!(prompt.contains("AGENTS.override.md"));
+        assert!(prompt.contains("override instructions"));
+        assert!(!prompt.contains("base instructions"));
+    }
+
+    #[test]
+    fn project_instructions_are_merged_from_repository_root_to_cwd() {
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        fs::write(project.path().join("AGENTS.md"), "root instructions").unwrap();
+        let nested = project.path().join("crates/app");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("AGENTS.md"), "nested base").unwrap();
+        fs::write(nested.join("AGENTS.override.md"), "nested override").unwrap();
+
+        let prompt = build_system_prompt(&nested).unwrap().unwrap();
+
+        let root = prompt.find("root instructions").unwrap();
+        let nested = prompt.find("nested override").unwrap();
+        assert!(root < nested);
+        assert!(prompt.contains("crates/app/AGENTS.override.md"));
+        assert!(!prompt.contains("nested base"));
+    }
+
+    #[test]
+    fn project_instructions_above_repository_root_are_ignored() {
+        let parent = tempdir().unwrap();
+        fs::write(parent.path().join("AGENTS.md"), "outside instructions").unwrap();
+        let project = parent.path().join("project");
+        let nested = project.join("src");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(project.join("AGENTS.md"), "repository instructions").unwrap();
+
+        let prompt = build_system_prompt(&nested).unwrap().unwrap();
+
+        assert!(prompt.contains("repository instructions"));
+        assert!(!prompt.contains("outside instructions"));
     }
 
     #[tokio::test]

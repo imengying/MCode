@@ -542,10 +542,9 @@ async fn responses_api_runs_local_tools_and_native_web_search() {
         requests[0]["include"],
         json!(["reasoning.encrypted_content"])
     );
-    assert_eq!(
-        requests[0]["instructions"],
-        "Project instructions from AGENTS.md:\n\nAlways preserve the fixture sentinel."
-    );
+    let instructions = requests[0]["instructions"].as_str().unwrap();
+    assert!(instructions.starts_with("Project instructions from "));
+    assert!(instructions.contains("AGENTS.md:\n\nAlways preserve the fixture sentinel."));
     let second_input = requests[1]["input"].as_array().unwrap();
     assert!(second_input.iter().any(|item| {
         item["type"] == "reasoning"

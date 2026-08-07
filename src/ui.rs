@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
@@ -37,22 +38,27 @@ use crate::compaction::{estimate_message_tokens, estimate_text_tokens};
 use crate::config::{ApiProtocol, ReasoningEffort};
 use crate::event::{AgentEvent, CompactionReason};
 use crate::highlight::highlight_code;
+use crate::latex::{render_display, render_inline};
 use crate::protocol::{
     ChatMessage, FileChangeKind, FileChangeLineKind, FileChangeSummary, ImageAttachment,
     MAX_IMAGE_BYTES, MessageRole, Usage, sanitize_terminal_text,
 };
+use crate::sandbox::PermissionProfile;
+use crate::session::{Session, SessionSummary};
 
-const APPROVAL_HEIGHT: u16 = 6;
-const DELETE_CONFIRMATION_HEIGHT: u16 = 5;
+const APPROVAL_HEIGHT: u16 = 10;
+const DELETE_CONFIRMATION_HEIGHT: u16 = 7;
+const PERMISSION_PICKER_HEIGHT: u16 = 8;
+const MAX_SESSION_PICKER_ROWS: usize = 8;
 const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
 const MIN_TERMINAL_HEIGHT: u16 = 10;
 const INPUT_PREFIX_WIDTH: u16 = 2;
-const INPUT_FOOTER_GAP: u16 = 1;
 const INPUT_PLACEHOLDER: &str = "描述任务，或输入 / 查看命令";
 const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_QUEUED_SUBMISSIONS: usize = 8;
+const MAX_WORKSPACE_FILES: usize = 20_000;
 const MAX_SLASH_SUGGESTIONS: u16 = 8;
 const PREVIEW_LINE_CHARS: usize = 240;
 const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
@@ -61,11 +67,10 @@ const X11_CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(500);
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTEXT_BASELINE_TOKENS: u64 = 12_000;
 // Match Codex's terminal-native palette: inherit the configured foreground/background and use
 // ANSI semantic colors so accents remain legible across terminal themes.
 const THEME_BASE: Color = Color::Reset;
-const THEME_MANTLE: Color = Color::Reset;
-const THEME_SURFACE: Color = Color::DarkGray;
 const THEME_TEXT: Color = Color::Reset;
 const THEME_SUBTEXT: Color = Color::Gray;
 const THEME_MUTED: Color = Color::DarkGray;
@@ -73,10 +78,10 @@ const THEME_BLUE: Color = Color::Cyan;
 const THEME_GREEN: Color = Color::Green;
 const THEME_YELLOW: Color = Color::Yellow;
 const THEME_RED: Color = Color::Red;
+const THEME_USER_BG: Color = Color::Rgb(50, 50, 54);
 const THEME_DIFF_ADD_BG: Color = Color::Rgb(33, 58, 43);
 const THEME_DIFF_REMOVE_BG: Color = Color::Rgb(74, 34, 29);
 const THEME_MAUVE: Color = Color::Magenta;
-const THEME_TEAL: Color = Color::Cyan;
 const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
@@ -85,11 +90,14 @@ const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
 ];
 
 pub fn run_interactive(
-    agent: Agent,
+    mut agent: Agent,
     initial_prompt: Option<String>,
     initial_images: Vec<ImageAttachment>,
     bypass_approvals: bool,
 ) -> Result<()> {
+    if bypass_approvals {
+        agent.set_permission_profile(PermissionProfile::FullAccess);
+    }
     let historical_compaction = agent.session().latest_compaction().cloned();
     let historical_messages = historical_compaction.as_ref().map_or_else(
         || agent.messages().to_vec(),
@@ -317,6 +325,14 @@ pub fn run_interactive(
                         },
                         Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
+                    UiAction::SetPermissions(profile) => match agent.try_lock() {
+                        Ok(mut agent) => {
+                            agent.set_permission_profile(profile);
+                            state.sync_from_agent(&agent);
+                            state.push_notice(format!("权限已切换为 {}。", profile.label()));
+                        }
+                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
+                    },
                     UiAction::Compact(instructions) => {
                         start_compaction(
                             Arc::clone(&agent),
@@ -342,6 +358,66 @@ pub fn run_interactive(
                         },
                         Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
+                    UiAction::ResumeSession(selector) => match agent.try_lock() {
+                        Ok(mut current_agent) => match current_agent.resume_session(&selector) {
+                            Ok(()) => {
+                                resume_candidate = current_agent
+                                    .session()
+                                    .persistence_path()?
+                                    .map(|path| (current_agent.session().id(), path));
+                                let checkpoint =
+                                    current_agent.session().latest_compaction().cloned();
+                                let messages = checkpoint.as_ref().map_or_else(
+                                    || current_agent.messages().to_vec(),
+                                    |checkpoint| {
+                                        current_agent.messages()[checkpoint
+                                            .first_kept_message_index
+                                            .min(current_agent.messages().len())..]
+                                            .to_vec()
+                                    },
+                                );
+                                let has_pending = current_agent.has_pending_run();
+                                let pending_tool_ids = if has_pending {
+                                    current_agent
+                                        .session()
+                                        .pending_tool_calls()?
+                                        .into_iter()
+                                        .map(|pending| pending.call.id)
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                };
+                                state.reset_session();
+                                state.sync_from_agent(&current_agent);
+                                if let Some(checkpoint) = checkpoint {
+                                    state.push_notice(format!(
+                                        "此会话已从约 {} 个 token 压缩。\n\n{}",
+                                        format_tokens(checkpoint.tokens_before),
+                                        checkpoint.summary
+                                    ));
+                                }
+                                for message in messages {
+                                    state.push_history(message);
+                                }
+                                state.protect_resumed_turn();
+                                state.hold_pending_tools(&pending_tool_ids);
+                                drop(current_agent);
+                                terminal = create_ui_terminal(true)?;
+                                compact_viewport = true;
+                                if has_pending {
+                                    start_resume(
+                                        Arc::clone(&agent),
+                                        &event_tx,
+                                        approvals.clone(),
+                                        &mut state,
+                                        &mut active_cancel,
+                                    );
+                                }
+                            }
+                            Err(error) => state.push_error(format!("{error:#}")),
+                        },
+                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
+                    },
                     UiAction::DeleteSession => match agent.try_lock() {
                         Ok(mut agent) => match agent.delete_session() {
                             Ok(id) => {
@@ -356,6 +432,10 @@ pub fn run_interactive(
                         state.clear_view();
                         terminal = create_ui_terminal(compact_viewport)?;
                     }
+                    UiAction::ShowDiff => match workspace_diff(&state.cwd) {
+                        Ok(diff) => state.push_notice(diff),
+                        Err(error) => state.push_error(format!("{error:#}")),
+                    },
                     UiAction::PasteClipboard => paste_from_clipboard(&mut state),
                     UiAction::ResolveApproval(decision) => {
                         if let Some(request) = pending_approval.take() {
@@ -367,6 +447,8 @@ pub fn run_interactive(
             }
             Event::Paste(text)
                 if state.pending_approval.is_none()
+                    && state.permission_picker.is_none()
+                    && state.session_picker.is_none()
                     && state.delete_confirmation == DeleteConfirmation::None =>
             {
                 needs_draw = true;
@@ -537,11 +619,12 @@ fn minimum_active_viewport_height(screen_height: u16) -> u16 {
 fn minimum_ui_height(state: &UiState, width: u16) -> u16 {
     let sections = ui_section_heights(state, width, u16::MAX);
     sections
-        .suggestions
-        .saturating_add(sections.activity)
+        .activity
+        .saturating_add(sections.activity_gap)
+        .saturating_add(sections.composer_top)
         .saturating_add(sections.input)
-        .saturating_add(INPUT_FOOTER_GAP)
-        .saturating_add(1)
+        .saturating_add(sections.composer_bottom)
+        .saturating_add(sections.trailing)
         .saturating_add(1)
 }
 
@@ -1067,10 +1150,13 @@ enum UiAction {
     ListModels,
     SelectModel(String),
     SetReasoning(ReasoningEffort),
+    SetPermissions(PermissionProfile),
     Compact(String),
     NewSession,
+    ResumeSession(String),
     DeleteSession,
     Clear,
+    ShowDiff,
     PasteClipboard,
     ResolveApproval(ApprovalDecision),
 }
@@ -1087,6 +1173,7 @@ struct SlashSuggestion {
     label: String,
     replacement: String,
     description: String,
+    replacement_range: Option<(usize, usize)>,
 }
 
 const SLASH_COMMANDS: &[SlashCommand] = &[
@@ -1106,6 +1193,21 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "压缩当前上下文",
     },
     SlashCommand {
+        name: "permissions",
+        accepts_argument: false,
+        description: "选择工具权限",
+    },
+    SlashCommand {
+        name: "diff",
+        accepts_argument: false,
+        description: "显示工作区改动",
+    },
+    SlashCommand {
+        name: "review",
+        accepts_argument: true,
+        description: "审查当前改动",
+    },
+    SlashCommand {
         name: "status",
         accepts_argument: false,
         description: "显示会话状态",
@@ -1114,6 +1216,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "new",
         accepts_argument: false,
         description: "新建会话",
+    },
+    SlashCommand {
+        name: "resume",
+        accepts_argument: false,
+        description: "恢复其他会话",
     },
     SlashCommand {
         name: "delete",
@@ -1168,6 +1275,7 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                     label: format!("/{}", command.name),
                     replacement: format!("/{}{trailing_space}", command.name),
                     description: command.description.to_string(),
+                    replacement_range: None,
                 }
             })
             .collect();
@@ -1204,6 +1312,7 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                     label: format!("/model {qualified}"),
                     replacement: format!("/model {qualified}"),
                     description,
+                    replacement_range: None,
                 })
             })
             .collect(),
@@ -1227,6 +1336,7 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                     } else {
                         markers.join("、")
                     },
+                    replacement_range: None,
                 }
             })
             .collect(),
@@ -1234,8 +1344,65 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
     }
 }
 
+fn file_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
+    let text = state.editor.text();
+    if state.dismissed_slash_input.as_deref() == Some(text.as_str()) {
+        return Vec::new();
+    }
+    let Some((start, end, query)) = state.editor.file_mention() else {
+        return Vec::new();
+    };
+    let query = query.to_ascii_lowercase();
+    let mut matches = state
+        .workspace_files
+        .iter()
+        .filter_map(|path| fuzzy_file_score(path, &query).map(|score| (score, path.as_str())))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+    matches
+        .into_iter()
+        .take(100)
+        .map(|(_, path)| SlashSuggestion {
+            label: format!("@{path}"),
+            replacement: format!("@{path} "),
+            description: "文件".to_string(),
+            replacement_range: Some((start, end)),
+        })
+        .collect()
+}
+
+fn input_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
+    let slash = slash_suggestions(state);
+    if slash.is_empty() {
+        file_suggestions(state)
+    } else {
+        slash
+    }
+}
+
+fn fuzzy_file_score(path: &str, query: &str) -> Option<(u8, usize, usize)> {
+    let path = path.to_ascii_lowercase();
+    if query.is_empty() {
+        return Some((0, 0, path.len()));
+    }
+    if path.starts_with(query) {
+        return Some((0, path.len().saturating_sub(query.len()), path.len()));
+    }
+    if let Some(position) = path.find(query) {
+        return Some((1, position, path.len()));
+    }
+    let mut offset = 0;
+    let mut gaps = 0;
+    for character in query.chars() {
+        let position = path[offset..].find(character)?;
+        gaps += position;
+        offset += position + character.len_utf8();
+    }
+    Some((2, gaps, path.len()))
+}
+
 fn complete_slash_suggestion(state: &mut UiState) -> bool {
-    let suggestions = slash_suggestions(state);
+    let suggestions = input_suggestions(state);
     let Some(suggestion) = suggestions.get(
         state
             .slash_selection
@@ -1244,7 +1411,13 @@ fn complete_slash_suggestion(state: &mut UiState) -> bool {
         return false;
     };
     state.detach_input_history();
-    state.editor.set_text(&suggestion.replacement);
+    if let Some((start, end)) = suggestion.replacement_range {
+        state
+            .editor
+            .replace_range(start, end, &suggestion.replacement);
+    } else {
+        state.editor.set_text(&suggestion.replacement);
+    }
     state.slash_selection = 0;
     state.dismissed_slash_input = None;
     true
@@ -1322,6 +1495,71 @@ fn handle_key(
         };
     }
 
+    if let Some(selection) = state.permission_picker {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return UiAction::None;
+        }
+        return match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                state.permission_picker = Some(if selection == 0 {
+                    PermissionProfile::ALL.len() - 1
+                } else {
+                    selection - 1
+                });
+                UiAction::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                state.permission_picker = Some((selection + 1) % PermissionProfile::ALL.len());
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                state.permission_picker = None;
+                UiAction::SetPermissions(PermissionProfile::ALL[selection])
+            }
+            KeyCode::Esc => {
+                state.permission_picker = None;
+                UiAction::None
+            }
+            _ => UiAction::None,
+        };
+    }
+
+    if let Some(picker) = state.session_picker.as_mut() {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return UiAction::None;
+        }
+        return match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                picker.selection = if picker.selection == 0 {
+                    picker.sessions.len() - 1
+                } else {
+                    picker.selection - 1
+                };
+                UiAction::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                picker.selection = (picker.selection + 1) % picker.sessions.len();
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                let selector = picker.sessions[picker.selection].id.to_string();
+                state.session_picker = None;
+                UiAction::ResumeSession(selector)
+            }
+            KeyCode::Esc => {
+                state.session_picker = None;
+                UiAction::None
+            }
+            _ => UiAction::None,
+        };
+    }
+
     if let DeleteConfirmation::Selecting(selection) = state.delete_confirmation {
         match key.code {
             KeyCode::Left | KeyCode::Up => {
@@ -1358,7 +1596,7 @@ fn handle_key(
         return UiAction::None;
     }
 
-    if key.code == KeyCode::Esc && !slash_suggestions(state).is_empty() {
+    if key.code == KeyCode::Esc && !input_suggestions(state).is_empty() {
         state.dismissed_slash_input = Some(state.editor.text());
         state.slash_selection = 0;
         return UiAction::None;
@@ -1460,7 +1698,7 @@ fn handle_key(
         return UiAction::None;
     }
 
-    let suggestions = slash_suggestions(state);
+    let suggestions = input_suggestions(state);
     if !suggestions.is_empty() && key.modifiers.is_empty() {
         state.slash_selection = state
             .slash_selection
@@ -1514,6 +1752,9 @@ fn handle_key(
         {
             state.prepare_input_edit();
             state.editor.insert(character);
+            if character == '@' {
+                state.refresh_workspace_files();
+            }
         }
         KeyCode::Backspace => {
             if state.editor.is_empty() {
@@ -1587,8 +1828,42 @@ fn submit_editor(state: &mut UiState) -> UiAction {
     match name {
         "exit" => UiAction::Quit,
         "clear" => UiAction::Clear,
+        "diff" if argument.is_empty() => UiAction::ShowDiff,
+        "diff" => {
+            state.push_error("用法：/diff");
+            UiAction::None
+        }
+        "review" => UiAction::Submit {
+            prompt: review_prompt(argument),
+            images: state.take_pending_images(),
+        },
         "new" => UiAction::NewSession,
+        "resume" if argument.is_empty() => {
+            match state.open_session_picker() {
+                Ok(true) => {}
+                Ok(false) => state.push_notice("没有可恢复的其他会话。"),
+                Err(error) => state.push_error(format!("{error:#}")),
+            }
+            UiAction::None
+        }
+        "resume" => {
+            state.push_error("用法：/resume");
+            UiAction::None
+        }
         "compact" => UiAction::Compact(argument.to_string()),
+        "permissions" if argument.is_empty() => {
+            state.permission_picker = Some(
+                PermissionProfile::ALL
+                    .iter()
+                    .position(|profile| *profile == state.permission_profile)
+                    .unwrap_or(0),
+            );
+            UiAction::None
+        }
+        "permissions" => {
+            state.push_error("用法：/permissions");
+            UiAction::None
+        }
         "delete" if argument.is_empty() => {
             state.delete_confirmation = DeleteConfirmation::Selecting(DeleteChoice::No);
             UiAction::None
@@ -1629,7 +1904,7 @@ fn submit_editor(state: &mut UiState) -> UiAction {
         }
         "help" => {
             state.push_notice(
-                "命令：/model [ID]、/effort [级别]、/compact [说明]、/status、/new、/delete、/clear、/help、/exit",
+                "命令：/model、/effort、/permissions、/diff、/review、/compact、/status、/new、/resume、/delete、/clear、/help、/exit",
             );
             UiAction::None
         }
@@ -1638,6 +1913,57 @@ fn submit_editor(state: &mut UiState) -> UiAction {
             UiAction::None
         }
     }
+}
+
+fn review_prompt(focus: &str) -> String {
+    let mut prompt = "审查当前工作区未提交的改动。优先报告 bug、行为回归、安全风险和缺失的必要测试；按严重程度排序，并引用文件和行号。若没有发现问题，明确说明。不要修改文件。".to_string();
+    if !focus.is_empty() {
+        prompt.push_str("\n\n审查重点：");
+        prompt.push_str(focus);
+    }
+    prompt
+}
+
+fn workspace_diff(cwd: &Path) -> Result<String> {
+    let status = git_output(cwd, &["status", "--short"])?;
+    let unstaged = git_output(cwd, &["diff", "--no-ext-diff", "--no-color", "--"])?;
+    let staged = git_output(
+        cwd,
+        &["diff", "--cached", "--no-ext-diff", "--no-color", "--"],
+    )?;
+    if status.trim().is_empty() && unstaged.trim().is_empty() && staged.trim().is_empty() {
+        return Ok("工作区没有改动。".to_string());
+    }
+    let mut output = String::new();
+    if !status.trim().is_empty() {
+        output.push_str("```text\n");
+        output.push_str(status.trim_end());
+        output.push_str("\n```\n");
+    }
+    if !staged.trim().is_empty() {
+        output.push_str("\n已暂存：\n\n```diff\n");
+        output.push_str(staged.trim_end());
+        output.push_str("\n```\n");
+    }
+    if !unstaged.trim().is_empty() {
+        output.push_str("\n未暂存：\n\n```diff\n");
+        output.push_str(unstaged.trim_end());
+        output.push_str("\n```\n");
+    }
+    Ok(truncate_for_ui(&output))
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("无法运行 git {}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} 失败：{}", args.join(" "), stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn paste_from_clipboard(state: &mut UiState) {
@@ -1860,6 +2186,43 @@ impl Editor {
     fn set_text(&mut self, text: &str) {
         self.items = text.chars().map(EditorItem::Character).collect();
         self.cursor = self.items.len();
+    }
+
+    fn replace_range(&mut self, start: usize, end: usize, text: &str) {
+        if start > end || end > self.items.len() {
+            return;
+        }
+        let replacement = text.chars().map(EditorItem::Character).collect::<Vec<_>>();
+        let replacement_len = replacement.len();
+        self.items.splice(start..end, replacement);
+        self.cursor = start + replacement_len;
+    }
+
+    fn file_mention(&self) -> Option<(usize, usize, String)> {
+        let mut start = self.cursor;
+        while start > 0 {
+            match &self.items[start - 1] {
+                EditorItem::Character(character) if !character.is_whitespace() => start -= 1,
+                _ => break,
+            }
+        }
+        let mut end = self.cursor;
+        while end < self.items.len() {
+            match &self.items[end] {
+                EditorItem::Character(character) if !character.is_whitespace() => end += 1,
+                _ => break,
+            }
+        }
+        let token = self.items[start..self.cursor]
+            .iter()
+            .map(|item| match item {
+                EditorItem::Character(character) => Some(*character),
+                EditorItem::Paste { .. } => None,
+            })
+            .collect::<Option<String>>()?;
+        token
+            .strip_prefix('@')
+            .map(|query| (start, end, query.to_string()))
     }
 
     fn backspace(&mut self) {
@@ -2114,6 +2477,12 @@ struct QueuedSubmission {
 }
 
 #[derive(Debug)]
+struct SessionPicker {
+    sessions: Vec<SessionSummary>,
+    selection: usize,
+}
+
+#[derive(Debug)]
 struct ApprovalView {
     name: String,
     arguments: String,
@@ -2159,6 +2528,55 @@ impl ApprovalChoice {
     }
 }
 
+fn index_workspace_files(root: &Path) -> Vec<String> {
+    const SKIPPED_DIRECTORIES: [&str; 4] = [".git", ".mcode", "node_modules", "target"];
+
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut entries = entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !SKIPPED_DIRECTORIES
+                    .iter()
+                    .any(|name| entry.file_name() == *name)
+                {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            files.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if files.len() >= MAX_WORKSPACE_FILES {
+                files.sort();
+                return files;
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 struct X11Clipboard(x11_clipboard::Clipboard);
 
 impl std::fmt::Debug for X11Clipboard {
@@ -2176,8 +2594,11 @@ struct UiState {
     default_reasoning_effort: ReasoningEffort,
     endpoint: String,
     cwd: std::path::PathBuf,
+    current_session_id: String,
+    workspace_files: Vec<String>,
     model_choices: Vec<ModelChoice>,
     reasoning_choices: Vec<ReasoningEffort>,
+    permission_profile: PermissionProfile,
     messages: Vec<ViewMessage>,
     editor: Editor,
     running: bool,
@@ -2198,6 +2619,8 @@ struct UiState {
     max_input_tokens: u64,
     usage_estimated: bool,
     delete_confirmation: DeleteConfirmation,
+    permission_picker: Option<usize>,
+    session_picker: Option<SessionPicker>,
     pending_images: Vec<ImageAttachment>,
     queued_submissions: VecDeque<QueuedSubmission>,
     slash_selection: usize,
@@ -2220,6 +2643,7 @@ struct UiState {
 
 impl UiState {
     fn new(model: String, endpoint: String, cwd: std::path::PathBuf) -> Self {
+        let workspace_files = index_workspace_files(&cwd);
         Self {
             model,
             provider: "xai".to_string(),
@@ -2228,8 +2652,11 @@ impl UiState {
             default_reasoning_effort: ReasoningEffort::Off,
             endpoint,
             cwd,
+            current_session_id: String::new(),
+            workspace_files,
             model_choices: Vec::new(),
             reasoning_choices: ReasoningEffort::ALL.to_vec(),
+            permission_profile: PermissionProfile::default(),
             messages: Vec::new(),
             editor: Editor::default(),
             running: false,
@@ -2250,6 +2677,8 @@ impl UiState {
             max_input_tokens: 128_000,
             usage_estimated: false,
             delete_confirmation: DeleteConfirmation::None,
+            permission_picker: None,
+            session_picker: None,
             pending_images: Vec::new(),
             queued_submissions: VecDeque::new(),
             slash_selection: 0,
@@ -2280,6 +2709,8 @@ impl UiState {
         self.endpoint = sanitize_terminal_text(agent.endpoint());
         self.model_choices = agent.model_choices();
         self.reasoning_choices = agent.available_reasoning_efforts();
+        self.permission_profile = agent.permission_profile();
+        self.current_session_id = agent.session().id().to_string();
         self.usage = agent.total_usage();
         self.sync_usage_animation();
         self.context_tokens = agent.context_tokens();
@@ -2288,6 +2719,24 @@ impl UiState {
         self.usage_estimated = agent.usage_estimated();
         self.mcp_server_count = agent.mcp_server_count();
         self.mcp_tool_count = agent.mcp_tool_count();
+    }
+
+    fn refresh_workspace_files(&mut self) {
+        self.workspace_files = index_workspace_files(&self.cwd);
+    }
+
+    fn open_session_picker(&mut self) -> Result<bool> {
+        let mut sessions = Session::list(&self.cwd)?;
+        sessions.retain(|session| session.id.to_string() != self.current_session_id);
+        if sessions.is_empty() {
+            self.session_picker = None;
+            return Ok(false);
+        }
+        self.session_picker = Some(SessionPicker {
+            sessions,
+            selection: 0,
+        });
+        Ok(true)
     }
 
     fn begin_run(&mut self, status: impl Into<String>) {
@@ -2513,6 +2962,8 @@ impl UiState {
             }
         }
         self.delete_confirmation = DeleteConfirmation::None;
+        self.permission_picker = None;
+        self.session_picker = None;
     }
 
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
@@ -2894,9 +3345,10 @@ impl UiState {
                 )
             });
         format!(
-            "模型：{qualified_model}\nAPI：{}\neffort：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
+            "模型：{qualified_model}\nAPI：{}\neffort：{}\n权限：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
             self.api,
             self.reasoning_effort,
+            self.permission_profile.label(),
             format_tokens(context_tokens),
             format_tokens(self.max_input_tokens),
             format_tokens(self.context_window),
@@ -3040,7 +3492,7 @@ impl UiState {
                 self.finish_current_assistant_for_tool();
                 let name = sanitize_terminal_text(&name);
                 let arguments = format_tool_input(&name, &arguments);
-                self.status = tool_running_status(&name);
+                self.status = tool_action_title(&name, true, false);
                 if let Some(message) = self
                     .messages
                     .iter_mut()
@@ -3352,18 +3804,22 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(heights.conversation),
-            Constraint::Length(heights.suggestions),
             Constraint::Length(heights.activity),
+            Constraint::Length(heights.activity_gap),
+            Constraint::Length(heights.composer_top),
             Constraint::Length(heights.input),
-            Constraint::Length(INPUT_FOOTER_GAP),
-            Constraint::Length(1),
+            Constraint::Length(heights.composer_bottom),
+            Constraint::Length(heights.trailing),
         ])
         .split(layout_area);
     render_conversation(frame, state, areas[0]);
-    render_slash_suggestions(frame, state, areas[1]);
-    render_activity_status(frame, state, areas[2]);
-    render_input(frame, state, areas[3]);
-    render_footer(frame, state, areas[5]);
+    render_activity_status(frame, state, areas[1]);
+    render_input(frame, state, areas[4]);
+    if input_suggestions(state).is_empty() {
+        render_footer(frame, state, areas[6]);
+    } else {
+        render_slash_suggestions(frame, state, areas[6]);
+    }
 }
 
 fn desired_ui_height(state: &UiState, width: u16) -> u16 {
@@ -3371,24 +3827,32 @@ fn desired_ui_height(state: &UiState, width: u16) -> u16 {
     let conversation =
         u16::try_from(transcript_line_count(state, &state.messages, width)).unwrap_or(u16::MAX);
     conversation
-        .saturating_add(sections.suggestions)
         .saturating_add(sections.activity)
+        .saturating_add(sections.activity_gap)
+        .saturating_add(sections.composer_top)
         .saturating_add(sections.input)
-        .saturating_add(INPUT_FOOTER_GAP)
-        .saturating_add(1)
+        .saturating_add(sections.composer_bottom)
+        .saturating_add(sections.trailing)
 }
 
 #[derive(Debug, Clone, Copy)]
 struct UiSectionHeights {
     conversation: u16,
-    suggestions: u16,
     activity: u16,
+    activity_gap: u16,
+    composer_top: u16,
     input: u16,
+    composer_bottom: u16,
+    trailing: u16,
 }
 
 fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeights {
     let input = if state.pending_approval.is_some() {
         APPROVAL_HEIGHT
+    } else if let Some(picker) = &state.session_picker {
+        u16::try_from(picker.sessions.len().min(MAX_SESSION_PICKER_ROWS) + 4).unwrap_or(u16::MAX)
+    } else if state.permission_picker.is_some() {
+        PERMISSION_PICKER_HEIGHT
     } else if state.delete_confirmation != DeleteConfirmation::None {
         DELETE_CONFIRMATION_HEIGHT
     } else {
@@ -3398,34 +3862,47 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
             .clamp(1, MAX_INPUT_HEIGHT);
         editor_height.saturating_add(u16::from(!state.pending_images.is_empty()))
     };
-    let suggestion_count = if state.pending_approval.is_some()
-        || state.delete_confirmation != DeleteConfirmation::None
-    {
+    let modal = state.pending_approval.is_some()
+        || state.permission_picker.is_some()
+        || state.session_picker.is_some()
+        || state.delete_confirmation != DeleteConfirmation::None;
+    let suggestion_count = if modal {
         0
     } else {
-        slash_suggestions(state).len()
+        input_suggestions(state).len()
     };
     let activity = u16::from(state.activity_label().is_some());
-    let reserved_height = 3_u16
-        .saturating_add(activity)
+    let activity_gap = u16::from(activity > 0);
+    let composer_top = u16::from(!modal);
+    let composer_bottom = u16::from(!modal);
+    let fixed_height = activity
+        .saturating_add(activity_gap)
+        .saturating_add(composer_top)
         .saturating_add(input)
-        .saturating_add(INPUT_FOOTER_GAP)
-        .saturating_add(1);
-    let suggestions = u16::try_from(suggestion_count)
-        .unwrap_or(u16::MAX)
-        .min(MAX_SLASH_SUGGESTIONS)
-        .min(height.saturating_sub(reserved_height));
+        .saturating_add(composer_bottom);
+    let trailing = if suggestion_count == 0 {
+        u16::from(!modal).min(height.saturating_sub(fixed_height))
+    } else {
+        u16::try_from(suggestion_count)
+            .unwrap_or(u16::MAX)
+            .min(MAX_SLASH_SUGGESTIONS)
+            .min(height.saturating_sub(fixed_height).saturating_sub(1))
+    };
     let conversation = height
-        .saturating_sub(suggestions)
         .saturating_sub(activity)
+        .saturating_sub(activity_gap)
+        .saturating_sub(composer_top)
         .saturating_sub(input)
-        .saturating_sub(INPUT_FOOTER_GAP)
-        .saturating_sub(1);
+        .saturating_sub(composer_bottom)
+        .saturating_sub(trailing);
     UiSectionHeights {
         conversation,
-        suggestions,
         activity,
+        activity_gap,
+        composer_top,
         input,
+        composer_bottom,
+        trailing,
     }
 }
 
@@ -3434,13 +3911,13 @@ fn render_activity_status(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         return;
     };
     let elapsed = format_elapsed_compact(state.run_elapsed().as_secs());
-    let suffix = format!(" ({elapsed} · Esc 取消)");
+    let suffix = format!(" ({elapsed} • Esc 取消)");
     let available = usize::from(area.width)
         .saturating_sub(2)
         .saturating_sub(display_width(&suffix));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("• ", Style::default().fg(THEME_YELLOW)),
+            Span::styled("• ", Style::default().fg(THEME_BLUE)),
             Span::styled(
                 truncate_width(&activity, available.saturating_add(1)),
                 Style::default()
@@ -3568,7 +4045,7 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
     if area.height == 0 {
         return;
     }
-    let suggestions = slash_suggestions(state);
+    let suggestions = input_suggestions(state);
     if suggestions.is_empty() {
         return;
     }
@@ -3623,11 +4100,6 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &UiState, area: Rect) 
                     }),
                 ),
             ])
-            .style(if is_selected {
-                Style::default().bg(THEME_SURFACE)
-            } else {
-                Style::default()
-            })
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
@@ -3646,80 +4118,159 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             usize::from(area.width.saturating_sub(2)),
         );
         let lines = vec![
+            Line::default(),
             Line::from(Span::styled(
-                format!("是否允许运行 {}？", approval.name),
-                Style::default()
-                    .fg(THEME_YELLOW)
-                    .add_modifier(Modifier::BOLD),
+                format!("  是否允许运行 {}？", approval.name),
+                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(details, Style::default().fg(THEME_SUBTEXT))),
-            approval_option_line(
-                ApprovalChoice::ApproveOnce,
-                approval.selection,
+            Line::default(),
+            Line::from(Span::styled(
+                format!("  {details}"),
+                Style::default().fg(THEME_SUBTEXT),
+            )),
+            Line::default(),
+            selection_option_line(
+                approval.selection == ApprovalChoice::ApproveOnce,
                 "1. 允许一次",
             ),
-            approval_option_line(
-                ApprovalChoice::ApproveForSession,
-                approval.selection,
+            selection_option_line(
+                approval.selection == ApprovalChoice::ApproveForSession,
                 "2. 本次会话内始终允许",
             ),
-            approval_option_line(ApprovalChoice::Deny, approval.selection, "3. 拒绝"),
+            selection_option_line(approval.selection == ApprovalChoice::Deny, "3. 拒绝"),
+            Line::default(),
             Line::from(Span::styled(
                 "  ↑/↓ 选择 · Enter 确认 · Esc 取消任务",
                 Style::default().fg(THEME_MUTED),
             )),
         ];
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(THEME_MANTLE)),
+            Paragraph::new(lines).style(Style::default().bg(THEME_BASE)),
+            area,
+        );
+        return;
+    }
+
+    if let Some(picker) = &state.session_picker {
+        let selected = picker
+            .selection
+            .min(picker.sessions.len().saturating_sub(1));
+        let visible = usize::from(area.height.saturating_sub(4));
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(picker.sessions.len().saturating_sub(visible));
+        let mut lines = vec![
+            Line::default(),
+            Line::from(Span::styled(
+                "  恢复会话",
+                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+        ];
+        for (index, session) in picker.sessions.iter().enumerate().skip(start).take(visible) {
+            let is_selected = index == selected;
+            let short_id = session.id.to_string();
+            let short_id = &short_id[..8];
+            let pending = if session.has_pending_run {
+                " · 中断"
+            } else {
+                ""
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if is_selected { "› " } else { "  " },
+                    Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}. {short_id}  ", index + 1),
+                    if is_selected {
+                        Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(THEME_TEXT)
+                    },
+                ),
+                Span::styled(
+                    truncate_width(
+                        &format!(
+                            "{}/{} · {} 条消息{pending}",
+                            session.provider, session.model, session.message_count
+                        ),
+                        usize::from(area.width).saturating_sub(12),
+                    ),
+                    Style::default().fg(THEME_MUTED),
+                ),
+            ]));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  ↑/↓ 选择 · Enter 恢复 · Esc 返回",
+            Style::default().fg(THEME_MUTED),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(THEME_BASE)),
+            area,
+        );
+        return;
+    }
+
+    if let Some(selection) = state.permission_picker {
+        let mut lines = vec![
+            Line::default(),
+            Line::from(Span::styled(
+                "  选择工具权限",
+                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+        ];
+        for (index, profile) in PermissionProfile::ALL.iter().enumerate() {
+            let selected = index == selection;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}. {:<10}", index + 1, profile.label()),
+                    if selected {
+                        Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(THEME_TEXT)
+                    },
+                ),
+                Span::styled(profile.description(), Style::default().fg(THEME_MUTED)),
+            ]));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  ↑/↓ 选择 · Enter 确认 · Esc 返回",
+            Style::default().fg(THEME_MUTED),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(THEME_BASE)),
             area,
         );
         return;
     }
 
     frame.render_widget(
-        Block::default().style(Style::default().bg(THEME_MANTLE)),
+        Block::default().style(Style::default().bg(THEME_BASE)),
         area,
     );
 
     if let DeleteConfirmation::Selecting(selection) = state.delete_confirmation {
-        let yes_style = if selection == DeleteChoice::Yes {
-            Style::default()
-                .fg(THEME_RED)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::default().fg(THEME_MUTED)
-        };
-        let no_style = if selection == DeleteChoice::No {
-            Style::default()
-                .fg(THEME_GREEN)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::default().fg(THEME_MUTED)
-        };
-        let yes_marker = if selection == DeleteChoice::Yes {
-            ">"
-        } else {
-            " "
-        };
-        let no_marker = if selection == DeleteChoice::No {
-            ">"
-        } else {
-            " "
-        };
         let lines = vec![
+            Line::default(),
             Line::from(Span::styled(
-                "删除当前对话？此操作无法撤销。",
-                Style::default()
-                    .fg(THEME_YELLOW)
-                    .add_modifier(Modifier::BOLD),
+                "  删除当前对话？此操作无法撤销。",
+                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
             )),
+            Line::default(),
+            selection_option_line(selection == DeleteChoice::Yes, "1. Yes  删除并退出"),
+            selection_option_line(selection == DeleteChoice::No, "2. No   返回"),
+            Line::default(),
             Line::from(Span::styled(
-                format!("{yes_marker} Yes  删除并退出"),
-                yes_style,
-            )),
-            Line::from(Span::styled(format!("{no_marker} No   返回"), no_style)),
-            Line::from(Span::styled(
-                "使用方向键选择，按 Enter 确认",
+                "  ↑/↓ 选择 · Enter 确认 · Esc 返回",
                 Style::default().fg(THEME_MUTED),
             )),
         ];
@@ -3754,7 +4305,7 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "> ",
+            "› ",
             Style::default()
                 .fg(prompt_color)
                 .add_modifier(Modifier::BOLD),
@@ -3836,25 +4387,20 @@ fn render_pending_images(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
 fn render_footer(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     frame.render_widget(
         Paragraph::new(footer_line(state, usize::from(area.width)))
-            .style(Style::default().bg(THEME_MANTLE)),
+            .style(Style::default().bg(THEME_BASE)),
         area,
     );
 }
 
-fn approval_option_line(
-    choice: ApprovalChoice,
-    selected: ApprovalChoice,
-    label: &'static str,
-) -> Line<'static> {
-    let is_selected = choice == selected;
-    let style = if is_selected {
-        Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD)
+fn selection_option_line(selected: bool, label: &'static str) -> Line<'static> {
+    let style = if selected {
+        Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(THEME_SUBTEXT)
+        Style::default().fg(THEME_TEXT)
     };
     Line::from(vec![
         Span::styled(
-            if is_selected { "› " } else { "  " },
+            if selected { "› " } else { "  " },
             Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(label, style),
@@ -3864,7 +4410,7 @@ fn approval_option_line(
 fn footer_line(state: &UiState, width: usize) -> Line<'static> {
     if state.quit_shortcut_active() {
         return Line::from(Span::styled(
-            truncate_width("再按 Ctrl+C 退出", width),
+            truncate_width("  再按 Ctrl+C 退出", width.saturating_add(1)),
             Style::default()
                 .fg(THEME_YELLOW)
                 .add_modifier(Modifier::BOLD),
@@ -3877,110 +4423,100 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
     } else {
         ""
     };
-    let context_full = format!(
-        "{estimate}{}/{} ({}%)",
-        format_tokens(context_tokens),
-        format_tokens(state.max_input_tokens),
-        format_context_percent(context_tokens, state.max_input_tokens)
-    );
-    let context_compact = format!(
-        "{estimate}{}%",
-        format_context_percent(context_tokens, state.max_input_tokens)
-    );
-    let usage = format!(
-        " | 输入 {} 输出 {}",
-        format_tokens(usage_values.prompt_tokens),
-        format_tokens(usage_values.completion_tokens)
-    );
+    let remaining = context_remaining_percent(context_tokens, state.max_input_tokens);
+    let context_full = format!("上下文 {estimate}{remaining}% 剩余");
+    let context_compact = format!("{estimate}{remaining}%");
+    let input = format!("输入 {}", format_tokens(usage_values.prompt_tokens));
+    let output = format!("输出 {}", format_tokens(usage_values.completion_tokens));
     let effort = state.reasoning_effort.to_string();
-    let context_label = " 上下文 ";
-    let full_right_width = display_width(&state.model)
-        .saturating_add(display_width(" | effort "))
-        .saturating_add(display_width(&effort))
-        .saturating_add(1);
-    let model_right_width = display_width(&state.model).saturating_add(1);
-    let full_left_width = display_width(context_label)
-        .saturating_add(display_width(&context_full))
-        .saturating_add(display_width(&usage));
-    let context_left_width =
-        display_width(context_label).saturating_add(display_width(&context_full));
-    let compact_left_width =
-        display_width(context_label).saturating_add(display_width(&context_compact));
+    let model_with_effort = format!("{} effort {effort}", state.model);
 
-    let (context, usage, show_effort, model) = if full_left_width
-        .saturating_add(full_right_width)
-        .saturating_add(2)
-        <= width
-    {
-        (context_full, Some(usage), true, state.model.clone())
-    } else if context_left_width
-        .saturating_add(full_right_width)
-        .saturating_add(2)
-        <= width
-    {
-        (context_full, None, true, state.model.clone())
-    } else if compact_left_width
-        .saturating_add(full_right_width)
-        .saturating_add(2)
-        <= width
-    {
-        (context_compact, None, true, state.model.clone())
-    } else {
-        let available = width.saturating_sub(compact_left_width).saturating_sub(3);
-        (
-            context_compact,
-            None,
-            false,
-            truncate_width(&state.model, available.saturating_add(1)),
-        )
-    };
-
-    let left_width = display_width(context_label)
-        .saturating_add(display_width(&context))
-        .saturating_add(usage.as_deref().map_or(0, display_width));
-    let right_width = if model.is_empty() {
-        0
-    } else if show_effort {
-        full_right_width
-    } else {
-        model_right_width.min(display_width(&model).saturating_add(1))
-    };
-    let padding = width.saturating_sub(left_width.saturating_add(right_width));
-    let mut spans = vec![
-        Span::styled(
-            context_label,
-            Style::default()
-                .fg(THEME_SUBTEXT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            context,
-            Style::default()
-                .fg(context_usage_color(context_tokens, state.max_input_tokens))
-                .add_modifier(Modifier::BOLD),
-        ),
+    let candidates = [
+        (true, true, true, context_full.as_str()),
+        (true, true, false, context_full.as_str()),
+        (true, false, false, context_full.as_str()),
+        (false, false, true, context_full.as_str()),
+        (false, false, false, context_full.as_str()),
+        (false, false, false, context_compact.as_str()),
     ];
-    if let Some(usage) = usage {
-        spans.push(Span::styled(usage, Style::default().fg(THEME_MUTED)));
-    }
-    spans.push(Span::raw(" ".repeat(padding)));
-    if !model.is_empty() {
+    let (show_model, show_effort, show_usage, context) = candidates
+        .into_iter()
+        .find(|(show_model, show_effort, show_usage, context)| {
+            let left = if *show_model {
+                2 + display_width(if *show_effort {
+                    &model_with_effort
+                } else {
+                    &state.model
+                })
+            } else {
+                0
+            };
+            let right = footer_right_width(context, &input, &output, *show_usage);
+            let gap = usize::from(*show_model) * 2;
+            left.saturating_add(gap).saturating_add(right) <= width
+        })
+        .unwrap_or((false, false, false, context_compact.as_str()));
+
+    let mut spans = Vec::new();
+    let left_width = if show_model {
+        spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            model,
+            state.model.clone(),
             Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
         ));
-        if show_effort {
-            spans.push(Span::styled(" | effort ", Style::default().fg(THEME_MUTED)));
-            spans.push(Span::styled(
-                effort,
-                Style::default()
-                    .fg(THEME_YELLOW)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        spans.push(Span::raw(" "));
+        2 + display_width(&state.model)
+    } else {
+        0
+    };
+    let left_width = if show_effort {
+        spans.push(Span::styled(" effort ", Style::default().fg(THEME_MUTED)));
+        spans.push(Span::styled(
+            effort.clone(),
+            Style::default()
+                .fg(THEME_YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ));
+        left_width + display_width(" effort ") + display_width(&effort)
+    } else {
+        left_width
+    };
+    let right_width = footer_right_width(context, &input, &output, show_usage);
+    spans.push(Span::raw(" ".repeat(
+        width.saturating_sub(left_width).saturating_sub(right_width),
+    )));
+    spans.push(Span::styled(
+        context.to_string(),
+        Style::default().fg(context_usage_color(context_tokens, state.max_input_tokens)),
+    ));
+    if show_usage {
+        spans.push(Span::styled(" · ", Style::default().fg(THEME_MUTED)));
+        spans.push(Span::styled(input, Style::default().fg(THEME_GREEN)));
+        spans.push(Span::styled(" · ", Style::default().fg(THEME_MUTED)));
+        spans.push(Span::styled(output, Style::default().fg(THEME_GREEN)));
     }
     Line::from(spans)
+}
+
+fn footer_right_width(context: &str, input: &str, output: &str, show_usage: bool) -> usize {
+    display_width(context)
+        + usize::from(show_usage)
+            * (display_width(" · ") * 2 + display_width(input) + display_width(output))
+}
+
+fn context_remaining_percent(tokens: u64, limit: u64) -> u64 {
+    if limit <= CONTEXT_BASELINE_TOKENS {
+        return 0;
+    }
+    let effective_limit = limit - CONTEXT_BASELINE_TOKENS;
+    let used = tokens
+        .saturating_sub(CONTEXT_BASELINE_TOKENS)
+        .min(effective_limit);
+    let remaining = effective_limit - used;
+    let rounded = u128::from(remaining)
+        .saturating_mul(100)
+        .saturating_add(u128::from(effective_limit) / 2)
+        / u128::from(effective_limit);
+    u64::try_from(rounded).unwrap_or(100).min(100)
 }
 
 fn context_usage_color(tokens: u64, limit: u64) -> Color {
@@ -4155,7 +4691,7 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
     let mut lines = Vec::new();
     for message in messages {
         if message.role == ViewRole::Separator {
-            remove_trailing_blank_line(&mut lines);
+            trim_trailing_blank_lines(&mut lines);
             append_turn_separator(&mut lines, width);
             continue;
         }
@@ -4163,7 +4699,7 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
             message.role,
             ViewRole::RunCompleted | ViewRole::RunCancelled | ViewRole::RunFailed
         ) {
-            remove_trailing_blank_line(&mut lines);
+            trim_trailing_blank_lines(&mut lines);
             append_run_summary(&mut lines, message, width);
             continue;
         }
@@ -4203,7 +4739,7 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
 
         let (label_color, content_style) = match message.role {
             ViewRole::Tool => (THEME_YELLOW, Style::default().fg(THEME_SUBTEXT)),
-            ViewRole::Notice => (THEME_TEAL, Style::default().fg(THEME_SUBTEXT)),
+            ViewRole::Notice => (THEME_BLUE, Style::default().fg(THEME_SUBTEXT)),
             ViewRole::Error => (THEME_RED, Style::default().fg(THEME_RED)),
             ViewRole::User
             | ViewRole::Assistant
@@ -4229,14 +4765,15 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
 }
 
 fn append_message_gap(lines: &mut Vec<Line<'static>>) {
-    while lines.last().is_some_and(|line| line.width() == 0) {
-        lines.pop();
-    }
+    trim_trailing_blank_lines(lines);
     lines.push(Line::default());
 }
 
-fn remove_trailing_blank_line(lines: &mut Vec<Line<'static>>) {
-    if lines.last().is_some_and(|line| line.width() == 0) {
+fn trim_trailing_blank_lines(lines: &mut Vec<Line<'static>>) {
+    while lines
+        .last()
+        .is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
+    {
         lines.pop();
     }
 }
@@ -4295,20 +4832,29 @@ fn append_reasoning_summary(lines: &mut Vec<Line<'static>>, reasoning: &str) {
 }
 
 fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
+    let user_style = Style::default().fg(THEME_TEXT).bg(THEME_USER_BG);
     let mut content_lines = content.lines();
     let first = content_lines.next().unwrap_or_default();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "› ",
-            Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(first.to_string(), Style::default().fg(THEME_TEAL)),
-    ]));
+    lines.push(
+        Line::from(vec![
+            Span::styled(
+                "› ",
+                user_style
+                    .fg(THEME_SUBTEXT)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM),
+            ),
+            Span::styled(first.to_string(), user_style),
+        ])
+        .style(user_style),
+    );
     for line in content_lines {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(line.to_string(), Style::default().fg(THEME_TEAL)),
-        ]));
+        lines.push(
+            Line::from(vec![
+                Span::styled("  ", user_style),
+                Span::styled(line.to_string(), user_style),
+            ])
+            .style(user_style),
+        );
     }
 }
 
@@ -4460,7 +5006,9 @@ fn append_shell_tool_header(
         ),
         Span::styled(
             format!("{title} "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(if failed { THEME_RED } else { THEME_TEXT })
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     let command_lines = message
@@ -4491,7 +5039,7 @@ fn append_file_change(lines: &mut Vec<Line<'static>>, change: &FileChangeSummary
         FileChangeKind::Updated => "已编辑",
     };
     lines.push(Line::from(vec![
-        Span::styled("• ", Style::default().fg(THEME_MUTED)),
+        Span::styled("• ", Style::default().fg(THEME_GREEN)),
         Span::styled(
             action,
             Style::default()
@@ -4578,10 +5126,6 @@ fn append_file_change(lines: &mut Vec<Line<'static>>, change: &FileChangeSummary
             Span::styled("…", Style::default().fg(THEME_MUTED)),
         ]));
     }
-}
-
-fn tool_running_status(name: &str) -> String {
-    tool_action_title(name, true, false)
 }
 
 fn tool_action_title(name: &str, running: bool, failed: bool) -> String {
@@ -4727,6 +5271,145 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, base: St
     lines.extend(MarkdownRenderer::new(base).render(content));
 }
 
+fn normalize_backslash_math_delimiters(content: &str) -> Cow<'_, str> {
+    let mut output = String::new();
+    let mut last = 0usize;
+    let mut cursor = 0usize;
+    let mut fence: Option<(u8, usize)> = None;
+    let mut inline_ticks: Option<usize> = None;
+
+    while cursor < content.len() {
+        let line_start =
+            cursor == 0 || content.as_bytes().get(cursor.wrapping_sub(1)) == Some(&b'\n');
+        if line_start {
+            let line_end = content
+                .get(cursor..)
+                .and_then(|tail| tail.find('\n'))
+                .map_or(content.len(), |offset| cursor + offset + 1);
+            if let Some((marker, count)) = markdown_fence_marker(content, cursor, line_end) {
+                match fence {
+                    Some((open_marker, open_count))
+                        if marker == open_marker && count >= open_count =>
+                    {
+                        fence = None;
+                    }
+                    None => fence = Some((marker, count)),
+                    _ => {}
+                }
+                cursor = line_end;
+                continue;
+            }
+            if fence.is_some() {
+                cursor = line_end;
+                continue;
+            }
+        }
+
+        if content.as_bytes().get(cursor) == Some(&b'`') {
+            let count = content.as_bytes()[cursor..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            inline_ticks = match inline_ticks {
+                Some(open) if open == count => None,
+                None => Some(count),
+                current => current,
+            };
+            cursor = cursor.saturating_add(count);
+            continue;
+        }
+
+        if inline_ticks.is_none() && !is_escaped_at(content, cursor) {
+            let delimiter = if content
+                .get(cursor..)
+                .is_some_and(|tail| tail.starts_with(r"\("))
+            {
+                Some((r"\)", "$", false))
+            } else if content
+                .get(cursor..)
+                .is_some_and(|tail| tail.starts_with(r"\["))
+            {
+                Some((r"\]", "$$", true))
+            } else {
+                None
+            };
+            if let Some((closing, markdown_delimiter, display)) = delimiter
+                && let Some(close) = find_unescaped_delimiter(content, cursor + 2, closing)
+            {
+                let math = &content[cursor + 2..close];
+                let supported = if display {
+                    render_display(math).is_some()
+                } else {
+                    !math.contains('\n') && render_inline(math).is_some()
+                };
+                if supported {
+                    output.push_str(&content[last..cursor]);
+                    output.push_str(markdown_delimiter);
+                    output.push_str(math);
+                    output.push_str(markdown_delimiter);
+                    cursor = close.saturating_add(2);
+                    last = cursor;
+                    continue;
+                }
+            }
+        }
+
+        cursor = cursor.saturating_add(
+            content
+                .get(cursor..)
+                .and_then(|tail| tail.chars().next())
+                .map_or(1, char::len_utf8),
+        );
+    }
+
+    if output.is_empty() {
+        Cow::Borrowed(content)
+    } else {
+        output.push_str(&content[last..]);
+        Cow::Owned(output)
+    }
+}
+
+fn markdown_fence_marker(content: &str, start: usize, end: usize) -> Option<(u8, usize)> {
+    let line = content.get(start..end)?;
+    let bytes = line.as_bytes();
+    let indentation = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let marker = *bytes.get(indentation)?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let count = bytes[indentation..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    (count >= 3).then_some((marker, count))
+}
+
+fn find_unescaped_delimiter(content: &str, start: usize, delimiter: &str) -> Option<usize> {
+    let mut cursor = start;
+    while let Some(offset) = content.get(cursor..)?.find(delimiter) {
+        let found = cursor.saturating_add(offset);
+        if !is_escaped_at(content, found) {
+            return Some(found);
+        }
+        cursor = found.saturating_add(1);
+    }
+    None
+}
+
+fn is_escaped_at(content: &str, index: usize) -> bool {
+    content.as_bytes()[..index]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
 struct MarkdownList {
     next: Option<u64>,
 }
@@ -4771,7 +5454,8 @@ impl MarkdownRenderer {
     }
 
     fn render(mut self, content: &str) -> Vec<Line<'static>> {
-        for event in Parser::new_ext(content, MarkdownOptions::all()) {
+        let content = normalize_backslash_math_delimiters(content);
+        for event in Parser::new_ext(&content, MarkdownOptions::all()) {
             self.event(event);
         }
         self.flush_line(false);
@@ -4794,14 +5478,16 @@ impl MarkdownRenderer {
                 self.push_text(&text, self.current_style());
             }
             MarkdownEvent::Code(code) => {
-                self.push_text(&code, Style::default().fg(THEME_TEAL));
+                self.push_text(&code, Style::default().fg(THEME_BLUE));
             }
             MarkdownEvent::InlineMath(math) => {
-                self.push_text(&format!("${math}$"), self.current_style());
+                let rendered = render_inline(&math).unwrap_or_else(|| format!("${math}$"));
+                self.push_text(&rendered, self.current_style());
             }
             MarkdownEvent::DisplayMath(math) => {
                 self.flush_line(false);
-                self.push_text(&format!("$${math}$$"), self.current_style());
+                let rendered = render_display(&math).unwrap_or_else(|| format!("$${math}$$"));
+                self.push_text(&rendered, self.current_style());
                 self.flush_line(false);
             }
             MarkdownEvent::FootnoteReference(label) => {
@@ -5189,19 +5875,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_hint_requires_a_nonempty_session_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("rollout.jsonl");
-
-        assert!(!session_path_is_resumable(&path));
-        std::fs::File::create(&path).unwrap();
-        assert!(!session_path_is_resumable(&path));
-        std::fs::write(&path, "{}\n").unwrap();
-        assert!(session_path_is_resumable(&path));
-        assert!(!session_path_is_resumable(temp.path()));
-    }
-
-    #[test]
     fn restores_compact_turn_separators_and_keeps_them_for_the_next_input() {
         let mut state = UiState::new(
             "model".to_string(),
@@ -5464,90 +6137,6 @@ mod tests {
     }
 
     #[test]
-    fn removes_a_deferred_assistant_message_when_the_agent_retries_with_a_tool() {
-        let mut state = UiState::new(
-            "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
-            std::path::PathBuf::from("."),
-        );
-        state.apply_agent_event(AgentEvent::RunStarted);
-        state.apply_agent_event(AgentEvent::AssistantStarted);
-        state.apply_agent_event(AgentEvent::TextDelta {
-            text: "好的，这就写入 result.txt。".to_string(),
-        });
-
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].content, "好的，这就写入 result.txt。");
-        assert!(state.current_assistant.is_some());
-
-        state.apply_agent_event(AgentEvent::AssistantDiscarded);
-
-        assert!(state.messages.is_empty());
-        assert!(state.current_assistant.is_none());
-        assert!(state.live_completion.is_empty());
-        assert_eq!(state.status, "正在继续执行");
-        assert!(state.running);
-    }
-
-    #[test]
-    fn keeps_the_live_turn_contiguous_and_refreshes_usage() {
-        let mut state = UiState::new(
-            "model".to_string(),
-            "http://localhost/v1/responses".to_string(),
-            std::path::PathBuf::from("."),
-        );
-        state.protect_new_turn();
-        state.begin_live_usage(120);
-        state.push_user("继续".to_string(), &[]);
-        state.begin_run("处理中");
-        state.apply_agent_event(AgentEvent::AssistantStarted);
-        state.apply_agent_event(AgentEvent::TextDelta {
-            text: format!("{}最终一行", "较长的中文输出。\n".repeat(40)),
-        });
-
-        let live_usage = state.displayed_usage();
-        assert_eq!(live_usage.prompt_tokens, 120);
-        assert!(live_usage.completion_tokens > 0);
-        assert!(footer_line(&state, 80).to_string().contains('~'));
-
-        state.apply_agent_event(AgentEvent::Usage {
-            usage: Usage {
-                prompt_tokens: 150,
-                completion_tokens: 90,
-                total_tokens: 240,
-                cached_prompt_tokens: None,
-            },
-            context_tokens: 240,
-            context_window: 1_000,
-            max_input_tokens: 1_000,
-            estimated: false,
-        });
-        state.apply_agent_event(AgentEvent::RunFinished);
-
-        assert_eq!(state.displayed_usage().prompt_tokens, 150);
-        assert_eq!(state.displayed_usage().completion_tokens, 90);
-        assert_eq!(transcript_archive_count(&state, 40, 6), 0);
-
-        let backend = TestBackend::new(40, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let final_line_y = buffer
-            .content
-            .iter()
-            .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == "最").then_some(index / 40))
-            .unwrap();
-        let completed_y = buffer
-            .content
-            .iter()
-            .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == "已").then_some(index / 40))
-            .unwrap();
-        assert!(completed_y.saturating_sub(final_line_y) <= 2);
-    }
-
-    #[test]
     fn animates_live_input_and_output_token_counts() {
         let mut state = UiState::new(
             "model".to_string(),
@@ -5572,6 +6161,37 @@ mod tests {
             state.advance_usage_animation(now);
         }
         assert_eq!(state.animated_usage(), target);
+    }
+
+    #[test]
+    fn renders_a_codex_style_context_footer_at_wide_and_narrow_widths() {
+        let mut state = UiState::new(
+            "grok-4.5".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.reasoning_effort = ReasoningEffort::High;
+        state.usage = Usage {
+            prompt_tokens: 1_200,
+            completion_tokens: 300,
+            total_tokens: 1_500,
+            cached_prompt_tokens: None,
+        };
+        state.context_tokens = 32_000;
+        state.max_input_tokens = 112_000;
+        state.sync_usage_animation();
+
+        let wide = footer_line(&state, 120).to_string();
+        assert!(wide.starts_with("  grok-4.5 effort high"));
+        assert!(wide.ends_with("上下文 80% 剩余 · 输入 1.2k · 输出 300"));
+        assert_eq!(display_width(&wide), 120);
+        let medium = footer_line(&state, 50).to_string();
+        assert!(medium.starts_with("  grok-4.5 effort high"));
+        assert!(medium.ends_with("上下文 80% 剩余"));
+        assert!(!medium.contains("输入"));
+        let narrow = footer_line(&state, 20);
+        assert!(narrow.to_string().ends_with("上下文 80% 剩余"));
+        assert_eq!(narrow.width(), 20);
     }
 
     #[test]
@@ -5696,6 +6316,56 @@ mod tests {
     }
 
     #[test]
+    fn places_status_and_completions_around_the_composer_like_codex() {
+        let mut popup_state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        popup_state.editor.set_text("/mo");
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut popup_state))
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(60)
+            .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+            .collect::<Vec<_>>();
+        let input_y = rows.iter().position(|line| line.contains("› /mo")).unwrap();
+        let suggestion_y = rows
+            .iter()
+            .position(|line| line.trim_start().starts_with("› /model"))
+            .unwrap();
+        assert!(suggestion_y > input_y);
+        assert!(!rows.iter().any(|line| line.contains("上下文")));
+
+        let mut running_state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        running_state.show_welcome = false;
+        running_state.begin_run("处理中");
+        terminal
+            .draw(|frame| render(frame, &mut running_state))
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(60)
+            .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+            .collect::<Vec<_>>();
+        let status_y = rows.iter().position(|line| line.contains('•')).unwrap();
+        let input_y = rows.iter().position(|line| line.contains('›')).unwrap();
+        assert_eq!(input_y.saturating_sub(status_y), 3);
+    }
+
+    #[test]
     fn anchors_a_compact_layout_to_the_terminal_bottom() {
         let mut state = UiState::new(
             "model".to_string(),
@@ -5725,7 +6395,8 @@ mod tests {
             .content
             .iter()
             .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == ">").then_some(index / 40))
+            .rfind(|(_, cell)| cell.symbol() == "›")
+            .map(|(index, _)| index / 40)
             .unwrap();
         let footer_y = buffer
             .content
@@ -5735,7 +6406,7 @@ mod tests {
             .unwrap();
         assert_eq!(footer_y, 31);
         assert_eq!(input_y, 29);
-        assert_eq!(message_y, 27);
+        assert_eq!(message_y, 26);
     }
 
     #[test]
@@ -5798,7 +6469,7 @@ mod tests {
             .content
             .iter()
             .enumerate()
-            .rfind(|(_, cell)| cell.symbol() == ">")
+            .rfind(|(_, cell)| cell.symbol() == "›")
             .map(|(index, _)| index / 80)
             .unwrap();
         assert_eq!(placeholder_y, input_y);
@@ -5820,7 +6491,7 @@ mod tests {
             .enumerate()
             .find_map(|(index, cell)| (cell.symbol() == "╮").then_some(index % 80))
             .unwrap();
-        assert_eq!(border_y, 4);
+        assert_eq!(border_y, 3);
         assert!(border_left.abs_diff(79 - border_right) <= 1);
         assert_eq!(
             buffer[(79, u16::try_from(input_y).unwrap())].bg,
@@ -5849,7 +6520,8 @@ mod tests {
             .flat_map(|line| &line.spans)
             .find(|span| span.content.contains("用户内容"))
             .unwrap();
-        assert_eq!(user_span.style.fg, Some(THEME_TEAL));
+        assert_eq!(user_span.style.fg, Some(THEME_TEXT));
+        assert_eq!(user_span.style.bg, Some(THEME_USER_BG));
 
         let assistant = ViewMessage {
             role: ViewRole::Assistant,
@@ -5894,44 +6566,17 @@ mod tests {
     }
 
     #[test]
-    fn aligns_a_short_conversation_directly_above_the_input() {
-        let mut state = UiState::new(
-            "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
-            std::path::PathBuf::from("."),
-        );
-        state.push_user("紧凑布局".to_string(), &[]);
-        let backend = TestBackend::new(80, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let message_y = buffer
-            .content
-            .iter()
-            .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == "紧").then_some(index / 80))
-            .unwrap();
-        let input_y = buffer
-            .content
-            .iter()
-            .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == ">").then_some(index / 80))
-            .unwrap();
-        let footer_y = buffer
-            .content
-            .iter()
-            .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == "上").then_some(index / 80))
-            .unwrap();
-        assert!(input_y.saturating_sub(message_y) <= 2);
-        assert_eq!(footer_y.saturating_sub(input_y), 2);
-        assert!(message_y > 0);
-    }
-
-    #[test]
     fn keeps_one_blank_row_between_live_output_and_activity() {
+        let mut trailing_whitespace = vec![
+            Line::from("正文"),
+            Line::from("   "),
+            Line::from(vec![Span::raw(" "), Span::raw("\t")]),
+        ];
+        append_message_gap(&mut trailing_whitespace);
+        assert_eq!(trailing_whitespace.len(), 2);
+        assert_eq!(trailing_whitespace[0].to_string(), "正文");
+        assert_eq!(trailing_whitespace[1].width(), 0);
+
         let mut state = UiState::new(
             "model".to_string(),
             "http://localhost/v1/chat/completions".to_string(),
@@ -5998,7 +6643,7 @@ mod tests {
 
     #[test]
     fn renders_commonmark_as_terminal_styles() {
-        let content = "# Heading\n\n**bold** and *italic* with `code` and [docs](https://example.com).\n\n- one\n- two\n\n> quote\n\n```rust\nlet value = 1;\n```";
+        let content = "# Heading\n\n**bold** and *italic* with `code` and [docs](https://example.com).\n\nFormula $\\mathbb{C}^3 \\to \\mathbb{C}^3$ and \\(s \\to \\infty\\).\n\n\\[\\frac{x^2+1}{x-1}\\]\n\n- one\n- two\n\n> quote\n\n```rust\nlet value = 1;\n```";
         let mut lines = Vec::new();
         append_markdown_lines(&mut lines, content, Style::default().fg(THEME_TEXT));
         let rendered = lines
@@ -6012,6 +6657,9 @@ mod tests {
         assert!(!rendered.contains("- one"));
         assert!(rendered.contains("│ quote"));
         assert!(rendered.contains("docs (https://example.com)"));
+        assert!(rendered.contains("Formula ℂ³ → ℂ³ and s → ∞."));
+        assert!(rendered.contains('─'));
+        assert!(!rendered.contains("\\mathbb"));
         assert!(rendered.contains("let value = 1;"));
         assert!(!rendered.contains("# Heading"));
         assert!(!rendered.contains("**bold**"));
@@ -6032,7 +6680,7 @@ mod tests {
             .clone()
             .find(|span| span.content.as_ref() == "code")
             .unwrap();
-        assert_eq!(code.style.fg, Some(THEME_TEAL));
+        assert_eq!(code.style.fg, Some(THEME_BLUE));
         assert_eq!(code.style.bg, None);
 
         let rust_line = lines
@@ -6561,5 +7209,27 @@ mod tests {
             ),
             UiAction::ResolveApproval(ApprovalDecision::Deny)
         ));
+    }
+
+    #[test]
+    fn completes_workspace_file_mentions_at_the_cursor() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::fs::create_dir_all(project.path().join("target")).unwrap();
+        std::fs::write(project.path().join("target/ignored.rs"), "ignored\n").unwrap();
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            project.path().to_path_buf(),
+        );
+        state.editor.set_text("检查 @sl");
+
+        let suggestions = file_suggestions(&state);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].label, "@src/lib.rs");
+        assert!(complete_slash_suggestion(&mut state));
+        assert_eq!(state.editor.text(), "检查 @src/lib.rs ");
     }
 }

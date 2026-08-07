@@ -34,13 +34,15 @@ ratatui = { version = "0.30", default-features = false, features = [
 ] }
 ratatui-crossterm = { version = "0.1", features = ["scrolling-regions"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
-rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "3.1.1", default-features = false, features = ["client", "transport-child-process"] }
+rust-latex-parser = "0.1"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 syntect = "5"
 tar = "0.4"
+term-maths = { version = "1.0", default-features = false }
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"

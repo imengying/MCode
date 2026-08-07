@@ -9,6 +9,7 @@ use mcode::cli::{Cli, Command, join_prompt};
 use mcode::config::{AppConfig, ConfigOverrides, McpServerConfig};
 use mcode::event::{AgentEvent, CompactionReason};
 use mcode::protocol::{ImageAttachment, sanitize_terminal_text};
+use mcode::sandbox::PermissionProfile;
 use mcode::session::{Session, SessionMetadata};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -235,6 +236,15 @@ fn run_doctor(config: &AppConfig, json: bool) -> Result<()> {
         "name": "session_storage",
         "detail": session_directory,
     }));
+    let bubblewrap = resolve_executable("bwrap", &config.cwd);
+    checks.push(serde_json::json!({
+        "status": if bubblewrap.is_some() { "ok" } else { "warning" },
+        "name": "sandbox",
+        "detail": bubblewrap.map_or_else(
+            || "bwrap not found; read-only and workspace-write shell commands are unavailable".to_string(),
+            |path| path.to_string_lossy().into_owned(),
+        ),
+    }));
     match Session::list(&config.cwd) {
         Ok(sessions) => checks.push(serde_json::json!({
             "status": "ok",
@@ -298,6 +308,7 @@ fn localized_doctor_name(name: &str) -> &str {
         "api_key" => "API 密钥",
         "session_storage" => "会话存储",
         "sessions" => "会话",
+        "sandbox" => "沙箱",
         _ => name,
     }
 }
@@ -323,6 +334,9 @@ fn localized_doctor_detail(status: &str, name: &str, detail: &serde_json::Value)
                 || detail.to_string(),
                 |count| format!("可读取 {count} 个会话"),
             ),
+        "sandbox" if status != "ok" => {
+            "未找到 bwrap；只读和工作区可写模式无法运行 shell 命令".to_string()
+        }
         _ => detail
             .as_str()
             .map_or_else(|| detail.to_string(), ToString::to_string),
@@ -443,6 +457,9 @@ async fn run_exec(
     json: bool,
     bypass_approvals: bool,
 ) -> Result<()> {
+    if bypass_approvals {
+        agent.set_permission_profile(PermissionProfile::FullAccess);
+    }
     let resume_pending = agent.has_pending_run();
     for failure in agent.mcp_startup_failures() {
         eprintln!(

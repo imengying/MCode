@@ -9,7 +9,8 @@ Kimi。
 - `read_file`、`write_file`、`edit_file`、`shell` 内置工具
 - 四家模型原生 Web Search 与网页正文提取
 - 图片输入、Wayland/X11 剪贴板和本地 stdio MCP
-- shell/MCP 执行审批
+- Markdown 与终端 Unicode 数学公式渲染
+- Linux Bubblewrap 沙箱与 shell/MCP 执行审批
 - Pi 风格自动上下文压缩和溢出恢复
 - JSONL 会话、崩溃恢复、累计 token 与缓存命中统计
 - 模型与 effort 切换
@@ -30,6 +31,16 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/imengying/MCode/main/install.sh | \
   MCODE_VERSION=0.1.0 MCODE_INSTALL_DIR="$HOME/bin" sh
+```
+
+默认 shell 权限需要系统安装 `bubblewrap`（命令名 `bwrap`）：
+
+```bash
+# Arch Linux
+sudo pacman -S bubblewrap
+
+# Debian / Ubuntu
+sudo apt install bubblewrap
 ```
 
 显式升级到最新正式版：
@@ -116,8 +127,8 @@ Web Search 默认开启，不需要配置：
 - Kimi 的 `$web_search` 要求关闭 thinking，MCode 会在搜索可用时自动处理。
 - 四家模型均可使用 `fetch_content` 读取公开网页正文。
 
-当前工作目录中的普通 UTF-8 `AGENTS.md` 会加入 system instructions，大小上限 64 KiB；不会
-读取父目录、目录项或符号链接。
+MCode 会从 Git 仓库根目录到当前工作目录逐层读取普通 UTF-8 `AGENTS.md`；同层的
+`AGENTS.override.md` 优先，合计大小上限 64 KiB。不会读取仓库外文件、目录项或符号链接。
 除此之外，MCode 不注入身份、语气或工作流提示；工具能力仅通过标准工具 schema 提供。
 
 ## 使用
@@ -154,15 +165,20 @@ TUI 命令：
 |---|---|
 | `/model [provider/model]` | 查看或切换模型 |
 | `/effort [LEVEL]` | 查看或切换思考强度 |
+| `/permissions` | 选择只读、工作区可写或完全访问 |
+| `/diff` | 显示当前 Git 改动 |
+| `/review [FOCUS]` | 审查当前工作区改动 |
 | `/compact [INSTRUCTIONS]` | 手动压缩上下文 |
 | `/status` | 显示模型、端点和 token |
 | `/new` | 新建会话 |
+| `/resume` | 选择并恢复其他会话 |
 | `/delete` | 选择 Yes 后删除当前会话并退出 |
 | `/clear` | 清屏 |
 | `/help` | 显示帮助 |
 | `/exit` | 退出 |
 
-输入 `/` 后可用方向键选择，Tab 补全，Enter 补全并立即执行命令。Enter 或 Tab 提交；
+输入 `/` 后可用方向键选择，Tab 补全，Enter 补全并立即执行命令。输入 `@` 可模糊查找并
+引用工作区文件。Enter 或 Tab 提交；
 任务运行中则排队为后续消息。Shift+Enter 或 Alt+Enter 换行，Escape 先关闭命令候选，再取消当前任务。
 `Ctrl+C` 先清空草稿，空草稿时一秒内再按一次退出。使用 `Ctrl+V` 粘贴系统剪贴板中的图片或文本；
 Wayland 不可用或报错时自动回退 X11。也可将单个图片文件拖入终端；启动时可用
@@ -184,7 +200,9 @@ Wayland 不可用或报错时自动回退 X11。也可将单个图片文件拖�
 
 - 文件工具拒绝工作目录外路径，写入使用原子替换。
 - 网页抓取限制 2 MiB，逐跳校验重定向和 DNS/IP，拒绝内网地址。
-- shell 和 MCP 以当前用户权限运行；审批不是系统沙箱。
+- 默认 shell 通过 Bubblewrap 禁用网络，并只允许写当前项目与 `/tmp`；`/permissions`
+  可切换为只读或完全访问。Bubblewrap 不可用时安全失败，不会静默降级。
+- shell 和 MCP 仍需审批；“本次会话内始终允许”会在权限档位改变后清空。
 - MCP 服务器、`AGENTS.md` 和网页搜索结果都应视为不可信输入。
 - `resume` 只接受当前项目的会话，并校验会话工作目录。
 - 管道输入或 JSON 模式无法询问时，危险工具默认拒绝执行。

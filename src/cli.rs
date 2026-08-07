@@ -81,7 +81,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "秒")]
     pub request_timeout: Option<u64>,
 
-    /// 无需确认即可运行 shell 和 MCP 工具，并关闭执行保护。
+    /// 无需确认即可运行 shell 和 MCP 工具，并关闭系统沙箱。
     #[arg(
         long = "dangerously-bypass-approvals",
         visible_alias = "dangerously-bypass-approvals-and-sandbox",

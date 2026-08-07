@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -23,6 +22,7 @@ use crate::protocol::{
     FileChangeKind, FileChangeLine, FileChangeLineKind, FileChangeSummary, FunctionDefinition,
     ToolCall, ToolDefinition,
 };
+use crate::sandbox::{PermissionProfile, shell_command};
 use crate::session::ToolReplayPolicy;
 use crate::web_access::WebAccess;
 
@@ -34,6 +34,7 @@ const SHELL_EXIT_PIPE_IDLE_GRACE: Duration = Duration::from_millis(100);
 
 pub struct ToolRegistry {
     root: PathBuf,
+    permission_profile: PermissionProfile,
     definitions: Vec<ToolDefinition>,
     web_access: WebAccess,
     mcp_servers: Vec<McpService>,
@@ -99,6 +100,7 @@ impl ToolRegistry {
         definitions.extend(web_access.definitions());
         Ok(Self {
             root,
+            permission_profile: PermissionProfile::default(),
             definitions,
             web_access,
             mcp_servers: Vec::new(),
@@ -128,6 +130,15 @@ impl ToolRegistry {
     #[must_use]
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
+    }
+
+    #[must_use]
+    pub const fn permission_profile(&self) -> PermissionProfile {
+        self.permission_profile
+    }
+
+    pub const fn set_permission_profile(&mut self, profile: PermissionProfile) {
+        self.permission_profile = profile;
     }
 
     #[must_use]
@@ -275,6 +286,11 @@ impl ToolRegistry {
             },
             "write_file" => match parse_args(&call.function.arguments) {
                 Ok(args) => {
+                    if !self.permission_profile.allows_file_writes() {
+                        return ToolExecution::error(
+                            "当前权限为只读；请通过 /permissions 更改权限",
+                        );
+                    }
                     return match self.write_file(args).await {
                         Ok((output, change)) => {
                             ToolExecution::success_with_file_change(output, change)
@@ -286,6 +302,11 @@ impl ToolRegistry {
             },
             "edit_file" => match parse_args(&call.function.arguments) {
                 Ok(args) => {
+                    if !self.permission_profile.allows_file_writes() {
+                        return ToolExecution::error(
+                            "当前权限为只读；请通过 /permissions 更改权限",
+                        );
+                    }
                     return match self.edit_file(args).await {
                         Ok((output, change)) => {
                             ToolExecution::success_with_file_change(output, change)
@@ -487,14 +508,7 @@ impl ToolRegistry {
             bail!("command cannot be empty");
         }
         let timeout = Duration::from_secs(args.timeout_seconds.unwrap_or(120).clamp(1, 1800));
-        let mut command = shell_command(&args.command);
-        command
-            .current_dir(&self.root)
-            .env("AI_AGENT", "mcode")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut command = shell_command(&args.command, &self.root, self.permission_profile)?;
         let mut child = command.spawn().context("failed to start shell command")?;
         let stdout = child
             .stdout
@@ -1115,60 +1129,38 @@ fn truncate_output(output: &str) -> String {
     format!("{head}\n... tool output truncated ...\n{tail}")
 }
 
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new("cmd");
-    process.arg("/C").arg(command);
-    process
-}
-
-#[cfg(not(windows))]
-fn shell_command(command: &str) -> Command {
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut process = Command::new(shell);
-    process.arg("-lc").arg(command);
-    process
-}
-
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use super::*;
 
-    #[test]
-    fn summarizes_added_and_removed_lines_for_the_ui() {
-        let change = summarize_file_change(
-            "src/lib.rs",
-            Some("fn old() {}\nunchanged\n"),
-            "fn new() {}\nunchanged\nextra\n",
-        );
+    #[tokio::test]
+    async fn read_only_profile_rejects_builtin_file_writes() {
+        let project = tempdir().unwrap();
+        let mut tools = ToolRegistry::new(project.path()).unwrap();
+        tools.set_permission_profile(PermissionProfile::ReadOnly);
+        let call = ToolCall {
+            id: "call_write".to_string(),
+            kind: "function".to_string(),
+            function: crate::protocol::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({"path": "blocked.txt", "content": "no"}).to_string(),
+            },
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
 
-        assert_eq!(change.kind, FileChangeKind::Updated);
-        assert_eq!(change.added_lines, 2);
-        assert_eq!(change.removed_lines, 1);
-        assert!(
-            change
-                .preview
-                .iter()
-                .any(|line| line.kind == FileChangeLineKind::Added)
-        );
-        assert!(
-            change
-                .preview
-                .iter()
-                .any(|line| line.kind == FileChangeLineKind::Removed)
-        );
+        let result = tools.execute(&call, &CancellationToken::new(), &tx).await;
 
-        let added = summarize_file_change("new.rs", None, "one\ntwo\n");
-        assert_eq!(added.kind, FileChangeKind::Added);
-        assert_eq!((added.added_lines, added.removed_lines), (2, 0));
+        assert!(result.is_error);
+        assert!(!project.path().join("blocked.txt").exists());
     }
 
     #[tokio::test]
     async fn shell_emits_incremental_output_events() {
         let project = tempdir().unwrap();
-        let tools = ToolRegistry::new(project.path()).unwrap();
+        let mut tools = ToolRegistry::new(project.path()).unwrap();
+        tools.set_permission_profile(PermissionProfile::FullAccess);
         let call = ToolCall {
             id: "call_shell".to_string(),
             kind: "function".to_string(),
@@ -1199,7 +1191,8 @@ mod tests {
     #[tokio::test]
     async fn shell_stops_waiting_for_quiet_inherited_pipes_after_exit() {
         let project = tempdir().unwrap();
-        let tools = ToolRegistry::new(project.path()).unwrap();
+        let mut tools = ToolRegistry::new(project.path()).unwrap();
+        tools.set_permission_profile(PermissionProfile::FullAccess);
         let call = ToolCall {
             id: "call_shell".to_string(),
             kind: "function".to_string(),
