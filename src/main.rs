@@ -684,7 +684,12 @@ fn confirm_tool_execution(name: &str, arguments: &str) -> ApprovalDecision {
     let arguments = format_tool_arguments(arguments);
     eprintln!("\n{name} 请求使用以下参数执行：");
     eprintln!("{arguments}");
-    eprint!("是否允许？[y] 允许一次 / [a] 本次会话始终允许 / [N] 拒绝：");
+    let session_scope = if name == "shell" {
+        "本次会话允许此命令"
+    } else {
+        "本次会话允许此工具"
+    };
+    eprint!("是否允许？[y] 允许一次 / [a] {session_scope} / [N] 拒绝：");
     if io::stderr().flush().is_err() {
         return ApprovalDecision::Deny;
     }

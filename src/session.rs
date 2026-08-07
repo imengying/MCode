@@ -426,8 +426,7 @@ impl Session {
         let id = session.id;
         session.writer.take();
         drop(session);
-        fs::remove_file(&path)
-            .with_context(|| format!("failed to delete session: {}", path.display()))?;
+        remove_session_files(&path)?;
         remove_project_session_directory_if_empty(&directory)?;
         Ok(id)
     }
@@ -1014,6 +1013,21 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn save_tool_output(
+        &self,
+        intent: &ToolIntent,
+        output: &str,
+    ) -> Result<Option<PathBuf>> {
+        let Some(session_path) = self.path.as_deref() else {
+            return Ok(None);
+        };
+        let directory = session_artifact_directory(session_path).join("tool-results");
+        create_private_directory(&directory)?;
+        let path = directory.join(format!("{}.txt", intent.result_id));
+        write_private_file(&path, output.as_bytes())?;
+        Ok(Some(path))
+    }
+
     pub fn finish_run(&mut self, run_id: Uuid, outcome: RunOutcome) -> Result<()> {
         self.finish_run_with_error(run_id, outcome, None)
     }
@@ -1173,8 +1187,7 @@ impl Session {
             bail!("refusing to delete a session outside the current project session directory");
         }
         self.writer.take();
-        fs::remove_file(&path)
-            .with_context(|| format!("failed to delete session: {}", path.display()))?;
+        remove_session_files(&path)?;
         self.path = None;
         self.persistence_base = None;
         remove_project_session_directory_if_empty(&expected_directory)?;
@@ -1343,6 +1356,33 @@ fn create_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("tool output path has no parent: {}", path.display()))?;
+    let temporary = parent.join(format!(".{}.tmp", Uuid::now_v7()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("failed to create tool output: {}", temporary.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("failed to write tool output: {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush tool output: {}", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to save tool output: {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn create_session_file(path: &Path, header: &SessionRecord) -> Result<SessionWriter> {
     let mut options = OpenOptions::new();
     options.read(true).append(true).create_new(true);
@@ -1419,6 +1459,43 @@ fn project_session_dir(base: &Path, cwd: &Path) -> PathBuf {
         let _ = write!(key, "{byte:02x}");
     }
     base.join(key)
+}
+
+fn session_artifact_directory(path: &Path) -> PathBuf {
+    path.with_extension("")
+}
+
+fn remove_session_artifacts(path: &Path) -> Result<()> {
+    let directory = session_artifact_directory(path);
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect session artifacts: {}",
+                    directory.display()
+                )
+            });
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to delete invalid session artifact directory: {}",
+            directory.display()
+        );
+    }
+    fs::remove_dir_all(&directory).with_context(|| {
+        format!(
+            "failed to delete session artifacts: {}",
+            directory.display()
+        )
+    })
+}
+
+fn remove_session_files(path: &Path) -> Result<()> {
+    remove_session_artifacts(path)?;
+    fs::remove_file(path).with_context(|| format!("failed to delete session: {}", path.display()))
 }
 
 fn remove_project_session_directory_if_empty(directory: &Path) -> Result<()> {
@@ -1622,6 +1699,66 @@ mod tests {
         assert_eq!(resumed.model(), "grok-test");
         assert_eq!(resumed.reasoning_effort(), ReasoningEffort::High);
         assert_eq!(resumed.messages(), [ChatMessage::user("hello")]);
+    }
+
+    #[test]
+    fn saves_full_tool_output_privately_and_deletes_it_with_the_session() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let metadata = SessionMetadata {
+            provider: "deepseek".to_string(),
+            model: "test-model".to_string(),
+            api: ApiProtocol::Responses,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();
+        let id = session.id();
+        let run_id = session.begin_run(ChatMessage::user("run a tool")).unwrap();
+        let intent = session
+            .start_tool(
+                run_id,
+                ToolCall {
+                    id: "call_output".to_string(),
+                    kind: "function".to_string(),
+                    function: crate::protocol::FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: r#"{"path":"large.txt","offset":null,"limit":null}"#.to_string(),
+                    },
+                },
+                ToolReplayPolicy::Safe,
+            )
+            .unwrap();
+        let session_path = session.path().unwrap().to_path_buf();
+        let output_path = session
+            .save_tool_output(&intent, "complete output")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&output_path).unwrap(),
+            "complete output"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&output_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        session
+            .save_tool_output(&intent, "replacement output")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&output_path).unwrap(),
+            "replacement output"
+        );
+        drop(session);
+
+        Session::delete_in(base.path(), project.path(), &id.to_string()).unwrap();
+        assert!(!session_path.exists());
+        assert!(!session_artifact_directory(&session_path).exists());
     }
 
     #[test]

@@ -54,7 +54,7 @@ const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
 const MIN_TERMINAL_HEIGHT: u16 = 10;
 const INPUT_PREFIX_WIDTH: u16 = 2;
-const INPUT_PLACEHOLDER: &str = "描述任务，或输入 / 查看命令";
+const INPUT_PLACEHOLDER: &str = "让 MCode 处理任何任务";
 const MAX_INPUT_HEIGHT: u16 = 5;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_QUEUED_SUBMISSIONS: usize = 8;
@@ -249,7 +249,7 @@ pub fn run_interactive(
         }
         if needs_draw && last_frame.elapsed() >= FRAME_INTERVAL {
             terminal
-                .draw(|frame| render(frame, &mut state))
+                .draw(|frame| render(frame, &state))
                 .context("绘制终端界面失败")?;
             last_frame = Instant::now();
             needs_draw = false;
@@ -1295,7 +1295,7 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                     return None;
                 }
                 let qualified = sanitize_terminal_text(&qualified);
-                let current = choice.id == state.model && state.provider == choice.provider;
+                let current = choice.provider == state.provider && choice.id == state.model;
                 let detail = choice
                     .name
                     .as_deref()
@@ -3254,7 +3254,7 @@ impl UiState {
         }
         let mut lines = vec!["已配置的模型：".to_string()];
         for choice in &self.model_choices {
-            let selected = if choice.id == self.model && self.provider == choice.provider {
+            let selected = if choice.provider == self.provider && choice.id == self.model {
                 "*"
             } else {
                 " "
@@ -3764,7 +3764,7 @@ fn x11_clipboard(state: &mut UiState) -> Result<&x11_clipboard::Clipboard> {
         .0)
 }
 
-fn render(frame: &mut Frame<'_>, state: &mut UiState) {
+fn render(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(Style::default().fg(THEME_TEXT).bg(THEME_BASE)),
@@ -3915,7 +3915,7 @@ fn render_activity_status(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         return;
     };
     let elapsed = format_elapsed_compact(state.run_elapsed().as_secs());
-    let suffix = format!(" ({elapsed} • Esc 取消)");
+    let suffix = format!(" ({elapsed} • esc to interrupt)");
     let available = usize::from(area.width)
         .saturating_sub(2)
         .saturating_sub(display_width(&suffix));
@@ -4139,7 +4139,11 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             ),
             selection_option_line(
                 approval.selection == ApprovalChoice::ApproveForSession,
-                "2. 本次会话内始终允许",
+                if approval.name == "shell" {
+                    "2. 本次会话内允许此命令"
+                } else {
+                    "2. 本次会话内允许此工具"
+                },
             ),
             selection_option_line(approval.selection == ApprovalChoice::Deny, "3. 拒绝"),
             Line::default(),
@@ -4414,7 +4418,7 @@ fn selection_option_line(selected: bool, label: &'static str) -> Line<'static> {
 fn footer_line(state: &UiState, width: usize) -> Line<'static> {
     if state.quit_shortcut_active() {
         return Line::from(Span::styled(
-            truncate_width("  再按 Ctrl+C 退出", width.saturating_add(1)),
+            truncate_width("  Press Ctrl+C again to exit", width.saturating_add(1)),
             Style::default()
                 .fg(THEME_YELLOW)
                 .add_modifier(Modifier::BOLD),
@@ -4428,10 +4432,10 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
         ""
     };
     let remaining = context_remaining_percent(context_tokens, state.max_input_tokens);
-    let context_full = format!("上下文 {estimate}{remaining}% 剩余");
+    let context_full = format!("{estimate}{remaining}% context left");
     let context_compact = format!("{estimate}{remaining}%");
-    let input = format!("输入 {}", format_tokens(usage_values.prompt_tokens));
-    let output = format!("输出 {}", format_tokens(usage_values.completion_tokens));
+    let input = format!("in {}", format_tokens(usage_values.prompt_tokens));
+    let output = format!("out {}", format_tokens(usage_values.completion_tokens));
     let effort = state.reasoning_effort.to_string();
     let model_with_effort = format!("{} effort {effort}", state.model);
 
@@ -5942,19 +5946,22 @@ mod tests {
         assert!(separator > 0);
         assert!(!rows[separator - 1].trim().is_empty());
 
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
         let buffer = terminal.backend().buffer();
+        let rows = buffer
+            .content
+            .chunks(32)
+            .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+            .collect::<Vec<_>>();
         let next_turn = buffer
             .content
             .iter()
             .enumerate()
             .find_map(|(index, cell)| (cell.symbol() == "后").then_some(index / 32))
             .unwrap();
-        let footer_y = buffer
-            .content
+        let footer_y = rows
             .iter()
-            .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == "上").then_some(index / 32))
+            .position(|row| row.contains("context left"))
             .unwrap();
         assert!(next_turn < footer_y);
     }
@@ -6118,11 +6125,11 @@ mod tests {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
 
         let active = rendered_terminal(&terminal);
         assert!(active.contains("5m 22s"));
-        assert!(active.contains("Esc"));
+        assert!(active.contains("esc to interrupt"));
 
         state.pause_run_timer();
         assert!(state.run_started_at.is_none());
@@ -6188,14 +6195,14 @@ mod tests {
 
         let wide = footer_line(&state, 120).to_string();
         assert!(wide.starts_with("  grok-4.5 effort high"));
-        assert!(wide.ends_with("上下文 80% 剩余 · 输入 1.2k · 输出 300"));
+        assert!(wide.ends_with("80% context left · in 1.2k · out 300"));
         assert_eq!(display_width(&wide), 120);
         let medium = footer_line(&state, 50).to_string();
         assert!(medium.starts_with("  grok-4.5 effort high"));
-        assert!(medium.ends_with("上下文 80% 剩余"));
-        assert!(!medium.contains("输入"));
+        assert!(medium.ends_with("80% context left"));
+        assert!(!medium.contains("in 1.2k"));
         let narrow = footer_line(&state, 20);
-        assert!(narrow.to_string().ends_with("上下文 80% 剩余"));
+        assert!(narrow.to_string().ends_with("80% context left"));
         assert_eq!(narrow.width(), 20);
     }
 
@@ -6314,7 +6321,7 @@ mod tests {
         let active_area = terminal.get_frame().area();
         assert_eq!(active_area.bottom(), 24);
         assert!(active_area.height >= required_height);
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
 
         let rendered = rendered_terminal(&terminal).replace(' ', "");
         assert!(!rendered.contains("终端窗口过小"));
@@ -6330,9 +6337,7 @@ mod tests {
         popup_state.editor.set_text("/mo");
         let backend = TestBackend::new(60, 16);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| render(frame, &mut popup_state))
-            .unwrap();
+        terminal.draw(|frame| render(frame, &popup_state)).unwrap();
         let rows = terminal
             .backend()
             .buffer()
@@ -6346,7 +6351,7 @@ mod tests {
             .position(|line| line.trim_start().starts_with("› /model"))
             .unwrap();
         assert!(suggestion_y > input_y);
-        assert!(!rows.iter().any(|line| line.contains("上下文")));
+        assert!(!rows.iter().any(|line| line.contains("context left")));
 
         let mut running_state = UiState::new(
             "model".to_string(),
@@ -6356,7 +6361,7 @@ mod tests {
         running_state.show_welcome = false;
         running_state.begin_run("处理中");
         terminal
-            .draw(|frame| render(frame, &mut running_state))
+            .draw(|frame| render(frame, &running_state))
             .unwrap();
         let rows = terminal
             .backend()
@@ -6387,9 +6392,14 @@ mod tests {
         )
         .unwrap();
 
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
 
         let buffer = terminal.backend().buffer();
+        let rows = buffer
+            .content
+            .chunks(40)
+            .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+            .collect::<Vec<_>>();
         let message_y = buffer
             .content
             .iter()
@@ -6403,11 +6413,9 @@ mod tests {
             .rfind(|(_, cell)| cell.symbol() == "›")
             .map(|(index, _)| index / 40)
             .unwrap();
-        let footer_y = buffer
-            .content
+        let footer_y = rows
             .iter()
-            .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == "上").then_some(index / 40))
+            .position(|row| row.contains("context left"))
             .unwrap();
         assert_eq!(footer_y, 31);
         assert_eq!(input_y, 29);
@@ -6436,7 +6444,7 @@ mod tests {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
 
         let rendered = rendered_terminal(&terminal);
         // Wide CJK glyphs occupy two backend cells, so inspect their leading cells here.
@@ -6456,7 +6464,7 @@ mod tests {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
 
         let rendered = rendered_terminal(&terminal);
         assert!(rendered.contains("MCode"));
@@ -6468,7 +6476,7 @@ mod tests {
             .content
             .iter()
             .enumerate()
-            .find_map(|(index, cell)| (cell.symbol() == "描").then_some(index / 80))
+            .find_map(|(index, cell)| (cell.symbol() == "让").then_some(index / 80))
             .unwrap();
         let input_y = buffer
             .content
@@ -6504,8 +6512,8 @@ mod tests {
         );
 
         state.editor.insert('x');
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        assert!(!rendered_terminal(&terminal).contains("描述任务"));
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        assert!(!rendered_terminal(&terminal).contains('让'));
     }
 
     #[test]
@@ -6596,7 +6604,7 @@ mod tests {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
 
         let rows = terminal
             .backend()
@@ -6632,7 +6640,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = rendered_terminal(&terminal);
         assert!(rendered.replace(' ', "").contains("图片1"));
         assert!(rendered.contains("pixel.png"));
@@ -6888,7 +6896,7 @@ mod tests {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &mut responses_state))
+            .draw(|frame| render(frame, &responses_state))
             .unwrap();
         let active = rendered_terminal(&terminal);
         assert!(active.contains("• Inspecting files"));

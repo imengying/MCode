@@ -1,6 +1,6 @@
 use rust_latex_parser::{AccentKind, EqNode, parse_equation};
 
-pub(crate) fn render_inline(source: &str) -> Option<String> {
+pub fn render_inline(source: &str) -> Option<String> {
     let source = source.trim();
     if source.is_empty() || !has_balanced_groups(source) {
         return None;
@@ -9,7 +9,7 @@ pub(crate) fn render_inline(source: &str) -> Option<String> {
     valid_rendered(&normalize_operator_spacing(&rendered))
 }
 
-pub(crate) fn render_display(source: &str) -> Option<String> {
+pub fn render_display(source: &str) -> Option<String> {
     let source = source.trim();
     if source.is_empty() || !has_balanced_groups(source) {
         return None;
@@ -139,9 +139,10 @@ fn render_linear(node: &EqNode) -> String {
             .iter()
             .map(|(value, condition)| {
                 let value = render_linear(value);
-                condition.as_ref().map_or(value.clone(), |condition| {
-                    format!("{value} if {}", render_linear(condition))
-                })
+                condition.as_ref().map_or_else(
+                    || value.clone(),
+                    |condition| format!("{value} if {}", render_linear(condition)),
+                )
             })
             .collect::<Vec<_>>()
             .join("; "),
@@ -154,10 +155,13 @@ fn render_linear(node: &EqNode) -> String {
             over,
         } => {
             let content = render_linear(content);
-            label.as_ref().map_or(content.clone(), |label| {
-                let label = render_script(&render_linear(label), *over);
-                format!("{content}{label}")
-            })
+            label.as_ref().map_or_else(
+                || content.clone(),
+                |label| {
+                    let label = render_script(&render_linear(label), *over);
+                    format!("{content}{label}")
+                },
+            )
         }
         EqNode::StackRel {
             base,

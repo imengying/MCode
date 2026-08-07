@@ -28,7 +28,10 @@ use crate::protocol::{
 };
 use crate::sandbox::PermissionProfile;
 use crate::session::{PendingToolCall, RunOutcome, Session, ToolReplayPolicy};
-use crate::tools::{McpStartupFailure, ToolRegistry};
+use crate::tools::{
+    ApprovalScope, MAX_TOOL_OUTPUT_CHARS, McpStartupFailure, ToolRegistry,
+    summarize_oversized_tool_output,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
@@ -70,7 +73,7 @@ pub struct Agent {
     session: Session,
     system_prompt: Option<String>,
     total_usage: Usage,
-    approved_tools: BTreeSet<String>,
+    approved_actions: BTreeSet<ApprovalScope>,
     last_context_dropped: usize,
     auto_compaction_failed: bool,
 }
@@ -118,7 +121,7 @@ impl Agent {
         let selected_profile = config
             .model_profiles
             .iter()
-            .find(|profile| profile.id == config.model && config.provider == profile.provider);
+            .find(|profile| profile.provider == config.provider && profile.id == config.model);
         let default_reasoning_effort = selected_profile.map_or(
             config.reasoning_effort,
             ModelProfile::default_reasoning_effort,
@@ -141,7 +144,7 @@ impl Agent {
             session,
             system_prompt,
             total_usage,
-            approved_tools: BTreeSet::new(),
+            approved_actions: BTreeSet::new(),
             last_context_dropped: 0,
             auto_compaction_failed: false,
         };
@@ -491,9 +494,13 @@ impl Agent {
             let call = pending.call;
             let recovered_intent = pending.intent;
             let was_recovered = recovered_intent.is_some();
-            let requires_approval = recovered_intent.is_none()
-                && self.tools.requires_approval(&call.function.name)
-                && !self.approved_tools.contains(&call.function.name)
+            let approval_scope = recovered_intent
+                .is_none()
+                .then(|| self.tools.approval_scope(&call))
+                .flatten();
+            let requires_approval = approval_scope
+                .as_ref()
+                .is_some_and(|scope| !self.approved_actions.contains(scope))
                 && !approvals.bypasses_approval();
             if requires_approval {
                 let _ = events.send(AgentEvent::ApprovalRequested {
@@ -523,8 +530,8 @@ impl Agent {
                     approved,
                     for_session,
                 });
-                if for_session {
-                    self.approved_tools.insert(call.function.name.clone());
+                if for_session && let Some(scope) = approval_scope {
+                    self.approved_actions.insert(scope);
                 }
                 if !approved {
                     let output = format!(
@@ -569,18 +576,20 @@ impl Agent {
             } else {
                 self.tools.execute(&call, cancel, events).await
             };
+            let output = if execution.output.chars().count() > MAX_TOOL_OUTPUT_CHARS {
+                let saved_path = self.session.save_tool_output(&intent, &execution.output)?;
+                summarize_oversized_tool_output(&execution.output, saved_path.as_deref())
+            } else {
+                execution.output
+            };
             self.session.complete_tool(
                 &intent,
-                tool_result_message(
-                    &call,
-                    execution.output.clone(),
-                    execution.file_change.clone(),
-                ),
+                tool_result_message(&call, output.clone(), execution.file_change.clone()),
             )?;
             let _ = events.send(AgentEvent::ToolFinished {
                 id: call.id,
                 name: call.function.name,
-                output: execution.output,
+                output,
                 is_error: execution.is_error,
                 file_change: execution.file_change,
             });
@@ -977,7 +986,7 @@ impl Agent {
         self.total_usage = Usage::default();
         self.context_tokens = 0;
         self.usage_estimated = false;
-        self.approved_tools.clear();
+        self.approved_actions.clear();
         self.last_context_dropped = 0;
         self.auto_compaction_failed = false;
         Ok(())
@@ -1016,7 +1025,7 @@ impl Agent {
         self.session = session;
         self.context_tokens = self.estimated_context_tokens();
         self.usage_estimated = true;
-        self.approved_tools.clear();
+        self.approved_actions.clear();
         self.last_context_dropped = 0;
         self.auto_compaction_failed = false;
         Ok(())
@@ -1030,7 +1039,7 @@ impl Agent {
     pub fn set_permission_profile(&mut self, profile: PermissionProfile) {
         if self.tools.permission_profile() != profile {
             self.tools.set_permission_profile(profile);
-            self.approved_tools.clear();
+            self.approved_actions.clear();
         }
     }
 

@@ -31,7 +31,7 @@ impl WebAccess {
     }
 
     #[must_use]
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
+    pub fn definitions() -> Vec<ToolDefinition> {
         vec![fetch_content_definition()]
     }
 

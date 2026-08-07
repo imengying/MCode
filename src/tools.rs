@@ -26,7 +26,7 @@ use crate::sandbox::{PermissionProfile, shell_command};
 use crate::session::ToolReplayPolicy;
 use crate::web_access::WebAccess;
 
-const MAX_TOOL_OUTPUT_CHARS: usize = 60_000;
+pub(crate) const MAX_TOOL_OUTPUT_CHARS: usize = 60_000;
 const MAX_FILE_CHANGE_PREVIEW_LINES: usize = 5;
 const MCP_CALL_TIMEOUT: Duration = Duration::from_mins(2);
 const MAX_MCP_STDERR_BYTES: usize = 16_000;
@@ -40,6 +40,12 @@ pub struct ToolRegistry {
     mcp_servers: Vec<McpService>,
     mcp_routes: BTreeMap<String, McpToolRoute>,
     mcp_startup_failures: Vec<McpStartupFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ApprovalScope {
+    ShellCommand(String),
+    McpTool(String),
 }
 
 type McpService = RunningService<RoleClient, ()>;
@@ -97,7 +103,7 @@ impl ToolRegistry {
             .with_context(|| format!("invalid tool root: {}", root.as_ref().display()))?;
         let web_access = WebAccess::new();
         let mut definitions = Self::builtin_definitions();
-        definitions.extend(web_access.definitions());
+        definitions.extend(WebAccess::definitions());
         Ok(Self {
             root,
             permission_profile: PermissionProfile::default(),
@@ -157,8 +163,17 @@ impl ToolRegistry {
     }
 
     #[must_use]
-    pub fn requires_approval(&self, name: &str) -> bool {
-        name == "shell" || self.mcp_routes.contains_key(name)
+    pub(crate) fn approval_scope(&self, call: &ToolCall) -> Option<ApprovalScope> {
+        if call.function.name == "shell" {
+            let command = parse_args::<ShellArgs>(&call.function.arguments).map_or_else(
+                |_| call.function.arguments.trim().to_string(),
+                |args| args.command.trim().to_string(),
+            );
+            return Some(ApprovalScope::ShellCommand(command));
+        }
+        self.mcp_routes
+            .contains_key(&call.function.name)
+            .then(|| ApprovalScope::McpTool(call.function.name.clone()))
     }
 
     #[must_use]
@@ -270,7 +285,7 @@ impl ToolRegistry {
                 .execute(&call.function.name, &call.function.arguments, cancel)
                 .await
             {
-                Ok(output) => ToolExecution::success(truncate_output(&output)),
+                Ok(output) => ToolExecution::success(output),
                 Err(error) => ToolExecution::error(error),
             };
         }
@@ -324,7 +339,7 @@ impl ToolRegistry {
         };
 
         match result {
-            Ok(output) => ToolExecution::success(truncate_output(&output)),
+            Ok(output) => ToolExecution::success(output),
             Err(error) => ToolExecution::error(error),
         }
     }
@@ -872,7 +887,7 @@ fn mcp_result_to_execution(result: CallToolResult) -> ToolExecution {
         parts.push("<empty MCP result>".to_string());
     }
     ToolExecution {
-        output: truncate_output(&parts.join("\n")),
+        output: parts.join("\n"),
         is_error,
         file_change: None,
     }
@@ -1111,22 +1126,27 @@ fn display_relative<'a>(root: &'a Path, path: &'a Path) -> std::borrow::Cow<'a, 
     path.strip_prefix(root).unwrap_or(path).to_string_lossy()
 }
 
-fn truncate_output(output: &str) -> String {
-    const HALF: usize = MAX_TOOL_OUTPUT_CHARS / 2;
-
-    if output.chars().count() <= MAX_TOOL_OUTPUT_CHARS {
-        return output.to_string();
-    }
-    let head: String = output.chars().take(HALF).collect();
+pub(crate) fn summarize_oversized_tool_output(output: &str, saved_path: Option<&Path>) -> String {
+    let location = saved_path.map_or_else(
+        || "full output was not saved because session persistence is disabled".to_string(),
+        |path| format!("full output: {}", path.display()),
+    );
+    let marker = format!("... tool output truncated; {location} ...");
+    let content_budget = MAX_TOOL_OUTPUT_CHARS
+        .saturating_sub(marker.chars().count())
+        .saturating_sub(2);
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget.saturating_sub(head_budget);
+    let head: String = output.chars().take(head_budget).collect();
     let tail: String = output
         .chars()
         .rev()
-        .take(HALF)
+        .take(tail_budget)
         .collect::<String>()
         .chars()
         .rev()
         .collect();
-    format!("{head}\n... tool output truncated ...\n{tail}")
+    format!("{head}\n{marker}\n{tail}")
 }
 
 #[cfg(test)]
@@ -1134,6 +1154,44 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn shell_session_approval_is_bound_to_the_exact_command() {
+        let project = tempdir().unwrap();
+        let tools = ToolRegistry::new(project.path()).unwrap();
+        let call = |command: &str, timeout_seconds: u64| ToolCall {
+            id: "call_shell".to_string(),
+            kind: "function".to_string(),
+            function: crate::protocol::FunctionCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({
+                    "command": command,
+                    "timeout_seconds": timeout_seconds
+                })
+                .to_string(),
+            },
+        };
+
+        assert_eq!(
+            tools.approval_scope(&call("cargo test", 30)),
+            tools.approval_scope(&call(" cargo test ", 120))
+        );
+        assert_ne!(
+            tools.approval_scope(&call("cargo test", 30)),
+            tools.approval_scope(&call("cargo test --release", 30))
+        );
+    }
+
+    #[test]
+    fn summarized_tool_output_references_the_saved_full_output() {
+        let output = "x".repeat(MAX_TOOL_OUTPUT_CHARS + 1);
+        let path = Path::new("/tmp/tool-results/result.txt");
+
+        let summary = summarize_oversized_tool_output(&output, Some(path));
+
+        assert!(summary.contains("full output: /tmp/tool-results/result.txt"));
+        assert!(summary.chars().count() <= MAX_TOOL_OUTPUT_CHARS);
+    }
 
     #[tokio::test]
     async fn read_only_profile_rejects_builtin_file_writes() {
