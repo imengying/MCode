@@ -4438,7 +4438,7 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
         ""
     };
     let remaining = context_remaining_percent(context_tokens, state.max_input_tokens);
-    let context_full = format!("{estimate}{remaining}% context left");
+    let context_full = format!("context {estimate}{remaining}%");
     let context_compact = format!("{estimate}{remaining}%");
     let input = format!("in {}", format_tokens(usage_values.prompt_tokens));
     let output = format!("out {}", format_tokens(usage_values.completion_tokens));
@@ -6097,7 +6097,7 @@ mod tests {
             .unwrap();
         let footer_y = rows
             .iter()
-            .position(|row| row.contains("context left"))
+            .position(|row| row.contains("context "))
             .unwrap();
         assert!(next_turn < footer_y);
     }
@@ -6344,15 +6344,22 @@ mod tests {
 
         let wide = footer_line(&state, 120).to_string();
         assert!(wide.starts_with("  grok-4.5 effort high"));
-        assert!(wide.ends_with("80% context left · in 1.2k · out 300"));
+        assert!(wide.ends_with("context 80% · in 1.2k · out 300"));
         assert_eq!(display_width(&wide), 120);
         let medium = footer_line(&state, 50).to_string();
         assert!(medium.starts_with("  grok-4.5 effort high"));
-        assert!(medium.ends_with("80% context left"));
+        assert!(medium.ends_with("context 80%"));
         assert!(!medium.contains("in 1.2k"));
         let narrow = footer_line(&state, 20);
-        assert!(narrow.to_string().ends_with("80% context left"));
+        assert!(narrow.to_string().ends_with("context 80%"));
         assert_eq!(narrow.width(), 20);
+
+        state.usage_estimated = true;
+        assert!(
+            footer_line(&state, 120)
+                .to_string()
+                .contains("context ~80%")
+        );
     }
 
     #[test]
@@ -6500,7 +6507,7 @@ mod tests {
             .position(|line| line.trim_start().starts_with("› /model"))
             .unwrap();
         assert!(suggestion_y > input_y);
-        assert!(!rows.iter().any(|line| line.contains("context left")));
+        assert!(!rows.iter().any(|line| line.contains("context ")));
 
         let mut running_state = UiState::new(
             "model".to_string(),
@@ -6564,7 +6571,7 @@ mod tests {
             .unwrap();
         let footer_y = rows
             .iter()
-            .position(|row| row.contains("context left"))
+            .position(|row| row.contains("context "))
             .unwrap();
         assert_eq!(footer_y, 31);
         assert_eq!(input_y, 29);
