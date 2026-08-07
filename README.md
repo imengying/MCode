@@ -219,6 +219,6 @@ cargo test --all-targets --locked
 cargo build --release --locked
 ```
 
-默认测试不联网。GitHub Actions 仅保留 Release workflow：`v*` tag 发布 Linux musl
+默认测试不联网。GitHub Actions 仅保留 Release workflow：`v*` tag 发布 Linux glibc
 x86_64/ARM64 二进制归档，并用 tag 之间的 commit 生成更新日志；发布二进制的版本取自 tag，
 源码归档由 GitHub 自动提供。

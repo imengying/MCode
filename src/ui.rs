@@ -899,7 +899,7 @@ where
             state
                 .messages
                 .iter()
-                .rposition(|message| message.role == ViewRole::Assistant)
+                .rposition(|message| is_assistant_role(message.role))
         });
     let Some(anchor) = anchor else {
         return Ok(false);
@@ -911,7 +911,7 @@ where
     let Some(message) = state.messages.first() else {
         return Ok(false);
     };
-    if message.role != ViewRole::Assistant || message.content.is_empty() {
+    if !is_assistant_role(message.role) || message.content.is_empty() {
         return Ok(false);
     }
     let following_height = transcript_line_count(state, &state.messages[1..], width);
@@ -926,7 +926,7 @@ where
     }
 
     let fragment = ViewMessage {
-        role: ViewRole::Assistant,
+        role: message.role,
         title: String::new(),
         content: prefix,
         reasoning: message.reasoning.clone(),
@@ -943,6 +943,7 @@ where
     if let Some(message) = state.messages.first_mut() {
         message.content = suffix;
         message.reasoning.clear();
+        message.role = ViewRole::AssistantContinuation;
     }
     Ok(true)
 }
@@ -2432,6 +2433,7 @@ impl Editor {
 enum ViewRole {
     User,
     Assistant,
+    AssistantContinuation,
     Tool,
     Notice,
     Error,
@@ -2439,6 +2441,10 @@ enum ViewRole {
     RunCompleted,
     RunCancelled,
     RunFailed,
+}
+
+const fn is_assistant_role(role: ViewRole) -> bool {
+    matches!(role, ViewRole::Assistant | ViewRole::AssistantContinuation)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3674,7 +3680,7 @@ impl UiState {
             message.running = false;
         }
         self.messages.retain(|message| {
-            message.role != ViewRole::Assistant
+            !is_assistant_role(message.role)
                 || !message.content.is_empty()
                 || !message.reasoning.is_empty()
         });
@@ -3874,7 +3880,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
     let activity = u16::from(state.activity_label().is_some());
     let conversation_gap = u16::from(activity > 0 && !state.messages.is_empty());
     let activity_gap = u16::from(activity > 0);
-    let composer_top = u16::from(!modal);
+    let composer_top = u16::from(!modal && activity == 0);
     let composer_bottom = u16::from(!modal);
     let fixed_height = conversation_gap
         .saturating_add(activity)
@@ -4701,6 +4707,7 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
         if message.role == ViewRole::Separator {
             trim_trailing_blank_lines(&mut lines);
             append_turn_separator(&mut lines, width);
+            append_message_gap(&mut lines);
             continue;
         }
         if matches!(
@@ -4708,25 +4715,31 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
             ViewRole::RunCompleted | ViewRole::RunCancelled | ViewRole::RunFailed
         ) {
             trim_trailing_blank_lines(&mut lines);
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
             append_run_summary(&mut lines, message, width);
+            append_message_gap(&mut lines);
             continue;
         }
 
-        if message.role == ViewRole::Assistant {
+        if is_assistant_role(message.role) {
             if message.reasoning.is_empty() && message.content.is_empty() {
                 continue;
             }
             if !message.reasoning.is_empty() {
-                append_reasoning_summary(&mut lines, &message.reasoning);
+                append_reasoning_summary(&mut lines, &message.reasoning, width);
                 if !message.content.is_empty() {
                     lines.push(Line::default());
                 }
             }
             if !message.content.is_empty() {
-                append_markdown_lines(
+                append_agent_markdown_lines(
                     &mut lines,
                     &message.content,
                     Style::default().fg(THEME_TEXT),
+                    width,
+                    message.role == ViewRole::Assistant,
                 );
             }
             append_message_gap(&mut lines);
@@ -4734,13 +4747,13 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
         }
 
         if matches!(message.role, ViewRole::Tool | ViewRole::Error) && message.tool_id.is_some() {
-            append_tool_message(&mut lines, message);
+            append_tool_message(&mut lines, message, width);
             append_message_gap(&mut lines);
             continue;
         }
 
         if message.role == ViewRole::User {
-            append_user_message(&mut lines, &message.content);
+            append_user_message(&mut lines, &message.content, width);
             append_message_gap(&mut lines);
             continue;
         }
@@ -4751,6 +4764,7 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
             ViewRole::Error => (THEME_RED, Style::default().fg(THEME_RED)),
             ViewRole::User
             | ViewRole::Assistant
+            | ViewRole::AssistantContinuation
             | ViewRole::Separator
             | ViewRole::RunCompleted
             | ViewRole::RunCancelled
@@ -4821,53 +4835,58 @@ fn append_run_summary(lines: &mut Vec<Line<'static>>, message: &ViewMessage, wid
     lines.push(line);
 }
 
-fn append_reasoning_summary(lines: &mut Vec<Line<'static>>, reasoning: &str) {
-    for (index, mut line) in MarkdownRenderer::new(Style::default())
-        .render(reasoning)
-        .into_iter()
-        .enumerate()
-    {
+fn append_reasoning_summary(lines: &mut Vec<Line<'static>>, reasoning: &str, width: u16) {
+    let mut rendered = MarkdownRenderer::new(Style::default()).render(reasoning);
+    for line in &mut rendered {
         for span in &mut line.spans {
             span.style = span.style.fg(THEME_SUBTEXT).add_modifier(Modifier::ITALIC);
         }
-        let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
-        spans.push(Span::styled(
-            if index == 0 { "• " } else { "  " },
+    }
+    lines.extend(prefixed_wrapped_lines(
+        rendered,
+        width,
+        &Line::from(Span::styled("• ", Style::default().fg(THEME_MUTED))),
+        &Line::from("  "),
+    ));
+}
+
+fn append_agent_markdown_lines(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    base: Style,
+    width: u16,
+    show_bullet: bool,
+) {
+    lines.extend(prefixed_wrapped_lines(
+        MarkdownRenderer::new(base).render(content),
+        width,
+        &Line::from(Span::styled(
+            if show_bullet { "• " } else { "  " },
             Style::default().fg(THEME_MUTED),
-        ));
-        spans.extend(line.spans);
-        lines.push(Line::from(spans));
-    }
+        )),
+        &Line::from("  "),
+    ));
 }
 
-fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str) {
+fn append_user_message(lines: &mut Vec<Line<'static>>, content: &str, width: u16) {
     let user_style = Style::default().fg(THEME_TEXT).bg(THEME_USER_BG);
-    let mut content_lines = content.lines();
-    let first = content_lines.next().unwrap_or_default();
-    lines.push(
-        Line::from(vec![
-            Span::styled(
-                "› ",
-                user_style
-                    .fg(THEME_SUBTEXT)
-                    .add_modifier(Modifier::BOLD | Modifier::DIM),
-            ),
-            Span::styled(first.to_string(), user_style),
-        ])
-        .style(user_style),
-    );
-    for line in content_lines {
-        lines.push(
-            Line::from(vec![
-                Span::styled("  ", user_style),
-                Span::styled(line.to_string(), user_style),
-            ])
-            .style(user_style),
-        );
-    }
+    let content_lines = content
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), user_style)).style(user_style));
+    lines.extend(prefixed_wrapped_lines(
+        content_lines,
+        width,
+        &Line::from(Span::styled(
+            "› ",
+            user_style
+                .fg(THEME_SUBTEXT)
+                .add_modifier(Modifier::BOLD | Modifier::DIM),
+        )),
+        &Line::from(Span::styled("  ", user_style)),
+    ));
 }
 
-fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
+fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage, width: u16) {
     let failed = message.role == ViewRole::Error;
     if !failed
         && !message.running
@@ -4884,7 +4903,7 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
         THEME_GREEN
     };
     if message.title == "shell" {
-        append_shell_tool_header(lines, message, failed, color);
+        append_shell_tool_header(lines, message, failed, color, width);
     } else {
         lines.push(Line::from(vec![
             Span::styled(
@@ -4910,6 +4929,7 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
             "  ↳ ",
             "    ",
             Style::default().fg(THEME_SUBTEXT),
+            width,
         );
     }
     if !message.content.is_empty() {
@@ -4922,7 +4942,7 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
             && !message.running
             && let Some(output) = parse_shell_output(&message.content)
         {
-            append_shell_output(lines, &output, style);
+            append_shell_output(lines, &output, style, width);
         } else if message.running {
             let content = if message.title == "shell" {
                 message
@@ -4940,6 +4960,7 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
                 "  └ ",
                 "    ",
                 style,
+                width,
             );
         } else {
             append_preview_lines(
@@ -4949,6 +4970,7 @@ fn append_tool_message(lines: &mut Vec<Line<'static>>, message: &ViewMessage) {
                 "  └ ",
                 "    ",
                 style,
+                width,
             );
         }
     }
@@ -4971,7 +4993,12 @@ fn parse_shell_output(content: &str) -> Option<ShellOutput<'_>> {
     })
 }
 
-fn append_shell_output(lines: &mut Vec<Line<'static>>, output: &ShellOutput<'_>, style: Style) {
+fn append_shell_output(
+    lines: &mut Vec<Line<'static>>,
+    output: &ShellOutput<'_>,
+    style: Style,
+    width: u16,
+) {
     let mut preview = Vec::new();
     if output.exit_code != "0" {
         preview.push(format!("exit code: {}", output.exit_code));
@@ -4992,6 +5019,7 @@ fn append_shell_output(lines: &mut Vec<Line<'static>>, output: &ShellOutput<'_>,
         "  └ ",
         "    ",
         style,
+        width,
     );
 }
 
@@ -5000,6 +5028,7 @@ fn append_shell_tool_header(
     message: &ViewMessage,
     failed: bool,
     color: Color,
+    width: u16,
 ) {
     let title = if failed {
         "命令失败"
@@ -5008,7 +5037,7 @@ fn append_shell_tool_header(
     } else {
         "已运行"
     };
-    let mut header = vec![
+    let header = Line::from(vec![
         Span::styled(
             "• ",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -5019,27 +5048,32 @@ fn append_shell_tool_header(
                 .fg(if failed { THEME_RED } else { THEME_TEXT })
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]);
     let command_lines = message
         .tool_arguments
         .as_deref()
         .filter(|command| !command.is_empty())
         .map(|command| highlight_code(command, "bash"))
         .unwrap_or_default();
-    if let Some(first) = command_lines.first() {
-        header.extend(first.spans.iter().cloned());
+    if command_lines.is_empty() {
+        lines.push(header);
+        return;
     }
-    lines.push(Line::from(header));
-    for line in command_lines
-        .into_iter()
-        .skip(1)
-        .take(TOOL_ARGUMENT_PREVIEW_LINES - 1)
-    {
-        let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
-        spans.push(Span::styled("    ", Style::default().fg(THEME_MUTED)));
-        spans.extend(line.spans);
-        lines.push(Line::from(spans));
+    let mut command = prefixed_wrapped_lines(
+        command_lines,
+        width,
+        &header,
+        &Line::from(Span::styled("  │ ", Style::default().fg(THEME_MUTED))),
+    );
+    let maximum_rows = TOOL_ARGUMENT_PREVIEW_LINES.saturating_add(1);
+    if command.len() > maximum_rows {
+        command.truncate(maximum_rows);
+        command.push(Line::from(vec![
+            Span::styled("    ", Style::default().fg(THEME_MUTED)),
+            Span::styled("…", Style::default().fg(THEME_MUTED)),
+        ]));
     }
+    lines.extend(command);
 }
 
 fn append_file_change(lines: &mut Vec<Line<'static>>, change: &FileChangeSummary) {
@@ -5171,6 +5205,84 @@ fn tool_action_title(name: &str, running: bool, failed: bool) -> String {
     .to_string()
 }
 
+fn prefixed_wrapped_lines(
+    source: impl IntoIterator<Item = Line<'static>>,
+    width: u16,
+    initial_prefix: &Line<'static>,
+    subsequent_prefix: &Line<'static>,
+) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut output = Vec::new();
+    let mut first = true;
+    for line in source {
+        if line.spans.iter().all(|span| span.content.is_empty()) {
+            output.push(Line::default().style(line.style));
+            first = false;
+            continue;
+        }
+        let prefix = if first {
+            initial_prefix.clone()
+        } else {
+            subsequent_prefix.clone()
+        };
+        first = false;
+        let mut continuation = subsequent_prefix.clone();
+        let leading = line
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .take_while(|character| *character == ' ')
+            .collect::<String>();
+        if !leading.is_empty() {
+            continuation.spans.push(Span::raw(leading));
+        }
+        output.extend(wrap_styled_line(line, width, &prefix, &continuation));
+    }
+    output
+}
+
+fn wrap_styled_line(
+    line: Line<'static>,
+    width: usize,
+    initial_prefix: &Line<'static>,
+    continuation_prefix: &Line<'static>,
+) -> Vec<Line<'static>> {
+    let line_style = line.style;
+    let mut output = Vec::new();
+    let mut spans = initial_prefix.spans.clone();
+    let mut used = initial_prefix.width();
+    let mut prefix_width = used;
+
+    for span in line.spans {
+        for character in span.content.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if character_width > 0
+                && used.saturating_add(character_width) > width
+                && used > prefix_width
+            {
+                output.push(Line::from(std::mem::take(&mut spans)).style(line_style));
+                spans.clone_from(&continuation_prefix.spans);
+                used = continuation_prefix.width();
+                prefix_width = used;
+            }
+            push_styled_character(&mut spans, character, span.style);
+            used = used.saturating_add(character_width);
+        }
+    }
+    output.push(Line::from(spans).style(line_style));
+    output
+}
+
+fn push_styled_character(spans: &mut Vec<Span<'static>>, character: char, style: Style) {
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push(character);
+        return;
+    }
+    spans.push(Span::styled(character.to_string(), style));
+}
+
 fn append_preview_lines(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -5178,33 +5290,39 @@ fn append_preview_lines(
     first_prefix: &str,
     continuation_prefix: &str,
     style: Style,
+    width: u16,
 ) {
-    let content_lines = content.lines().collect::<Vec<_>>();
-    for (index, line) in content_lines.iter().take(limit).enumerate() {
-        let prefix = if index == 0 {
-            first_prefix
-        } else {
-            continuation_prefix
-        };
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(THEME_MUTED)),
-            Span::styled(truncate_preview_line(line), style),
-        ]));
+    let first_prefix = Line::from(Span::styled(
+        first_prefix.to_string(),
+        Style::default().fg(THEME_MUTED),
+    ));
+    let continuation_prefix = Line::from(Span::styled(
+        continuation_prefix.to_string(),
+        Style::default().fg(THEME_MUTED),
+    ));
+    let rendered = prefixed_wrapped_lines(
+        content
+            .lines()
+            .map(|line| Line::from(Span::styled(truncate_preview_line(line), style))),
+        width,
+        &first_prefix,
+        &continuation_prefix,
+    );
+    if rendered.len() <= limit {
+        lines.extend(rendered);
+        return;
     }
-    if content_lines.len() > limit {
-        lines.push(Line::from(vec![
-            Span::styled(
-                continuation_prefix.to_string(),
-                Style::default().fg(THEME_MUTED),
-            ),
-            Span::styled(
-                "…",
-                Style::default()
-                    .fg(THEME_MUTED)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-    }
+    let content_rows = limit.saturating_sub(1);
+    let head = content_rows / 2;
+    let tail = content_rows.saturating_sub(head);
+    lines.extend(rendered.iter().take(head).cloned());
+    lines.push(preview_ellipsis_line(&continuation_prefix));
+    lines.extend(
+        rendered
+            .iter()
+            .skip(rendered.len().saturating_sub(tail))
+            .cloned(),
+    );
 }
 
 fn append_tail_preview_lines(
@@ -5214,32 +5332,49 @@ fn append_tail_preview_lines(
     first_prefix: &str,
     continuation_prefix: &str,
     style: Style,
+    width: u16,
 ) {
-    let content_lines = content.lines().collect::<Vec<_>>();
-    let truncated = content_lines.len() > limit;
-    if truncated {
-        lines.push(Line::from(vec![
-            Span::styled(first_prefix.to_string(), Style::default().fg(THEME_MUTED)),
-            Span::styled(
-                "…",
-                Style::default()
-                    .fg(THEME_MUTED)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
+    let first_prefix = Line::from(Span::styled(
+        first_prefix.to_string(),
+        Style::default().fg(THEME_MUTED),
+    ));
+    let continuation_prefix = Line::from(Span::styled(
+        continuation_prefix.to_string(),
+        Style::default().fg(THEME_MUTED),
+    ));
+    let rendered = prefixed_wrapped_lines(
+        content
+            .lines()
+            .map(|line| Line::from(Span::styled(truncate_preview_line(line), style))),
+        width,
+        &first_prefix,
+        &continuation_prefix,
+    );
+    if rendered.len() <= limit {
+        lines.extend(rendered);
+        return;
     }
-    let start = content_lines.len().saturating_sub(limit);
-    for (index, line) in content_lines[start..].iter().enumerate() {
-        let prefix = if index == 0 && !truncated {
-            first_prefix
-        } else {
-            continuation_prefix
-        };
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(THEME_MUTED)),
-            Span::styled(truncate_preview_line(line), style),
-        ]));
-    }
+    lines.push(preview_ellipsis_line(&first_prefix));
+    lines.extend(
+        rendered
+            .into_iter()
+            .rev()
+            .take(limit.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev(),
+    );
+}
+
+fn preview_ellipsis_line(prefix: &Line<'static>) -> Line<'static> {
+    let mut line = prefix.clone();
+    line.spans.push(Span::styled(
+        "…",
+        Style::default()
+            .fg(THEME_MUTED)
+            .add_modifier(Modifier::ITALIC),
+    ));
+    line
 }
 
 fn truncate_preview_line(line: &str) -> String {
@@ -5918,7 +6053,8 @@ mod tests {
         for index in separators {
             assert!(index > 0);
             assert!(!rendered[index - 1].is_empty());
-            assert!(rendered.get(index + 1).is_some_and(|line| !line.is_empty()));
+            assert!(rendered.get(index + 1).is_some_and(String::is_empty));
+            assert!(rendered.get(index + 2).is_some_and(|line| !line.is_empty()));
         }
 
         let backend = TestBackend::new(32, 24);
@@ -6137,14 +6273,27 @@ mod tests {
         state.resume_run_timer();
         assert!(state.run_started_at.is_some());
 
+        state.apply_agent_event(AgentEvent::TextDelta {
+            text: "完成内容".to_string(),
+        });
         state.apply_agent_event(AgentEvent::RunFinished);
-        let completed = conversation_lines(&state)
+        let completed_lines = conversation_lines(&state)
             .iter()
             .map(Line::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let completed = completed_lines.join("\n");
         assert!(completed.contains("已完成"));
         assert!(completed.contains("5m 22s"));
+        assert!(completed.contains("• 完成内容"));
+        let answer = completed_lines
+            .iter()
+            .position(|line| line.contains("完成内容"))
+            .unwrap();
+        let summary = completed_lines
+            .iter()
+            .position(|line| line.contains("已完成"))
+            .unwrap();
+        assert_eq!(summary.saturating_sub(answer), 2);
         assert_eq!(format_elapsed_compact(3_723), "1h 02m 03s");
     }
 
@@ -6235,7 +6384,7 @@ mod tests {
 
         assert_eq!(state.messages.len(), 1);
         let tail = &state.messages[0];
-        assert_eq!(tail.role, ViewRole::Assistant);
+        assert_eq!(tail.role, ViewRole::AssistantContinuation);
         assert!(!tail.content.lines().any(|line| line == "第 1 行稳定输出"));
         assert!(tail.content.contains("第 30 行"));
         let conversation_height = usize::from(ui_section_heights(&state, 40, 24).conversation);
@@ -6284,7 +6433,7 @@ mod tests {
             code_state
                 .messages
                 .iter()
-                .all(|message| message.role != ViewRole::Assistant)
+                .all(|message| !is_assistant_role(message.role))
         );
         assert!(
             terminal
@@ -6372,7 +6521,7 @@ mod tests {
             .collect::<Vec<_>>();
         let status_y = rows.iter().position(|line| line.contains('•')).unwrap();
         let input_y = rows.iter().position(|line| line.contains('›')).unwrap();
-        assert_eq!(input_y.saturating_sub(status_y), 3);
+        assert_eq!(input_y.saturating_sub(status_y), 2);
     }
 
     #[test]
@@ -6553,6 +6702,27 @@ mod tests {
             .find(|span| span.content.contains("Agent 内容"))
             .unwrap();
         assert_eq!(assistant_span.style.fg, Some(THEME_TEXT));
+        assert!(assistant_lines[0].to_string().starts_with("• Agent 内容"));
+
+        let wrapped = ViewMessage {
+            role: ViewRole::Assistant,
+            title: String::new(),
+            content: "这是一段需要在窄窗口中正确缩进的中文输出".to_string(),
+            reasoning: String::new(),
+            tool_arguments: None,
+            tool_id: None,
+            file_change: None,
+            running: false,
+        };
+        let wrapped_lines = conversation_lines_for_messages(&[wrapped], 12);
+        assert!(wrapped_lines.len() > 1);
+        assert!(wrapped_lines[0].to_string().starts_with("• "));
+        assert!(
+            wrapped_lines
+                .iter()
+                .skip(1)
+                .all(|line| { line.to_string().starts_with("  ") && line.width() <= 12 })
+        );
     }
 
     #[test]
@@ -6759,11 +6929,13 @@ mod tests {
         assert!(rendered.contains("first"));
         assert!(!rendered.contains("$ first"));
         assert!(rendered.contains("second"));
-        assert!(!rendered.contains("third"));
+        assert!(rendered.contains("third"));
         assert!(rendered.contains("output 0"));
-        assert!(rendered.contains("output 4"));
+        assert!(rendered.contains("output 1"));
+        assert!(!rendered.contains("output 2"));
         assert!(!rendered.contains("output 5"));
-        assert!(!rendered.contains("output 11"));
+        assert!(rendered.contains("output 10"));
+        assert!(rendered.contains("output 11"));
         assert_eq!(
             rendered.lines().filter(|line| line.trim() == "…").count(),
             1
