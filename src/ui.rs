@@ -619,7 +619,8 @@ fn minimum_active_viewport_height(screen_height: u16) -> u16 {
 fn minimum_ui_height(state: &UiState, width: u16) -> u16 {
     let sections = ui_section_heights(state, width, u16::MAX);
     sections
-        .activity
+        .conversation_gap
+        .saturating_add(sections.activity)
         .saturating_add(sections.activity_gap)
         .saturating_add(sections.composer_top)
         .saturating_add(sections.input)
@@ -914,10 +915,7 @@ where
         return Ok(false);
     }
     let following_height = transcript_line_count(state, &state.messages[1..], width);
-    let tail_height = conversation_height
-        .saturating_sub(following_height)
-        .saturating_sub(1)
-        .max(1);
+    let tail_height = conversation_height.saturating_sub(following_height).max(1);
     let Some((prefix, suffix)) =
         split_markdown_for_scrollback(&message.content, width, tail_height, !message.running)
     else {
@@ -937,8 +935,7 @@ where
         file_change: None,
         running: false,
     };
-    let mut lines = conversation_lines_for_messages(std::slice::from_ref(&fragment), width);
-    lines.pop();
+    let lines = conversation_lines_for_messages(std::slice::from_ref(&fragment), width);
     let minimum_active = minimum_ui_height(state, width);
     if !insert_transcript_lines(terminal, lines, width, minimum_active)? {
         return Ok(false);
@@ -3804,6 +3801,7 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(heights.conversation),
+            Constraint::Length(heights.conversation_gap),
             Constraint::Length(heights.activity),
             Constraint::Length(heights.activity_gap),
             Constraint::Length(heights.composer_top),
@@ -3813,12 +3811,12 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         ])
         .split(layout_area);
     render_conversation(frame, state, areas[0]);
-    render_activity_status(frame, state, areas[1]);
-    render_input(frame, state, areas[4]);
+    render_activity_status(frame, state, areas[2]);
+    render_input(frame, state, areas[5]);
     if input_suggestions(state).is_empty() {
-        render_footer(frame, state, areas[6]);
+        render_footer(frame, state, areas[7]);
     } else {
-        render_slash_suggestions(frame, state, areas[6]);
+        render_slash_suggestions(frame, state, areas[7]);
     }
 }
 
@@ -3827,6 +3825,7 @@ fn desired_ui_height(state: &UiState, width: u16) -> u16 {
     let conversation =
         u16::try_from(transcript_line_count(state, &state.messages, width)).unwrap_or(u16::MAX);
     conversation
+        .saturating_add(sections.conversation_gap)
         .saturating_add(sections.activity)
         .saturating_add(sections.activity_gap)
         .saturating_add(sections.composer_top)
@@ -3838,6 +3837,7 @@ fn desired_ui_height(state: &UiState, width: u16) -> u16 {
 #[derive(Debug, Clone, Copy)]
 struct UiSectionHeights {
     conversation: u16,
+    conversation_gap: u16,
     activity: u16,
     activity_gap: u16,
     composer_top: u16,
@@ -3872,10 +3872,12 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
         input_suggestions(state).len()
     };
     let activity = u16::from(state.activity_label().is_some());
+    let conversation_gap = u16::from(activity > 0 && !state.messages.is_empty());
     let activity_gap = u16::from(activity > 0);
     let composer_top = u16::from(!modal);
     let composer_bottom = u16::from(!modal);
-    let fixed_height = activity
+    let fixed_height = conversation_gap
+        .saturating_add(activity)
         .saturating_add(activity_gap)
         .saturating_add(composer_top)
         .saturating_add(input)
@@ -3889,6 +3891,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
             .min(height.saturating_sub(fixed_height).saturating_sub(1))
     };
     let conversation = height
+        .saturating_sub(conversation_gap)
         .saturating_sub(activity)
         .saturating_sub(activity_gap)
         .saturating_sub(composer_top)
@@ -3897,6 +3900,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
         .saturating_sub(trailing);
     UiSectionHeights {
         conversation,
+        conversation_gap,
         activity,
         activity_gap,
         composer_top,
@@ -4761,6 +4765,7 @@ fn conversation_lines_for_messages(messages: &[ViewMessage], width: u16) -> Vec<
         append_markdown_lines(&mut lines, &message.content, content_style);
         append_message_gap(&mut lines);
     }
+    trim_trailing_blank_lines(&mut lines);
     lines
 }
 
@@ -6406,7 +6411,7 @@ mod tests {
             .unwrap();
         assert_eq!(footer_y, 31);
         assert_eq!(input_y, 29);
-        assert_eq!(message_y, 26);
+        assert_eq!(input_y.saturating_sub(message_y), 2);
     }
 
     #[test]
