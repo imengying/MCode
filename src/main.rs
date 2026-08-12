@@ -72,9 +72,6 @@ async fn run() -> Result<()> {
                 }
                 (true, true) => {}
             }
-            if !model_was_overridden {
-                config.api = session.api();
-            }
             let prompt = join_prompt(&args.prompt);
             let images = load_images(&cli.images, &config.cwd)?;
             let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -154,11 +151,10 @@ fn list_sessions(config: &AppConfig, json: bool) -> Result<()> {
             );
         let model = format!("{}/{}", session.provider, session.model);
         println!(
-            "{}  {}  {}  {}  {} 条消息，{} 个 token{}\n    {}",
+            "{}  {}  {}  {} 条消息，{} 个 token{}\n    {}",
             session.id,
             timestamp,
             sanitize_terminal_text(&model),
-            session.api,
             session.message_count,
             session.total_usage.total_tokens,
             if session.has_pending_run {
@@ -190,7 +186,6 @@ fn run_doctor(config: &AppConfig, json: bool) -> Result<()> {
         "detail": {
             "provider": config.provider,
             "id": config.model,
-            "api": config.api.to_string(),
             "contextWindow": config.context_window,
             "maxInputTokens": config.max_input_tokens,
             "maxOutputTokens": config.max_output_tokens,
@@ -316,10 +311,9 @@ fn localized_doctor_name(name: &str) -> &str {
 fn localized_doctor_detail(status: &str, name: &str, detail: &serde_json::Value) -> String {
     match name {
         "model" => format!(
-            "提供商 {}，模型 {}，API {}，上下文窗口 {}，最大输入 {}，原生网页搜索已开启",
+            "提供商 {}，模型 {}，上下文窗口 {}，最大输入 {}，原生网页搜索已开启",
             detail["provider"].as_str().unwrap_or("未指定"),
             detail["id"].as_str().unwrap_or("未知"),
-            detail["api"].as_str().unwrap_or("未知"),
             detail["contextWindow"],
             detail["maxInputTokens"]
         ),

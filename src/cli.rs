@@ -35,7 +35,6 @@ pub struct Cli {
     #[arg(
         short = 'r',
         long = "reasoning",
-        visible_alias = "reasoning-effort",
         global = true,
         value_enum,
         value_name = "级别",
@@ -64,13 +63,7 @@ pub struct Cli {
     pub max_output_tokens: Option<u64>,
 
     /// 以指定目录作为工作目录运行。
-    #[arg(
-        short = 'C',
-        long = "cd",
-        visible_alias = "cwd",
-        global = true,
-        value_name = "目录"
-    )]
+    #[arg(short = 'C', long = "cd", global = true, value_name = "目录")]
     pub cwd: Option<PathBuf>,
 
     /// 不保存新建的交互式会话。
@@ -82,11 +75,7 @@ pub struct Cli {
     pub request_timeout: Option<u64>,
 
     /// 无需确认即可运行 shell 和 MCP 工具，并关闭系统沙箱。
-    #[arg(
-        long = "dangerously-bypass-approvals",
-        visible_alias = "dangerously-bypass-approvals-and-sandbox",
-        global = true
-    )]
+    #[arg(long = "dangerously-bypass-approvals", global = true)]
     pub dangerously_bypass_approvals: bool,
 
     #[command(subcommand)]
@@ -100,7 +89,6 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// 非交互式运行提示词。
-    #[command(alias = "e")]
     Exec(ExecArgs),
 
     /// 恢复最新或指定的会话。
@@ -155,7 +143,7 @@ pub struct DeleteArgs {
     pub session: String,
 
     /// 不经确认直接删除；SESSION 必须是完整 UUID。
-    #[arg(long, visible_alias = "yes")]
+    #[arg(long)]
     pub force: bool,
 }
 

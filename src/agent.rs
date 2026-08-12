@@ -16,7 +16,7 @@ use crate::compaction::{
     should_compact, turn_prefix_summary_request,
 };
 use crate::config::{
-    ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ModelProfile, ReasoningEffort,
+    AppConfig, CompactionSettings, ConfigOverrides, ModelProfile, ReasoningEffort,
     find_model_profile, load_model_profiles,
 };
 use crate::event::{AgentEvent, CompactionReason};
@@ -83,7 +83,6 @@ pub struct ModelChoice {
     pub provider: String,
     pub id: String,
     pub name: Option<String>,
-    pub api: ApiProtocol,
     pub context_window: u64,
     pub max_input_tokens: u64,
     pub reasoning: bool,
@@ -100,7 +99,7 @@ pub struct CompactionResult {
 
 impl Agent {
     pub async fn new(config: &AppConfig, mut session: Session) -> Result<Self> {
-        session.set_model(&config.provider, &config.model, config.api)?;
+        session.set_model(&config.provider, &config.model)?;
         session.set_reasoning_effort(config.reasoning_effort)?;
         let client = OpenAiClient::new(
             OpenAiModelConfig {
@@ -108,11 +107,10 @@ impl Agent {
                 base_url: config.base_url.clone(),
                 api_key: config.api_key.clone(),
                 model: config.model.clone(),
-                api: config.api,
                 max_output_tokens: config.max_output_tokens,
                 reasoning_effort: config.reasoning_value.clone(),
-                compat: config.compat,
             },
+            session.id().to_string(),
             Duration::from_secs(config.request_timeout_secs),
         )?;
         let tools = ToolRegistry::with_mcp(&config.cwd, &config.mcp_servers).await?;
@@ -288,7 +286,7 @@ impl Agent {
                 let _ = events.send(AgentEvent::AssistantStarted);
                 let response = if generation_requires_tool {
                     self.client
-                        .stream_chat_requiring_local_tool(
+                        .stream_response_requiring_local_tool(
                             &context,
                             request_definitions,
                             events,
@@ -297,7 +295,7 @@ impl Agent {
                         .await
                 } else {
                     self.client
-                        .stream_chat(&context, &definitions, events, cancel)
+                        .stream_response(&context, &definitions, events, cancel)
                         .await
                 };
                 match response {
@@ -829,7 +827,7 @@ impl Agent {
         let (sink, _discarded) = mpsc::unbounded_channel();
         let turn = self
             .client
-            .stream_chat_with_max_tokens(&context, &[], &sink, cancel, Some(request.max_tokens))
+            .stream_response_with_max_tokens(&context, &[], &sink, cancel, Some(request.max_tokens))
             .await?;
         if !turn.tool_calls.is_empty() {
             bail!("summarization returned an unexpected tool call");
@@ -895,10 +893,9 @@ impl Agent {
                 provider: profile.provider.clone(),
                 id: profile.id.clone(),
                 name: profile.name.clone(),
-                api: profile.api,
                 context_window: profile.context_window,
                 max_input_tokens: profile.max_input_tokens,
-                reasoning: profile.reasoning,
+                reasoning: profile.is_reasoning_model(),
             })
             .collect()
     }
@@ -932,10 +929,8 @@ impl Agent {
             base_url: profile.base_url.clone(),
             api_key: profile.api_key.clone(),
             model: profile.id.clone(),
-            api: profile.api,
             max_output_tokens: profile.max_output_tokens,
             reasoning_effort: reasoning_value,
-            compat: profile.compat,
         })?;
         self.provider = profile.provider;
         self.reasoning_effort = effective_effort;
@@ -944,8 +939,7 @@ impl Agent {
         self.max_input_tokens = profile.max_input_tokens;
         self.supports_images = profile.supports_images;
         let model = self.client.model().to_string();
-        self.session
-            .set_model(&self.provider, &model, self.client.api())?;
+        self.session.set_model(&self.provider, &model)?;
         self.session.set_reasoning_effort(self.reasoning_effort)?;
         self.context_tokens = self.estimated_context_tokens();
         self.usage_estimated = true;
@@ -980,6 +974,7 @@ impl Agent {
         let session = self
             .session
             .fresh_with_reasoning_effort(self.default_reasoning_effort)?;
+        self.client.set_prompt_cache_key(session.id().to_string());
         self.client.set_reasoning_effort(reasoning_value);
         self.reasoning_effort = self.default_reasoning_effort;
         self.session = session;
@@ -1005,15 +1000,14 @@ impl Agent {
         let reasoning_effort = profile.clamp_reasoning_effort(session.reasoning_effort());
         let default_reasoning_effort = profile.default_reasoning_effort();
         let reasoning_value = profile.reasoning_value(reasoning_effort)?;
+        self.client.set_prompt_cache_key(session.id().to_string());
         self.client.reconfigure(OpenAiModelConfig {
             provider: profile.provider.clone(),
             base_url: profile.base_url.clone(),
             api_key: profile.api_key.clone(),
             model: profile.id.clone(),
-            api: session.api(),
             max_output_tokens: profile.max_output_tokens,
             reasoning_effort: reasoning_value,
-            compat: profile.compat,
         })?;
         self.provider = profile.provider;
         self.reasoning_effort = reasoning_effort;
@@ -1050,11 +1044,6 @@ impl Agent {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         self.client.endpoint().as_str()
-    }
-
-    #[must_use]
-    pub const fn api(&self) -> ApiProtocol {
-        self.client.api()
     }
 
     #[must_use]
@@ -1510,7 +1499,6 @@ mod tests {
         let config = AppConfig {
             model: "test-model".to_string(),
             provider: "xai".to_string(),
-            api: ApiProtocol::ChatCompletions,
             reasoning_effort: ReasoningEffort::High,
             reasoning_value: Some("high".to_string()),
             base_url: "http://127.0.0.1:1/v1".to_string(),
@@ -1518,12 +1506,6 @@ mod tests {
             context_window: 128_000,
             max_input_tokens: 128_000,
             max_output_tokens: None,
-            compat: crate::config::ModelCompat {
-                reasoning_effort: true,
-                usage_in_streaming: true,
-                finish_reason: true,
-                strict_tools: false,
-            },
             cwd: project.path().canonicalize().unwrap(),
             request_timeout_secs: 10,
             compaction: CompactionSettings::default(),

@@ -101,31 +101,29 @@ MCode 不会把 API 密钥写入配置或会话。
 
 常用配置：
 
-- `api`：`openai-completions` 或 `openai-responses`
 - `contextWindow` / `maxInputTokens` / `maxOutputTokens`：上下文窗口、最大输入和可选输出上限；
   配置输出上限后可精确判断是否需要压缩重试
 - `input`：模型输入模态；文本模型使用 `["text"]`
 - `default`：每个模型必填，指定默认 effort；非推理模型使用 `off`
-- `thinkingLevelMap`：当前推理模型可选的 effort，`default` 必须是其中的非 `null` 等级
-- `compat`：控制 reasoning effort、流式 usage、`finish_reason` 和 strict tools；仅当端点确实
-  省略结束原因时将 `supportsFinishReason` 设为 `false`
+- `thinkingLevelMap`：只列出当前推理模型支持的 effort，`default` 必须是其中一个等级
+- `baseUrl`：提供 OpenAI Responses API 的中转站根地址；MCode 会请求其 `/responses`
 - `compaction`：自动压缩开关、预留 token 和最近历史预算
 - `mcpServers`：本地 stdio MCP；项目配置按服务名称逐字段合并全局配置
 
-`models.example.json` 只包含 Grok、DeepSeek、Kimi 和 GLM。对应密钥环境变量为
-`XAI_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和 `ZHIPUAI_API_KEY`。DeepSeek
-V4 Flash 与 V4 Pro 均使用 Responses API。未知 provider 会被拒绝。
+MCode 只使用 OpenAI Responses API，不包含 Chat Completions 回退。`models.example.json`
+只包含 Grok、DeepSeek、Kimi 和 GLM；其中 GLM/Kimi 的示例地址是中转站占位符，使用前需替换。
+对应密钥环境变量为
+`XAI_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和 `ZHIPUAI_API_KEY`。Grok 4.6
+使用 Responses API，支持 500K 上下文、图片输入以及 `low` / `medium` / `high` / `xhigh`
+effort。DeepSeek V4 Flash 与 V4 Pro 均使用 Responses API，支持 1M 上下文、384K 最大输出
+以及 `low` / `high` / `max` effort。未知 provider 会被拒绝。
 
 `MCODE_MODEL`、`MCODE_REASONING_EFFORT`、`MCODE_BASE_URL`、`MCODE_CONTEXT_WINDOW`、
 `MCODE_MAX_INPUT_TOKENS` 和 `MCODE_MAX_OUTPUT_TOKENS` 可覆盖当前选择；`--api-key-env`
 可临时指定密钥环境变量。
 
-Web Search 默认开启，不需要配置：
-
-- Grok 与 DeepSeek 通过 Responses API 使用原生 `web_search`。
-- GLM 使用原生 `web_search`，Kimi 使用内置 `$web_search`。
-- Kimi 的 `$web_search` 要求关闭 thinking，MCode 会在搜索可用时自动处理。
-- 四家模型均可使用 `fetch_content` 读取公开网页正文。
+Web Search 默认开启，不需要配置。四家模型均通过 Responses API 使用原生 `web_search`，
+并可使用 `fetch_content` 读取公开网页正文；中转站需要实现对应工具协议。
 
 MCode 会从 Git 仓库根目录到当前工作目录逐层读取普通 UTF-8 `AGENTS.md`；同层的
 `AGENTS.override.md` 优先，合计大小上限 64 KiB。不会读取仓库外文件、目录项或符号链接。

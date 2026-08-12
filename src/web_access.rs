@@ -158,7 +158,6 @@ fn fetch_content_definition() -> ToolDefinition {
                 "required": ["url", "urls"],
                 "additionalProperties": false
             }),
-            strict: Some(true),
         },
     }
 }

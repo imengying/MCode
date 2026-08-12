@@ -9,7 +9,6 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
-const SUPPORTED_PROVIDERS: [&str; 4] = ["xai", "deepseek", "glm", "kimi"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionSettings {
@@ -75,55 +74,19 @@ impl fmt::Display for ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ApiProtocol {
-    #[serde(rename = "openai-completions")]
-    ChatCompletions,
-    #[serde(rename = "openai-responses")]
-    Responses,
-}
-
-impl ApiProtocol {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ChatCompletions => "openai-completions",
-            Self::Responses => "openai-responses",
-        }
-    }
-}
-
-impl fmt::Display for ApiProtocol {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 #[derive(Clone)]
 pub struct ModelProfile {
     pub provider: String,
     pub id: String,
     pub name: Option<String>,
-    pub api: ApiProtocol,
     pub base_url: String,
     pub api_key: Option<String>,
     pub context_window: u64,
     pub max_input_tokens: u64,
     pub max_output_tokens: Option<u64>,
-    pub reasoning: bool,
     pub supports_images: bool,
-    pub compat: ModelCompat,
     default_reasoning_effort: ReasoningEffort,
-    thinking_level_map: BTreeMap<ReasoningEffort, Option<String>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct ModelCompat {
-    pub reasoning_effort: bool,
-    pub usage_in_streaming: bool,
-    pub finish_reason: bool,
-    pub strict_tools: bool,
+    thinking_level_map: BTreeMap<ReasoningEffort, String>,
 }
 
 impl ModelProfile {
@@ -136,39 +99,29 @@ impl ModelProfile {
         if !self.supports_reasoning(effort) {
             bail!("model {} does not support {effort} reasoning", self.id);
         }
-        if effort == ReasoningEffort::Off {
-            return Ok(None);
-        }
-        match self.thinking_level_map.get(&effort) {
-            Some(Some(value)) if value.trim().is_empty() => {
-                bail!(
-                    "model {} maps {effort} reasoning to an empty value",
-                    self.id
-                )
-            }
-            Some(Some(value)) => Ok(Some(value.clone())),
-            Some(None) => bail!("model {} does not support {effort} reasoning", self.id),
-            None => bail!("model {} does not configure {effort} reasoning", self.id),
-        }
+        Ok(self.thinking_level_map.get(&effort).cloned())
     }
 
     #[must_use]
     pub fn supports_reasoning(&self, effort: ReasoningEffort) -> bool {
-        if !self.reasoning {
-            return effort == ReasoningEffort::Off;
-        }
-        matches!(self.thinking_level_map.get(&effort), Some(Some(_)))
+        effort == ReasoningEffort::Off && self.thinking_level_map.is_empty()
+            || self.thinking_level_map.contains_key(&effort)
     }
 
     #[must_use]
     pub fn supported_reasoning_efforts(&self) -> Vec<ReasoningEffort> {
-        if !self.reasoning {
+        if self.thinking_level_map.is_empty() {
             return vec![ReasoningEffort::Off];
         }
         ReasoningEffort::ALL
             .into_iter()
             .filter(|effort| self.supports_reasoning(*effort))
             .collect()
+    }
+
+    #[must_use]
+    pub fn is_reasoning_model(&self) -> bool {
+        !self.thinking_level_map.is_empty()
     }
 
     #[must_use]
@@ -198,7 +151,6 @@ impl ModelProfile {
 pub struct AppConfig {
     pub model: String,
     pub provider: String,
-    pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
     pub reasoning_value: Option<String>,
     pub base_url: String,
@@ -206,7 +158,6 @@ pub struct AppConfig {
     pub context_window: u64,
     pub max_input_tokens: u64,
     pub max_output_tokens: Option<u64>,
-    pub compat: ModelCompat,
     pub cwd: PathBuf,
     pub request_timeout_secs: u64,
     pub compaction: CompactionSettings,
@@ -237,6 +188,7 @@ pub struct ConfigOverrides {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SettingsFile {
     #[serde(rename = "defaultProvider")]
     provider: Option<String>,
@@ -249,7 +201,7 @@ struct SettingsFile {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CompactionSettingsFile {
     enabled: Option<bool>,
     reserve_tokens: Option<u64>,
@@ -257,6 +209,7 @@ struct CompactionSettingsFile {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpServerFile {
     command: Option<String>,
     args: Option<Vec<String>>,
@@ -305,39 +258,33 @@ fn overlay_option<T>(current: &mut Option<T>, overlay: Option<T>) {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelsFile {
     #[serde(default)]
     providers: BTreeMap<String, ProviderFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ProviderFile {
     base_url: Option<String>,
-    api: Option<String>,
     api_key: Option<String>,
-    #[serde(default)]
-    compat: CompatFile,
     #[serde(default)]
     models: Vec<ModelFile>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ModelFile {
     id: String,
     name: Option<String>,
-    api: Option<String>,
-    reasoning: Option<bool>,
     input: Option<Vec<InputModality>>,
-    default: Option<ReasoningEffort>,
+    default: ReasoningEffort,
     context_window: Option<u64>,
     max_input_tokens: Option<u64>,
     max_output_tokens: Option<u64>,
     #[serde(default)]
-    compat: CompatFile,
-    #[serde(default)]
-    thinking_level_map: BTreeMap<String, Option<String>>,
+    thinking_level_map: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -345,29 +292,6 @@ struct ModelFile {
 enum InputModality {
     Text,
     Image,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-struct CompatFile {
-    #[serde(rename = "supportsReasoningEffort")]
-    reasoning_effort: Option<bool>,
-    #[serde(rename = "supportsUsageInStreaming")]
-    usage_in_streaming: Option<bool>,
-    #[serde(rename = "supportsFinishReason")]
-    finish_reason: Option<bool>,
-    #[serde(rename = "supportsStrictTools")]
-    strict_tools: Option<bool>,
-}
-
-impl CompatFile {
-    fn merge(self, model: Self) -> Self {
-        Self {
-            reasoning_effort: model.reasoning_effort.or(self.reasoning_effort),
-            usage_in_streaming: model.usage_in_streaming.or(self.usage_in_streaming),
-            finish_reason: model.finish_reason.or(self.finish_reason),
-            strict_tools: model.strict_tools.or(self.strict_tools),
-        }
-    }
 }
 
 impl AppConfig {
@@ -422,7 +346,6 @@ impl AppConfig {
             .with_context(|| format!("模型 {model:?} 不在 ~/.mcode/models.json 中"))?;
         let selected_model = selected_profile.id.clone();
         let provider = selected_profile.provider.clone();
-        let api = selected_profile.api;
 
         let environment_reasoning = env_reasoning("MCODE_REASONING_EFFORT").transpose()?;
         let requested_reasoning_effort = overrides.reasoning_effort.or(environment_reasoning);
@@ -437,7 +360,6 @@ impl AppConfig {
         let context_window = selected_profile.context_window;
         let max_input_tokens = selected_profile.max_input_tokens;
         let max_output_tokens = selected_profile.max_output_tokens;
-        let compat = selected_profile.compat;
         let request_timeout_secs = overrides.request_timeout_secs.unwrap_or(300);
         let defaults = CompactionSettings::default();
         let compaction = CompactionSettings {
@@ -481,7 +403,6 @@ impl AppConfig {
         Ok(Self {
             model: selected_model,
             provider,
-            api,
             reasoning_effort,
             reasoning_value,
             base_url,
@@ -489,7 +410,6 @@ impl AppConfig {
             context_window,
             max_input_tokens,
             max_output_tokens,
-            compat,
             cwd,
             request_timeout_secs,
             compaction,
@@ -507,13 +427,11 @@ impl AppConfig {
         self.reasoning_value = profile.reasoning_value(self.reasoning_effort)?;
         self.model = profile.id;
         self.provider = profile.provider;
-        self.api = profile.api;
         self.base_url = profile.base_url;
         self.api_key = profile.api_key;
         self.context_window = profile.context_window;
         self.max_input_tokens = profile.max_input_tokens;
         self.max_output_tokens = profile.max_output_tokens;
-        self.compat = profile.compat;
         Ok(())
     }
 
@@ -707,14 +625,6 @@ fn build_model_profiles(
     for (provider_name, provider) in file.providers {
         validate_supported_provider(&provider_name)?;
         for model in provider.models {
-            let api_name = model
-                .api
-                .as_deref()
-                .or(provider.api.as_deref())
-                .with_context(|| format!("provider {provider_name} is missing api"))?;
-            let api = parse_api_protocol(api_name).with_context(|| {
-                format!("provider {provider_name} uses unsupported api {api_name:?}")
-            })?;
             if model.id.trim().is_empty() {
                 bail!("provider {provider_name} contains a model with an empty id");
             }
@@ -742,6 +652,20 @@ fn build_model_profiles(
                         provider_name, model.id
                     )
                 })?;
+                if level == ReasoningEffort::Off {
+                    bail!(
+                        "thinkingLevelMap for {}/{} must not contain off",
+                        provider_name,
+                        model.id
+                    );
+                }
+                if value.trim().is_empty() {
+                    bail!(
+                        "thinkingLevelMap for {}/{} maps {level} to an empty value",
+                        provider_name,
+                        model.id
+                    );
+                }
                 thinking_level_map.insert(level, value);
             }
             let context_window = context_window_override
@@ -752,8 +676,6 @@ fn build_model_profiles(
                 .or(model.max_input_tokens)
                 .unwrap_or(context_window);
             let max_output_tokens = max_output_tokens_override.or(model.max_output_tokens);
-            let compat = provider.compat.merge(model.compat);
-            let reasoning = model.reasoning.unwrap_or(false);
             let input = model.input.unwrap_or_else(|| vec![InputModality::Text]);
             if !input.contains(&InputModality::Text) {
                 bail!(
@@ -763,12 +685,7 @@ fn build_model_profiles(
                 );
             }
             let supports_images = input.contains(&InputModality::Image);
-            let default_reasoning_effort = model.default.with_context(|| {
-                format!(
-                    "模型 {}/{} 缺少 default；请指定默认 effort",
-                    provider_name, model.id
-                )
-            })?;
+            let default_reasoning_effort = model.default;
             if context_window == 0 {
                 bail!(
                     "model {}/{} has a zero contextWindow",
@@ -790,35 +707,20 @@ fn build_model_profiles(
                     model.id
                 );
             }
-            let supports_strict_tools = compat.strict_tools.unwrap_or(false);
             let profile = ModelProfile {
                 provider: provider_name.clone(),
                 id: model.id,
                 name: model.name,
-                api,
                 base_url,
                 api_key,
                 context_window,
                 max_input_tokens,
                 max_output_tokens,
-                reasoning,
                 supports_images,
-                compat: ModelCompat {
-                    reasoning_effort: compat.reasoning_effort.unwrap_or(true),
-                    usage_in_streaming: compat.usage_in_streaming.unwrap_or(true),
-                    finish_reason: compat.finish_reason.unwrap_or(true),
-                    strict_tools: supports_strict_tools,
-                },
                 default_reasoning_effort,
                 thinking_level_map,
             };
             let configured_efforts = profile.supported_reasoning_efforts();
-            if profile.reasoning && configured_efforts.is_empty() {
-                bail!(
-                    "模型 {} 必须在 thinkingLevelMap 中配置至少一个非 null 等级",
-                    profile.qualified_id()
-                );
-            }
             if !configured_efforts.contains(&profile.default_reasoning_effort) {
                 let configured = configured_efforts
                     .iter()
@@ -838,17 +740,9 @@ fn build_model_profiles(
 }
 
 fn validate_supported_provider(provider: &str) -> Result<()> {
-    if SUPPORTED_PROVIDERS.contains(&provider) {
-        return Ok(());
-    }
-    bail!("不支持 provider {provider:?}；MCode 仅支持 xai（Grok）、deepseek、glm 和 kimi")
-}
-
-fn parse_api_protocol(value: &str) -> Option<ApiProtocol> {
-    match value {
-        "openai-completions" => Some(ApiProtocol::ChatCompletions),
-        "openai-responses" => Some(ApiProtocol::Responses),
-        _ => None,
+    match provider {
+        "xai" | "deepseek" | "glm" | "kimi" => Ok(()),
+        _ => bail!("不支持 provider {provider:?}；MCode 仅支持 xai（Grok）、deepseek、glm 和 kimi"),
     }
 }
 
@@ -954,12 +848,45 @@ mod tests {
             providers,
             BTreeSet::from(["deepseek", "glm", "kimi", "xai"])
         );
+        let grok = profiles
+            .iter()
+            .find(|profile| profile.provider == "xai")
+            .unwrap();
+        assert_eq!(grok.id, "grok-4.6");
+        assert_eq!(grok.context_window, 500_000);
+        assert_eq!(grok.max_input_tokens, 500_000);
+        assert_eq!(grok.max_output_tokens, None);
+        assert!(grok.supports_images);
+        assert_eq!(
+            grok.supported_reasoning_efforts(),
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh
+            ]
+        );
+        for profile in profiles
+            .iter()
+            .filter(|profile| profile.provider == "deepseek")
+        {
+            assert_eq!(profile.context_window, 1_048_576);
+            assert_eq!(profile.max_input_tokens, 1_048_576);
+            assert_eq!(profile.max_output_tokens, Some(384_000));
+            assert_eq!(
+                profile.supported_reasoning_efforts(),
+                vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max
+                ]
+            );
+        }
 
         let file = serde_json::from_value(serde_json::json!({
             "providers": {
                 "other": {
                     "baseUrl": "https://example.com/v1",
-                    "api": "openai-completions",
                     "models": []
                 }
             }
@@ -1007,5 +934,32 @@ mod tests {
         );
         assert_eq!(server.env.as_ref().unwrap().get("KEEP").unwrap(), "yes");
         assert_eq!(server.enabled, Some(true));
+    }
+
+    #[test]
+    fn rejects_removed_or_unknown_config_fields() {
+        let settings = serde_json::from_value::<SettingsFile>(serde_json::json!({
+            "defaultProvider": "deepseek",
+            "webSearch": "disabled"
+        }));
+        assert!(settings.is_err());
+
+        let models = serde_json::from_value::<ModelsFile>(serde_json::json!({
+            "providers": {
+                "deepseek": {
+                    "baseUrl": "https://api.deepseek.com",
+                    "api": "openai-responses",
+                    "models": [{
+                        "id": "deepseek-v4-pro",
+                        "api": "openai-completions",
+                        "reasoning": true,
+                        "compat": {"supportsStrictTools": true},
+                        "default": "high",
+                        "thinkingLevelMap": {"high": "high"}
+                    }]
+                }
+            }
+        }));
+        assert!(models.is_err());
     }
 }

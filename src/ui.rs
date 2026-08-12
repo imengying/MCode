@@ -35,7 +35,7 @@ use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents, get_mi
 use crate::agent::{Agent, ModelChoice};
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
 use crate::compaction::{estimate_message_tokens, estimate_text_tokens};
-use crate::config::{ApiProtocol, ReasoningEffort};
+use crate::config::ReasoningEffort;
 use crate::event::{AgentEvent, CompactionReason};
 use crate::highlight::highlight_code;
 use crate::latex::{render_display, render_inline};
@@ -1300,7 +1300,7 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
                 let detail = choice
                     .name
                     .as_deref()
-                    .map_or_else(|| choice.api.to_string(), sanitize_terminal_text);
+                    .map_or("Responses".to_string(), sanitize_terminal_text);
                 let description = if current {
                     format!("当前 · {detail}")
                 } else {
@@ -2592,7 +2592,6 @@ impl std::fmt::Debug for X11Clipboard {
 struct UiState {
     model: String,
     provider: String,
-    api: ApiProtocol,
     reasoning_effort: ReasoningEffort,
     default_reasoning_effort: ReasoningEffort,
     endpoint: String,
@@ -2650,7 +2649,6 @@ impl UiState {
         Self {
             model,
             provider: "xai".to_string(),
-            api: ApiProtocol::ChatCompletions,
             reasoning_effort: ReasoningEffort::Off,
             default_reasoning_effort: ReasoningEffort::Off,
             endpoint,
@@ -2706,7 +2704,6 @@ impl UiState {
     fn sync_from_agent(&mut self, agent: &Agent) {
         self.model = sanitize_terminal_text(agent.model());
         self.provider = sanitize_terminal_text(agent.provider());
-        self.api = agent.api();
         self.reasoning_effort = agent.reasoning_effort();
         self.default_reasoning_effort = agent.default_reasoning_effort();
         self.endpoint = sanitize_terminal_text(agent.endpoint());
@@ -2897,18 +2894,14 @@ impl UiState {
                 });
             }
             MessageRole::Assistant => {
-                let reasoning = if self.api == ApiProtocol::Responses {
-                    let mut parts = response_reasoning_summary_parts(&message.response_items);
-                    if parts.is_empty()
-                        && !has_response_reasoning_item(&message.response_items)
-                        && let Some(summary) = message.reasoning_content.as_deref()
-                    {
-                        parts.push(summary.to_string());
-                    }
-                    visible_reasoning_summary(&parts).unwrap_or_default()
-                } else {
-                    String::new()
-                };
+                let mut parts = response_reasoning_summary_parts(&message.response_items);
+                if parts.is_empty()
+                    && !has_response_reasoning_item(&message.response_items)
+                    && let Some(summary) = message.reasoning_content.as_deref()
+                {
+                    parts.push(summary.to_string());
+                }
+                let reasoning = visible_reasoning_summary(&parts).unwrap_or_default();
                 let content = sanitize_terminal_text(&message.content.unwrap_or_default());
                 if !content.is_empty() || !reasoning.is_empty() {
                     self.messages.push(ViewMessage {
@@ -3283,12 +3276,10 @@ impl UiState {
                 )
             };
             lines.push(format!(
-                "{selected} {}/{}{} - {limits}, {}{}",
+                "{selected} {}/{}{} - {limits}, Responses{reasoning}",
                 sanitize_terminal_text(&choice.provider),
                 sanitize_terminal_text(&choice.id),
                 name,
-                choice.api,
-                reasoning
             ));
         }
         lines.push("使用 /model <提供商/模型> 选择。".to_string());
@@ -3348,8 +3339,7 @@ impl UiState {
                 )
             });
         format!(
-            "模型：{qualified_model}\nAPI：{}\neffort：{}\n权限：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
-            self.api,
+            "模型：{qualified_model}\nAPI：OpenAI Responses\neffort：{}\n权限：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
             self.reasoning_effort,
             self.permission_profile.label(),
             format_tokens(context_tokens),
@@ -3423,16 +3413,12 @@ impl UiState {
                 self.status = "正在生成回复".to_string();
             }
             AgentEvent::ReasoningSummaryDelta { text } => {
-                if self.api == ApiProtocol::Responses {
-                    self.append_live_completion(&text);
-                    self.append_reasoning_summary(&text);
-                }
+                self.append_live_completion(&text);
+                self.append_reasoning_summary(&text);
                 self.status = "正在思考".to_string();
             }
             AgentEvent::ReasoningSummaryPartAdded { .. } => {
-                if self.api == ApiProtocol::Responses {
-                    self.begin_reasoning_summary_part();
-                }
+                self.begin_reasoning_summary_part();
             }
             AgentEvent::ReasoningSummaryFinished => self.finish_reasoning_summary(),
             AgentEvent::ResponseTruncated { had_tool_calls } => self.push_error(if had_tool_calls {
@@ -6107,7 +6093,7 @@ mod tests {
         let pasted = "full pasted content\n".repeat(COLLAPSED_PASTE_LINE_THRESHOLD);
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.editor.insert_paste(&pasted);
@@ -6232,7 +6218,7 @@ mod tests {
     fn slash_exit_quits_immediately_while_an_agent_is_running() {
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.running = true;
@@ -6253,7 +6239,7 @@ mod tests {
     fn renders_live_elapsed_time_and_a_final_run_status() {
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.begin_run("处理中");
@@ -6769,7 +6755,7 @@ mod tests {
 
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.push_user("继续".to_string(), &[]);
@@ -6806,7 +6792,7 @@ mod tests {
         .unwrap();
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             temp.path().to_path_buf(),
         );
 
@@ -6890,7 +6876,7 @@ mod tests {
     fn folds_tool_arguments_and_output() {
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.apply_agent_event(AgentEvent::ToolStarted {
@@ -7023,91 +7009,90 @@ mod tests {
     }
 
     #[test]
-    fn renders_codex_style_responses_summaries_without_raw_chat_reasoning() {
-        let mut chat_state = UiState::new(
+    fn renders_codex_style_responses_summaries_without_raw_reasoning() {
+        let mut raw_reasoning_state = UiState::new(
             "reasoning-model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("/tmp/project"),
         );
-        chat_state.apply_agent_event(AgentEvent::RunStarted);
-        chat_state.apply_agent_event(AgentEvent::AssistantStarted);
-        chat_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+        raw_reasoning_state.apply_agent_event(AgentEvent::RunStarted);
+        raw_reasoning_state.apply_agent_event(AgentEvent::AssistantStarted);
+        raw_reasoning_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
             text: "Private raw reasoning.".to_string(),
         });
-        let active = conversation_lines(&chat_state)
+        let active = conversation_lines(&raw_reasoning_state)
             .iter()
             .map(Line::to_string)
             .collect::<String>();
         assert!(active.is_empty());
         assert_eq!(
-            chat_state.reasoning_activity().as_deref(),
+            raw_reasoning_state.reasoning_activity().as_deref(),
             Some("正在思考…")
         );
         assert!(!active.contains("Private raw reasoning."));
 
-        chat_state.apply_agent_event(AgentEvent::TextDelta {
+        raw_reasoning_state.apply_agent_event(AgentEvent::TextDelta {
             text: "Final response.".to_string(),
         });
-        let completed = conversation_lines(&chat_state)
+        let completed = conversation_lines(&raw_reasoning_state)
             .iter()
             .map(Line::to_string)
             .collect::<String>();
         assert!(completed.contains("Final response."));
         assert!(!completed.contains("正在思考"));
 
-        let mut responses_state = UiState::new(
+        let mut summary_state = UiState::new(
             "reasoning-model".to_string(),
             "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
-        responses_state.api = ApiProtocol::Responses;
-        responses_state.apply_agent_event(AgentEvent::RunStarted);
-        responses_state.apply_agent_event(AgentEvent::AssistantStarted);
-        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryPartAdded { index: 0 });
-        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+        summary_state.apply_agent_event(AgentEvent::RunStarted);
+        summary_state.apply_agent_event(AgentEvent::AssistantStarted);
+        summary_state.apply_agent_event(AgentEvent::ReasoningSummaryPartAdded { index: 0 });
+        summary_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
             text: "**Inspecting files**\n\nReading the relevant modules.".to_string(),
         });
         assert_eq!(
-            responses_state.reasoning_activity().as_deref(),
+            summary_state.reasoning_activity().as_deref(),
             Some("Inspecting files")
         );
-        assert!(conversation_lines(&responses_state).is_empty());
+        assert!(conversation_lines(&summary_state).is_empty());
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &responses_state))
+            .draw(|frame| render(frame, &summary_state))
             .unwrap();
         let active = rendered_terminal(&terminal);
         assert!(active.contains("• Inspecting files"));
         assert!(!active.contains("Reading the relevant modules."));
 
-        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryPartAdded { index: 1 });
+        summary_state.apply_agent_event(AgentEvent::ReasoningSummaryPartAdded { index: 1 });
         assert_eq!(
-            responses_state.reasoning_activity().as_deref(),
+            summary_state.reasoning_activity().as_deref(),
             Some("Inspecting files")
         );
-        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+        summary_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
             text: "**Running".to_string(),
         });
         assert_eq!(
-            responses_state.reasoning_activity().as_deref(),
+            summary_state.reasoning_activity().as_deref(),
             Some("Inspecting files")
         );
-        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
+        summary_state.apply_agent_event(AgentEvent::ReasoningSummaryDelta {
             text: " checks**\n\nVerifying the behavior.".to_string(),
         });
         assert_eq!(
-            responses_state.reasoning_activity().as_deref(),
+            summary_state.reasoning_activity().as_deref(),
             Some("Running checks")
         );
-        responses_state.apply_agent_event(AgentEvent::ReasoningSummaryFinished);
+        summary_state.apply_agent_event(AgentEvent::ReasoningSummaryFinished);
 
-        let summary = conversation_lines(&responses_state)
+        let summary = conversation_lines(&summary_state)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(responses_state.reasoning_activity(), None);
+        assert_eq!(summary_state.reasoning_activity(), None);
         assert!(summary.contains("• Reading the relevant modules."));
         assert!(summary.contains("Running checks"));
         assert!(summary.contains("Verifying the behavior."));
@@ -7120,7 +7105,6 @@ mod tests {
             "https://api.deepseek.com/responses".to_string(),
             std::path::PathBuf::from("."),
         );
-        resumed_state.api = ApiProtocol::Responses;
         resumed_state.push_history(ChatMessage::assistant_with_response_items(
             Some("**Final response.**".to_string()),
             Some("Private raw reasoning.".to_string()),
@@ -7155,7 +7139,7 @@ mod tests {
     fn navigates_and_completes_slash_command_suggestions() {
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.editor.insert('/');
@@ -7195,7 +7179,7 @@ mod tests {
     fn slash_effort_lists_and_accepts_only_the_current_model_configuration() {
         let mut state = UiState::new(
             "grok".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.reasoning_effort = ReasoningEffort::Medium;
@@ -7250,7 +7234,7 @@ mod tests {
     fn slash_delete_uses_a_keyboard_confirmation_defaulting_to_no() {
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.editor.insert_str("/delete");
@@ -7314,7 +7298,7 @@ mod tests {
     fn approval_prompt_supports_vertical_selection_and_shortcuts() {
         let mut state = UiState::new(
             "model".to_string(),
-            "http://localhost/v1/chat/completions".to_string(),
+            "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.pending_approval = Some(ApprovalView {

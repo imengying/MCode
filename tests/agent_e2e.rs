@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use mcode::agent::{Agent, RunStatus};
 use mcode::approval::ApprovalGate;
-use mcode::config::{
-    ApiProtocol, AppConfig, CompactionSettings, ConfigOverrides, ModelCompat, ReasoningEffort,
-};
+use mcode::config::{AppConfig, CompactionSettings, ConfigOverrides, ReasoningEffort};
 use mcode::event::AgentEvent;
 use mcode::protocol::{ChatMessage, FunctionCall, ToolCall, Usage};
 use mcode::session::{Session, SessionMetadata, ToolReplayPolicy};
@@ -29,38 +27,17 @@ async fn executes_a_tool_and_continues_the_model_turn() {
             let request = read_json_request(&mut stream).await;
             server_requests.lock().await.push(request);
 
-            let event = if index == 0 {
-                json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "call_write",
-                                "function": {
-                                    "name": "write_file",
-                                    "arguments": "{\"path\":\"result.txt\",\"content\":\"created by tool\"}"
-                                }
-                            }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }]
-                })
+            if index == 0 {
+                write_sse_tool_call(
+                    &mut stream,
+                    "call_write",
+                    "write_file",
+                    "{\"path\":\"result.txt\",\"content\":\"created by tool\"}",
+                )
+                .await;
             } else {
-                json!({
-                    "choices": [{
-                        "delta": {"content": "Done."},
-                        "finish_reason": "stop"
-                    }]
-                })
-            };
-            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
+                write_sse_text(&mut stream, "Done.", None).await;
+            }
         }
     });
 
@@ -68,7 +45,6 @@ async fn executes_a_tool_and_continues_the_model_turn() {
     let config = AppConfig {
         model: "test-model".to_string(),
         provider: "xai".to_string(),
-        api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::High,
         reasoning_value: Some("high".to_string()),
         base_url: format!("http://{address}/v1"),
@@ -76,12 +52,6 @@ async fn executes_a_tool_and_continues_the_model_turn() {
         context_window: 200_000,
         max_input_tokens: 200_000,
         max_output_tokens: None,
-        compat: ModelCompat {
-            reasoning_effort: true,
-            usage_in_streaming: true,
-            finish_reason: true,
-            strict_tools: false,
-        },
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -114,26 +84,25 @@ async fn executes_a_tool_and_continues_the_model_turn() {
 
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 2);
-    let second_messages = requests[1]["messages"].as_array().unwrap();
+    let second_input = requests[1]["input"].as_array().unwrap();
     assert!(
-        second_messages
+        second_input
             .iter()
-            .any(|message| message["role"] == "tool")
+            .any(|item| item["type"] == "function_call_output")
     );
     assert!(
-        second_messages
+        second_input
             .iter()
-            .any(|message| message["tool_calls"][0]["id"] == "call_write")
+            .any(|item| item["type"] == "function_call" && item["call_id"] == "call_write")
     );
     assert_eq!(requests[0]["model"], "test-model");
-    assert_eq!(requests[0]["reasoning_effort"], "high");
-    assert_eq!(requests[0]["stream_options"]["include_usage"], true);
+    assert_eq!(requests[0]["reasoning"]["effort"], "high");
     assert!(
         requests[0]["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|tool| tool["function"].get("strict").is_none())
+            .all(|tool| tool.get("strict").is_none())
     );
 
     let mut saw_file_change = false;
@@ -179,48 +148,24 @@ async fn retries_a_deferred_file_action_with_a_required_local_tool() {
                 .lock()
                 .await
                 .push(read_json_request(&mut stream).await);
-            let event = match index {
-                0 => json!({
-                    "choices": [{
-                        "delta": {"content": "好的，这就追加到 result.txt。"},
-                        "finish_reason": "stop"
-                    }]
-                }),
-                1 => json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "call_retry_write",
-                                "function": {
-                                    "name": "write_file",
-                                    "arguments": "{\"path\":\"result.txt\",\"content\":\"retried by tool\"}"
-                                }
-                            }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }]
-                }),
-                _ => json!({
-                    "choices": [{
-                        "delta": {"content": "已完成。"},
-                        "finish_reason": "stop"
-                    }]
-                }),
-            };
-            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
+            match index {
+                0 => write_sse_text(&mut stream, "好的，这就追加到 result.txt。", None).await,
+                1 => {
+                    write_sse_tool_call(
+                        &mut stream,
+                        "call_retry_write",
+                        "write_file",
+                        "{\"path\":\"result.txt\",\"content\":\"retried by tool\"}",
+                    )
+                    .await;
+                }
+                _ => write_sse_text(&mut stream, "已完成。", None).await,
+            }
         }
     });
 
     let project = tempdir().unwrap();
-    let config = basic_chat_config(project.path(), address);
+    let config = basic_config(project.path(), address);
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -244,29 +189,25 @@ async fn retries_a_deferred_file_action_with_a_required_local_tool() {
     );
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 3);
-    assert!(requests[0].get("tool_choice").is_none());
+    assert_eq!(requests[0]["tool_choice"], "auto");
     assert_eq!(requests[1]["tool_choice"], "required");
     let retry_tool_names = requests[1]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .filter(|tool| tool["type"] == "function")
+        .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
         retry_tool_names,
         ["read_file", "write_file", "edit_file", "shell"]
     );
     assert!(
-        requests[1]["messages"]
+        requests[1]["input"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|message| {
-                message["role"] == "user"
-                    && message["content"]
-                        .as_str()
-                        .is_some_and(|content| content.contains("did not call a tool"))
-            })
+            .any(|item| item.to_string().contains("did not call a tool"))
     );
     assert!(
         drain_events(&mut rx)
@@ -290,26 +231,13 @@ async fn persists_an_error_when_a_deferred_action_retry_still_skips_tools() {
                 .lock()
                 .await
                 .push(read_json_request(&mut stream).await);
-            let event = json!({
-                "choices": [{
-                    "delta": {"content": response_text},
-                    "finish_reason": "stop"
-                }]
-            });
-            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
+            write_sse_text(&mut stream, response_text, None).await;
         }
     });
 
     let base = tempdir().unwrap();
     let project = tempdir().unwrap();
-    let config = basic_chat_config(project.path(), address);
+    let config = basic_config(project.path(), address);
     let metadata = SessionMetadata::from(&config);
     let session = Session::create_in(base.path(), project.path(), metadata).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
@@ -466,7 +394,6 @@ async fn responses_api_runs_local_tools_and_native_web_search() {
     let config = AppConfig {
         model: "deepseek-test".to_string(),
         provider: "deepseek".to_string(),
-        api: ApiProtocol::Responses,
         reasoning_effort: ReasoningEffort::Low,
         reasoning_value: Some("low".to_string()),
         base_url: format!("http://{address}/v1"),
@@ -474,12 +401,6 @@ async fn responses_api_runs_local_tools_and_native_web_search() {
         context_window: 200_000,
         max_input_tokens: 200_000,
         max_output_tokens: None,
-        compat: ModelCompat {
-            reasoning_effort: true,
-            usage_in_streaming: true,
-            finish_reason: true,
-            strict_tools: true,
-        },
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -520,7 +441,7 @@ async fn responses_api_runs_local_tools_and_native_web_search() {
         .unwrap();
     assert_eq!(read_tool["type"], "function");
     assert!(read_tool.get("function").is_none());
-    assert_eq!(read_tool["strict"], true);
+    assert!(read_tool.get("strict").is_none());
     assert!(
         requests[0]["tools"]
             .as_array()
@@ -534,14 +455,12 @@ async fn responses_api_runs_local_tools_and_native_web_search() {
             .unwrap()
             .iter()
             .filter(|tool| tool["type"] == "function")
-            .all(|tool| tool["strict"] == true)
+            .all(|tool| tool.get("strict").is_none())
     );
     assert_eq!(requests[0]["reasoning"]["effort"], "low");
-    assert_eq!(requests[0]["reasoning"]["summary"], "auto");
-    assert_eq!(
-        requests[0]["include"],
-        json!(["reasoning.encrypted_content"])
-    );
+    assert!(requests[0]["reasoning"].get("summary").is_none());
+    assert!(requests[0].get("prompt_cache_key").is_none());
+    assert!(requests[0].get("include").is_none());
     let instructions = requests[0]["instructions"].as_str().unwrap();
     assert!(instructions.starts_with("Project instructions from "));
     assert!(instructions.contains("AGENTS.md:\n\nAlways preserve the fixture sentinel."));
@@ -611,35 +530,44 @@ async fn responses_api_runs_local_tools_and_native_web_search() {
 }
 
 #[tokio::test]
-async fn glm_chat_completions_exposes_native_web_search() {
+async fn glm_responses_exposes_native_web_search() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request = read_json_request(&mut stream).await;
-        let event = json!({
-            "choices": [{
-                "delta": {"content": "Search tools are available."},
-                "finish_reason": "stop"
-            }],
-            "web_search": [{
-                "title": "Rust Programming Language",
-                "link": "https://www.rust-lang.org/"
-            }]
-        });
-        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
+        write_responses_sse(
+            &mut stream,
+            vec![
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "Search tools are available."
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Search tools are available.",
+                            "annotations": [{
+                                "type": "url_citation",
+                                "url": "https://www.rust-lang.org/",
+                                "title": "Rust Programming Language"
+                            }]
+                        }]
+                    }
+                }),
+                responses_completed("resp_glm", 30, 5),
+            ],
+        )
+        .await;
         request
     });
 
     let project = tempdir().unwrap();
-    let mut config = basic_chat_config(project.path(), address);
+    let mut config = basic_config(project.path(), address);
     config.provider = "glm".to_string();
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
@@ -662,18 +590,11 @@ async fn glm_chat_completions_exposes_native_web_search() {
         .iter()
         .find(|tool| tool["type"] == "web_search")
         .unwrap();
-    assert_eq!(web_search["web_search"]["enable"], true);
-    assert_eq!(web_search["web_search"]["search_result"], true);
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["function"]["name"] == "fetch_content")
-    );
-    assert!(
-        !tools
-            .iter()
-            .any(|tool| tool["function"]["name"] == "web_search")
-    );
+    assert_eq!(web_search.as_object().unwrap().len(), 1);
+    assert!(tools.iter().any(|tool| tool["name"] == "fetch_content"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "web_search"));
+    assert!(request.get("include").is_none());
+    assert!(request.get("prompt_cache_key").is_none());
     assert!(
         agent
             .messages()
@@ -696,38 +617,17 @@ async fn shell_tool_is_denied_without_frontend_approval() {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request = read_json_request(&mut stream).await;
             server_requests.lock().await.push(request);
-            let event = if index == 0 {
-                json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "call_shell",
-                                "function": {
-                                    "name": "shell",
-                                    "arguments": "{\"command\":\"echo denied > should-not-exist.txt\"}"
-                                }
-                            }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }]
-                })
+            if index == 0 {
+                write_sse_tool_call(
+                    &mut stream,
+                    "call_shell",
+                    "shell",
+                    "{\"command\":\"echo denied > should-not-exist.txt\"}",
+                )
+                .await;
             } else {
-                json!({
-                    "choices": [{
-                        "delta": {"content": "The command was denied."},
-                        "finish_reason": "stop"
-                    }]
-                })
-            };
-            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
+                write_sse_text(&mut stream, "The command was denied.", None).await;
+            }
         }
     });
 
@@ -735,7 +635,6 @@ async fn shell_tool_is_denied_without_frontend_approval() {
     let config = AppConfig {
         model: "test-model".to_string(),
         provider: "xai".to_string(),
-        api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
         reasoning_value: None,
         base_url: format!("http://{address}/v1"),
@@ -743,12 +642,6 @@ async fn shell_tool_is_denied_without_frontend_approval() {
         context_window: 128_000,
         max_input_tokens: 128_000,
         max_output_tokens: None,
-        compat: ModelCompat {
-            reasoning_effort: true,
-            usage_in_streaming: true,
-            finish_reason: true,
-            strict_tools: false,
-        },
         cwd: project.path().canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -775,14 +668,14 @@ async fn shell_tool_is_denied_without_frontend_approval() {
     assert_eq!(status, RunStatus::Completed);
     assert!(!project.path().join("should-not-exist.txt").exists());
     let requests = requests.lock().await;
-    let tool_message = requests[1]["messages"]
+    let tool_message = requests[1]["input"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|message| message["role"] == "tool")
+        .find(|item| item["type"] == "function_call_output")
         .unwrap();
     assert!(
-        tool_message["content"]
+        tool_message["output"]
             .as_str()
             .unwrap()
             .contains("requires user approval")
@@ -804,74 +697,6 @@ async fn shell_tool_is_denied_without_frontend_approval() {
 }
 
 #[tokio::test]
-async fn omits_request_fields_disabled_by_pi_compat() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let (request, user_agent) = read_http_request(&mut stream).await;
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-        (request, user_agent)
-    });
-
-    let project = tempdir().unwrap();
-    let config = AppConfig {
-        model: "compat-model".to_string(),
-        provider: "xai".to_string(),
-        api: ApiProtocol::ChatCompletions,
-        reasoning_effort: ReasoningEffort::High,
-        reasoning_value: Some("high".to_string()),
-        base_url: format!("http://{address}/v1"),
-        api_key: None,
-        context_window: 128_000,
-        max_input_tokens: 128_000,
-        max_output_tokens: None,
-        compat: ModelCompat {
-            reasoning_effort: false,
-            usage_in_streaming: false,
-            finish_reason: true,
-            strict_tools: false,
-        },
-        cwd: project.path().canonicalize().unwrap(),
-        request_timeout_secs: 10,
-        compaction: CompactionSettings::default(),
-        model_profiles: Vec::new(),
-        mcp_servers: Vec::new(),
-        reload_overrides: ConfigOverrides::default(),
-    };
-    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
-    let mut agent = Agent::new(&config, session).await.unwrap();
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let approvals = ApprovalGate::default();
-    let status = agent
-        .run(
-            "test compatibility",
-            Vec::new(),
-            &tx,
-            &CancellationToken::new(),
-            &approvals,
-        )
-        .await
-        .unwrap();
-    let (request, user_agent) = server.await.unwrap();
-
-    assert_eq!(status, RunStatus::Completed);
-    assert!(request.get("reasoning_effort").is_none());
-    assert!(request.get("stream_options").is_none());
-    assert_eq!(user_agent, mcode::USER_AGENT);
-}
-
-#[tokio::test]
 async fn recovers_from_stalled_requests_and_truncated_streams_without_persisting_partial_output() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -883,10 +708,11 @@ async fn recovers_from_stalled_requests_and_truncated_streams_without_persisting
                 0 => tokio::time::sleep(std::time::Duration::from_millis(1_100)).await,
                 1 => write_http_error(&mut stream, 503, "temporarily unavailable").await,
                 2 => {
-                    let body = concat!(
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"discard-me\"}}]}\n\n",
-                        "data: [DONE]\n\n"
-                    );
+                    let event = json!({
+                        "type": "response.output_text.delta",
+                        "delta": "discard-me"
+                    });
+                    let body = format!("event: response.output_text.delta\ndata: {event}\n\n");
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -901,7 +727,7 @@ async fn recovers_from_stalled_requests_and_truncated_streams_without_persisting
 
     let base = tempdir().unwrap();
     let project = tempdir().unwrap();
-    let mut config = basic_chat_config(project.path(), address);
+    let mut config = basic_config(project.path(), address);
     config.request_timeout_secs = 1;
     let session =
         Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
@@ -966,17 +792,17 @@ async fn exec_command_sends_image_content_parts() {
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request = read_json_request(&mut stream).await;
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Image received.\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
+        write_responses_sse(
+            &mut stream,
+            vec![
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "Image received."
+                }),
+                responses_completed("resp_image", 20, 4),
+            ],
+        )
+        .await;
         request
     });
 
@@ -1012,14 +838,14 @@ async fn exec_command_sends_image_content_parts() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let content = request["messages"][0]["content"].as_array().unwrap();
+    let content = request["input"][0]["content"].as_array().unwrap();
     assert_eq!(
         content[0],
-        json!({"type": "text", "text": "inspect this image"})
+        json!({"type": "input_text", "text": "inspect this image"})
     );
-    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(content[1]["type"], "input_image");
     assert!(
-        content[1]["image_url"]["url"]
+        content[1]["image_url"]
             .as_str()
             .unwrap()
             .starts_with("data:image/png;base64,")
@@ -1097,29 +923,12 @@ async fn auto_compaction_summarizes_old_turns_before_the_next_request() {
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 2);
     assert!(requests[0].get("tools").is_none());
-    assert_eq!(requests[0]["max_tokens"], 2_000);
-    assert!(
-        requests[0]["messages"][1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("old old old")
-    );
-    let regular_messages = requests[1]["messages"].as_array().unwrap();
-    assert!(regular_messages.iter().any(|message| {
-        message["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("Continue the fixture task"))
-    }));
-    assert!(regular_messages.iter().any(|message| {
-        message["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("recent question"))
-    }));
-    assert!(!regular_messages.iter().any(|message| {
-        message["content"]
-            .as_str()
-            .is_some_and(|content| content.len() > 5_000)
-    }));
+    assert_eq!(requests[0]["max_output_tokens"], 2_000);
+    assert!(requests[0]["input"].to_string().contains("old old old"));
+    let regular_input = requests[1]["input"].to_string();
+    assert!(regular_input.contains("Continue the fixture task"));
+    assert!(regular_input.contains("recent question"));
+    assert!(!regular_input.contains(&"old ".repeat(2_000)));
     assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
         event,
         AgentEvent::CompactionFinished {
@@ -1204,15 +1013,9 @@ async fn context_overflow_compacts_and_retries_once() {
     assert!(requests[0].get("tools").is_some());
     assert!(requests[1].get("tools").is_none());
     assert!(
-        requests[2]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| {
-                message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("Recover from overflow"))
-            })
+        requests[2]["input"]
+            .to_string()
+            .contains("Recover from overflow")
     );
     assert!(drain_events(&mut rx).into_iter().any(|event| matches!(
         event,
@@ -1270,10 +1073,8 @@ async fn responses_length_stop_compacts_and_retries_once() {
 
     let project = tempdir().unwrap();
     let mut config = compaction_test_config(project.path(), address, 100_000, 1_000, 60);
-    config.provider = "deepseek".to_string();
-    config.api = ApiProtocol::Responses;
+    config.provider = "xai".to_string();
     config.max_output_tokens = Some(100);
-    config.compat.strict_tools = true;
     let mut session =
         Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     session
@@ -1296,6 +1097,7 @@ async fn responses_length_stop_compacts_and_retries_once() {
             Vec::new(),
         ))
         .unwrap();
+    let session_id = session.id().to_string();
     let mut agent = Agent::new(&config, session).await.unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let status = agent
@@ -1313,6 +1115,11 @@ async fn responses_length_stop_compacts_and_retries_once() {
     assert_eq!(status, RunStatus::Completed);
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request["prompt_cache_key"] == session_id })
+    );
     assert_eq!(requests[0]["max_output_tokens"], 100);
     assert_eq!(requests[1]["max_output_tokens"], 800);
     assert_eq!(requests[2]["max_output_tokens"], 100);
@@ -1350,7 +1157,7 @@ async fn resume_does_not_replay_a_dangerous_tool_with_an_unknown_result() {
 
     let base = tempdir().unwrap();
     let project = tempdir().unwrap();
-    let config = basic_chat_config(project.path(), address);
+    let config = basic_config(project.path(), address);
     let mut session =
         Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
     let run_id = session
@@ -1390,14 +1197,14 @@ async fn resume_does_not_replay_a_dangerous_tool_with_an_unknown_result() {
 
     assert_eq!(status, RunStatus::Completed);
     assert!(!project.path().join("interrupted.txt").exists());
-    let tool_result = request["messages"]
+    let tool_result = request["input"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|message| message["role"] == "tool")
+        .find(|item| item["type"] == "function_call_output")
         .unwrap();
     assert!(
-        tool_result["content"]
+        tool_result["output"]
             .as_str()
             .unwrap()
             .contains("may have run before MCode was interrupted")
@@ -1426,7 +1233,7 @@ async fn resume_replays_a_safe_read_file_tool() {
     let base = tempdir().unwrap();
     let project = tempdir().unwrap();
     std::fs::write(project.path().join("fixture.txt"), "before interruption\n").unwrap();
-    let config = basic_chat_config(project.path(), address);
+    let config = basic_config(project.path(), address);
     let mut session =
         Session::create_in(base.path(), project.path(), SessionMetadata::from(&config)).unwrap();
     let run_id = session
@@ -1470,14 +1277,14 @@ async fn resume_replays_a_safe_read_file_tool() {
     let request = server.await.unwrap();
 
     assert_eq!(status, RunStatus::Completed);
-    let tool_result = request["messages"]
+    let tool_result = request["input"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|message| message["role"] == "tool")
+        .find(|item| item["type"] == "function_call_output")
         .unwrap();
     assert!(
-        tool_result["content"]
+        tool_result["output"]
             .as_str()
             .unwrap()
             .contains("content observed during replay")
@@ -1567,7 +1374,6 @@ fn test_session_metadata(model: &str) -> SessionMetadata {
     SessionMetadata {
         provider: "xai".to_string(),
         model: model.to_string(),
-        api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
     }
 }
@@ -1583,11 +1389,9 @@ fn write_test_model_catalog(home: &std::path::Path, model: &str, supports_images
         "providers": {
             "xai": {
                 "baseUrl": "http://127.0.0.1:1/v1",
-                "api": "openai-completions",
                 "models": [{
                     "id": model,
                     "input": input,
-                    "reasoning": false,
                     "default": "off",
                     "contextWindow": 128_000,
                     "maxInputTokens": 128_000
@@ -1624,7 +1428,6 @@ fn compaction_test_config(
     AppConfig {
         model: "test-model".to_string(),
         provider: "xai".to_string(),
-        api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
         reasoning_value: None,
         base_url: format!("http://{address}/v1"),
@@ -1632,12 +1435,6 @@ fn compaction_test_config(
         context_window,
         max_input_tokens: context_window,
         max_output_tokens: None,
-        compat: ModelCompat {
-            reasoning_effort: true,
-            usage_in_streaming: true,
-            finish_reason: true,
-            strict_tools: false,
-        },
         cwd: project.canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings {
@@ -1651,11 +1448,10 @@ fn compaction_test_config(
     }
 }
 
-fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -> AppConfig {
+fn basic_config(project: &std::path::Path, address: std::net::SocketAddr) -> AppConfig {
     AppConfig {
         model: "test-model".to_string(),
         provider: "xai".to_string(),
-        api: ApiProtocol::ChatCompletions,
         reasoning_effort: ReasoningEffort::Off,
         reasoning_value: None,
         base_url: format!("http://{address}/v1"),
@@ -1663,12 +1459,6 @@ fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -
         context_window: 128_000,
         max_input_tokens: 128_000,
         max_output_tokens: None,
-        compat: ModelCompat {
-            reasoning_effort: true,
-            usage_in_streaming: true,
-            finish_reason: true,
-            strict_tools: false,
-        },
         cwd: project.canonicalize().unwrap(),
         request_timeout_secs: 10,
         compaction: CompactionSettings::default(),
@@ -1679,32 +1469,38 @@ fn basic_chat_config(project: &std::path::Path, address: std::net::SocketAddr) -
 }
 
 async fn write_sse_text(stream: &mut TcpStream, content: &str, usage: Option<(u64, u64)>) {
-    let event = json!({
-        "choices": [{
-            "delta": {"content": content},
-            "finish_reason": "stop"
-        }]
-    });
-    let mut body = format!("data: {event}\n\n");
-    if let Some((prompt_tokens, completion_tokens)) = usage {
-        let usage = json!({
-            "choices": [],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens
-            }
-        });
-        let _ = write!(body, "data: {usage}\n\n");
-    }
-    body.push_str("data: [DONE]\n\n");
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes()).await.unwrap();
-    stream.shutdown().await.unwrap();
+    let (input_tokens, output_tokens) = usage.unwrap_or((0, 0));
+    write_responses_sse(
+        stream,
+        vec![
+            json!({
+                "type": "response.output_text.delta",
+                "delta": content
+            }),
+            responses_completed("resp_text", input_tokens, output_tokens),
+        ],
+    )
+    .await;
+}
+
+async fn write_sse_tool_call(stream: &mut TcpStream, call_id: &str, name: &str, arguments: &str) {
+    write_responses_sse(
+        stream,
+        vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": format!("fc_{call_id}"),
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments
+                }
+            }),
+            responses_completed("resp_tool", 20, 5),
+        ],
+    )
+    .await;
 }
 
 fn responses_completed(id: &str, input_tokens: u64, output_tokens: u64) -> Value {

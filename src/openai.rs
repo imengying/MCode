@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::str;
 use std::time::Duration;
@@ -11,7 +11,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::config::{ApiProtocol, ModelCompat};
 use crate::event::AgentEvent;
 use crate::protocol::{
     ChatMessage, FunctionCall, MessageRole, ToolCall, ToolDefinition, Usage, WebSearchAction,
@@ -74,10 +73,8 @@ pub(crate) struct OpenAiModelConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
-    pub api: ApiProtocol,
     pub max_output_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
-    pub compat: ModelCompat,
 }
 
 #[derive(Debug, Clone)]
@@ -87,10 +84,9 @@ pub struct OpenAiClient {
     provider: String,
     api_key: Option<String>,
     model: String,
-    api: ApiProtocol,
     max_output_tokens: Option<u64>,
     reasoning_effort: Option<String>,
-    compat: ModelCompat,
+    prompt_cache_key: String,
     idle_timeout: Duration,
 }
 
@@ -118,8 +114,12 @@ pub enum AssistantStopReason {
 }
 
 impl OpenAiClient {
-    pub(crate) fn new(config: OpenAiModelConfig, timeout: Duration) -> Result<Self> {
-        let endpoint = api_endpoint_url(&config.base_url, config.api)?;
+    pub(crate) fn new(
+        config: OpenAiModelConfig,
+        prompt_cache_key: String,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let endpoint = api_endpoint_url(&config.base_url)?;
         let http = build_http_client(&endpoint, timeout)?;
         Ok(Self {
             http,
@@ -127,10 +127,9 @@ impl OpenAiClient {
             provider: config.provider,
             api_key: config.api_key,
             model: config.model,
-            api: config.api,
             max_output_tokens: config.max_output_tokens,
             reasoning_effort: config.reasoning_effort,
-            compat: config.compat,
+            prompt_cache_key,
             idle_timeout: timeout,
         })
     }
@@ -146,31 +145,28 @@ impl OpenAiClient {
     }
 
     #[must_use]
-    pub const fn api(&self) -> ApiProtocol {
-        self.api
-    }
-
-    #[must_use]
     pub const fn max_output_tokens(&self) -> Option<u64> {
         self.max_output_tokens
     }
 
     pub(crate) fn reconfigure(&mut self, config: OpenAiModelConfig) -> Result<()> {
-        let endpoint = api_endpoint_url(&config.base_url, config.api)?;
+        let endpoint = api_endpoint_url(&config.base_url)?;
         self.http = build_http_client(&endpoint, self.idle_timeout)?;
         self.endpoint = endpoint;
         self.provider = config.provider;
         self.api_key = config.api_key;
         self.model = config.model;
-        self.api = config.api;
         self.max_output_tokens = config.max_output_tokens;
         self.reasoning_effort = config.reasoning_effort;
-        self.compat = config.compat;
         Ok(())
     }
 
     pub fn set_reasoning_effort(&mut self, reasoning_effort: Option<String>) {
         self.reasoning_effort = reasoning_effort;
+    }
+
+    pub fn set_prompt_cache_key(&mut self, prompt_cache_key: String) {
+        self.prompt_cache_key = prompt_cache_key;
     }
 
     #[cfg(test)]
@@ -244,14 +240,14 @@ impl OpenAiClient {
         unreachable!("request retry loop always returns")
     }
 
-    pub async fn stream_chat(
+    pub async fn stream_response(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<AssistantTurn> {
-        self.stream_chat_with_options(
+        self.stream_response_with_options(
             messages,
             tools,
             events,
@@ -265,14 +261,14 @@ impl OpenAiClient {
         .await
     }
 
-    pub async fn stream_chat_requiring_local_tool(
+    pub async fn stream_response_requiring_local_tool(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<AssistantTurn> {
-        self.stream_chat_with_options(
+        self.stream_response_with_options(
             messages,
             tools,
             events,
@@ -286,7 +282,7 @@ impl OpenAiClient {
         .await
     }
 
-    pub async fn stream_chat_with_max_tokens(
+    pub async fn stream_response_with_max_tokens(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
@@ -294,7 +290,7 @@ impl OpenAiClient {
         cancel: &CancellationToken,
         max_tokens: Option<u64>,
     ) -> Result<AssistantTurn> {
-        self.stream_chat_with_options(
+        self.stream_response_with_options(
             messages,
             tools,
             events,
@@ -308,7 +304,7 @@ impl OpenAiClient {
         .await
     }
 
-    async fn stream_chat_with_options(
+    async fn stream_response_with_options(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
@@ -319,9 +315,7 @@ impl OpenAiClient {
     ) -> Result<AssistantTurn> {
         for attempt in 0..MAX_STREAM_ATTEMPTS {
             let result = self
-                .stream_chat_once_with_max_tokens(
-                    messages, tools, events, cancel, max_tokens, features,
-                )
+                .stream_responses(messages, tools, events, cancel, max_tokens, features)
                 .await;
             match result {
                 Ok(turn) => return Ok(turn),
@@ -341,121 +335,6 @@ impl OpenAiClient {
         unreachable!("stream retry loop always returns")
     }
 
-    async fn stream_chat_once_with_max_tokens(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ToolDefinition],
-        events: &mpsc::UnboundedSender<AgentEvent>,
-        cancel: &CancellationToken,
-        max_tokens: Option<u64>,
-        features: StreamFeatures,
-    ) -> Result<AssistantTurn> {
-        let mut api_tools = tools.to_vec();
-        if !self.compat.strict_tools {
-            for tool in &mut api_tools {
-                tool.function.strict = None;
-            }
-        }
-        if self.api == ApiProtocol::Responses {
-            return self
-                .stream_responses(messages, &api_tools, events, cancel, max_tokens, features)
-                .await;
-        }
-        let api_messages: Vec<ApiMessage<'_>> = messages.iter().map(ApiMessage::from).collect();
-        let chat_tools = chat_tools(&api_tools, &self.provider, features.native_web_search)?;
-        let has_tools = !chat_tools.is_empty();
-        let kimi_web_search = features.native_web_search && self.provider == "kimi";
-        let body = ChatRequest {
-            model: &self.model,
-            messages: &api_messages,
-            tools: &chat_tools,
-            tool_choice: (has_tools && features.require_local_tool).then_some("required"),
-            reasoning_effort: self
-                .reasoning_effort
-                .as_deref()
-                .filter(|_| self.compat.reasoning_effort && !kimi_web_search),
-            thinking: kimi_web_search.then_some(ChatThinking { kind: "disabled" }),
-            max_tokens,
-            stream: true,
-            stream_options: self.compat.usage_in_streaming.then_some(StreamOptions {
-                include_usage: true,
-            }),
-        };
-
-        let response = self.send_stream_request(&body, events, cancel).await?;
-        let request_id = response_request_id(response.headers());
-
-        let mut bytes = response.bytes_stream();
-        let mut decoder = SseDecoder::default();
-        let mut state = ChatAccumulator::default();
-        let mut done = false;
-
-        while !done {
-            let chunk = tokio::select! {
-                () = cancel.cancelled() => return Err(OpenAiError::Cancelled),
-                chunk = bytes.next() => chunk,
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            let chunk =
-                chunk.map_err(|error| stream_transport_error(&error, request_id.as_deref()))?;
-            for data in decoder
-                .push(&chunk)
-                .map_err(|error| attach_request_id(error, request_id.as_deref()))?
-            {
-                if data.trim() == "[DONE]" {
-                    done = true;
-                    break;
-                }
-                apply_stream_chunk(&data, &mut state, events)
-                    .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
-            }
-        }
-
-        for data in decoder
-            .finish()
-            .map_err(|error| attach_request_id(error, request_id.as_deref()))?
-        {
-            if data.trim() != "[DONE]" {
-                apply_stream_chunk(&data, &mut state, events)
-                    .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
-            }
-        }
-
-        if state.web_search_started {
-            let _ = events.send(AgentEvent::WebSearchFinished {
-                id: "glm_web_search".to_string(),
-                action: WebSearchAction::Other,
-            });
-        }
-        let citations = std::mem::take(&mut state.web_search_citations);
-        append_chat_citations(&mut state.content, citations, events);
-
-        let tool_calls = state
-            .tool_calls
-            .into_values()
-            .map(ToolCallBuilder::finish)
-            .collect::<Result<Vec<_>>>()
-            .map_err(|error| attach_request_id(error, request_id.as_deref()))?;
-        let stop_reason = resolve_chat_stop_reason(
-            state.finish_reason,
-            self.compat.finish_reason,
-            !tool_calls.is_empty(),
-            done,
-            request_id.as_deref(),
-        )?;
-
-        Ok(AssistantTurn {
-            content: (!state.content.is_empty()).then_some(state.content),
-            reasoning_content: (!state.reasoning.is_empty()).then_some(state.reasoning),
-            tool_calls,
-            response_items: Vec::new(),
-            usage: state.usage,
-            stop_reason,
-        })
-    }
-
     async fn stream_responses(
         &self,
         messages: &[ChatMessage],
@@ -466,10 +345,7 @@ impl OpenAiClient {
         features: StreamFeatures,
     ) -> Result<AssistantTurn> {
         let (instructions, input) = responses_input(messages)?;
-        let response_tools = responses_tools(
-            tools,
-            features.native_web_search && matches!(self.provider.as_str(), "xai" | "deepseek"),
-        );
+        let response_tools = responses_tools(tools, features.native_web_search);
         let has_tools = !response_tools.is_empty();
         let body = ResponsesRequest {
             model: &self.model,
@@ -485,13 +361,13 @@ impl OpenAiClient {
             reasoning: self
                 .reasoning_effort
                 .as_deref()
-                .filter(|_| self.compat.reasoning_effort)
                 .map(|effort| ResponsesReasoning {
                     effort,
-                    summary: "auto",
+                    summary: (self.provider == "xai").then_some("auto"),
                 }),
             max_output_tokens: max_tokens,
-            include: Some(&["reasoning.encrypted_content"]),
+            prompt_cache_key: (self.provider == "xai").then_some(self.prompt_cache_key.as_str()),
+            include: (self.provider == "xai").then_some(["reasoning.encrypted_content"].as_slice()),
             store: false,
             stream: true,
         };
@@ -585,6 +461,8 @@ struct ResponsesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<&'a [&'static str]>,
     store: bool,
     stream: bool,
@@ -593,7 +471,8 @@ struct ResponsesRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ResponsesReasoning<'a> {
     effort: &'a str,
-    summary: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -629,8 +508,6 @@ enum ResponsesTool {
         name: String,
         description: String,
         parameters: serde_json::Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        strict: Option<bool>,
     },
     WebSearch,
 }
@@ -714,41 +591,12 @@ fn responses_tools(definitions: &[ToolDefinition], include_web_search: bool) -> 
             name: definition.function.name.clone(),
             description: definition.function.description.clone(),
             parameters: definition.function.parameters.clone(),
-            strict: definition.function.strict,
         })
         .collect::<Vec<_>>();
     if include_web_search {
         tools.push(ResponsesTool::WebSearch);
     }
     tools
-}
-
-fn chat_tools(
-    definitions: &[ToolDefinition],
-    provider: &str,
-    include_web_search: bool,
-) -> Result<Vec<serde_json::Value>> {
-    let mut tools = definitions
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if include_web_search {
-        match provider {
-            "glm" => tools.push(serde_json::json!({
-                "type": "web_search",
-                "web_search": {
-                    "enable": true,
-                    "search_result": true
-                }
-            })),
-            "kimi" => tools.push(serde_json::json!({
-                "type": "builtin_function",
-                "function": {"name": "$web_search"}
-            })),
-            _ => {}
-        }
-    }
-    Ok(tools)
 }
 
 #[derive(Debug, Default)]
@@ -1271,398 +1119,18 @@ fn stream_transport_error(error: &reqwest::Error, request_id: Option<&str>) -> O
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: &'a [ApiMessage<'a>],
-    #[serde(skip_serializing_if = "<[serde_json::Value]>::is_empty")]
-    tools: &'a [serde_json::Value],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<ChatThinking>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u64>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<StreamOptions>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatThinking {
-    #[serde(rename = "type")]
-    kind: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ApiMessage<'a> {
-    role: MessageRole,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<ApiContent<'a>>,
-    #[serde(skip_serializing_if = "<[ToolCall]>::is_empty")]
-    tool_calls: &'a [ToolCall],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum ApiContent<'a> {
-    Text(&'a str),
-    Parts(Vec<ApiContentPart<'a>>),
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ApiContentPart<'a> {
-    Text { text: &'a str },
-    ImageUrl { image_url: ApiImageUrl },
-}
-
-#[derive(Debug, Serialize)]
-struct ApiImageUrl {
-    url: String,
-}
-
-impl<'a> From<&'a ChatMessage> for ApiMessage<'a> {
-    fn from(message: &'a ChatMessage) -> Self {
-        let content = if message.images.is_empty() {
-            message.content.as_deref().map(ApiContent::Text)
-        } else {
-            let mut parts = Vec::with_capacity(message.images.len() + 1);
-            if let Some(text) = message.content.as_deref().filter(|text| !text.is_empty()) {
-                parts.push(ApiContentPart::Text { text });
-            }
-            parts.extend(message.images.iter().map(|image| ApiContentPart::ImageUrl {
-                image_url: ApiImageUrl {
-                    url: image.data_url(),
-                },
-            }));
-            Some(ApiContent::Parts(parts))
-        };
-        Self {
-            role: message.role,
-            content,
-            tool_calls: &message.tool_calls,
-            tool_call_id: message.tool_call_id.as_deref(),
-            name: message.tool_name.as_deref(),
-            reasoning_content: message.reasoning_content.as_deref(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamChunk {
-    #[serde(default)]
-    choices: Vec<StreamChoice>,
-    #[serde(default)]
-    web_search: Vec<ChatWebSearchResult>,
-    usage: Option<ChatUsage>,
-    error: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatWebSearchResult {
-    #[serde(default)]
-    title: String,
-    #[serde(default, alias = "url")]
-    link: String,
-}
-
-#[derive(Debug, Default)]
-struct ChatAccumulator {
-    content: String,
-    reasoning: String,
-    tool_calls: BTreeMap<usize, ToolCallBuilder>,
-    web_search_citations: Vec<(String, String)>,
-    web_search_started: bool,
-    usage: Option<Usage>,
-    finish_reason: Option<AssistantStopReason>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
-    #[serde(default)]
-    total_tokens: u64,
-    prompt_cache_hit_tokens: Option<u64>,
-    prompt_tokens_details: Option<CachedTokenDetails>,
-}
-
-impl From<ChatUsage> for Usage {
-    fn from(usage: ChatUsage) -> Self {
-        Self {
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            cached_prompt_tokens: usage.prompt_cache_hit_tokens.or_else(|| {
-                usage
-                    .prompt_tokens_details
-                    .and_then(|details| details.cached_tokens)
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct CachedTokenDetails {
     cached_tokens: Option<u64>,
 }
-
-#[derive(Debug, Deserialize)]
-struct StreamChoice {
-    #[serde(default)]
-    delta: StreamDelta,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct StreamDelta {
-    content: Option<String>,
-    reasoning_content: Option<String>,
-    reasoning: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ToolCallDelta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCallDelta {
-    index: usize,
-    id: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    function: Option<FunctionDelta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FunctionDelta {
-    name: Option<String>,
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct ToolCallBuilder {
-    id: String,
-    kind: String,
-    name: String,
-    arguments: String,
-}
-
-impl ToolCallBuilder {
-    fn apply(&mut self, delta: ToolCallDelta) {
-        if let Some(id) = delta.id {
-            self.id.push_str(&id);
-        }
-        if let Some(kind) = delta.kind {
-            self.kind.push_str(&kind);
-        }
-        if let Some(function) = delta.function {
-            if let Some(name) = function.name {
-                self.name.push_str(&name);
-            }
-            if let Some(arguments) = function.arguments {
-                self.arguments.push_str(&arguments);
-            }
-        }
-    }
-
-    fn finish(self) -> Result<ToolCall> {
-        if self.id.is_empty() {
-            return Err(OpenAiError::Protocol(
-                "tool call completed without an id".to_string(),
-            ));
-        }
-        if self.name.is_empty() {
-            return Err(OpenAiError::Protocol(format!(
-                "tool call {} completed without a function name",
-                self.id
-            )));
-        }
-        Ok(ToolCall {
-            id: self.id,
-            kind: if self.kind.is_empty() {
-                "function".to_string()
-            } else {
-                self.kind
-            },
-            function: FunctionCall {
-                name: self.name,
-                arguments: self.arguments,
-            },
-        })
-    }
-}
-
-fn apply_stream_chunk(
-    data: &str,
-    state: &mut ChatAccumulator,
-    events: &mpsc::UnboundedSender<AgentEvent>,
-) -> Result<()> {
-    let chunk: StreamChunk = serde_json::from_str(data)
-        .map_err(|error| OpenAiError::Protocol(format!("invalid JSON event: {error}")))?;
-    if let Some(error) = chunk.error {
-        return Err(OpenAiError::Protocol(format!(
-            "provider returned a stream error: {error}"
-        )));
-    }
-    if let Some(next_usage) = chunk.usage {
-        state.usage = Some(next_usage.into());
-    }
-    for result in chunk.web_search {
-        if result.link.trim().is_empty() {
-            continue;
-        }
-        if !state.web_search_started {
-            state.web_search_started = true;
-            let _ = events.send(AgentEvent::WebSearchStarted {
-                id: "glm_web_search".to_string(),
-            });
-        }
-        let title = if result.title.trim().is_empty() {
-            result.link.clone()
-        } else {
-            result.title
-        };
-        state.web_search_citations.push((result.link, title));
-    }
-    for choice in chunk.choices {
-        if let Some(reason) = choice.finish_reason {
-            let next = map_chat_finish_reason(&reason)?;
-            if state.finish_reason.is_some_and(|current| current != next) {
-                return Err(OpenAiError::Protocol(format!(
-                    "provider returned conflicting finish reasons: {:?} and {reason:?}",
-                    state.finish_reason
-                )));
-            }
-            state.finish_reason = Some(next);
-        }
-        if let Some(text) = choice.delta.content {
-            state.content.push_str(&text);
-            let _ = events.send(AgentEvent::TextDelta { text });
-        }
-        if let Some(text) = choice.delta.reasoning_content.or(choice.delta.reasoning) {
-            state.reasoning.push_str(&text);
-        }
-        for delta in choice.delta.tool_calls {
-            state
-                .tool_calls
-                .entry(delta.index)
-                .or_default()
-                .apply(delta);
-        }
-    }
-    Ok(())
-}
-
-fn append_chat_citations(
-    content: &mut String,
-    citations: Vec<(String, String)>,
-    events: &mpsc::UnboundedSender<AgentEvent>,
-) {
-    let mut cited_urls = BTreeSet::new();
-    let sources = citations
-        .into_iter()
-        .filter(|(url, _)| cited_urls.insert(url.clone()))
-        .map(|(url, title)| {
-            let title = title.replace([']', '\n', '\r'], " ");
-            format!("- [{title}]({url})")
-        })
-        .collect::<Vec<_>>();
-    if sources.is_empty() {
-        return;
-    }
-    let text = format!("\n\nSources:\n{}", sources.join("\n"));
-    content.push_str(&text);
-    let _ = events.send(AgentEvent::TextDelta { text });
-}
-
-fn resolve_chat_stop_reason(
-    finish_reason: Option<AssistantStopReason>,
-    supports_finish_reason: bool,
-    has_tool_calls: bool,
-    reached_done: bool,
-    request_id: Option<&str>,
-) -> Result<AssistantStopReason> {
-    if let Some(reason) = finish_reason {
-        return Ok(reason);
-    }
-    if !supports_finish_reason {
-        return Ok(if has_tool_calls {
-            AssistantStopReason::ToolUse
-        } else {
-            AssistantStopReason::Stop
-        });
-    }
-    Err(stream_error(
-        if reached_done {
-            "Chat Completions stream reached [DONE] without finish_reason"
-        } else {
-            "Chat Completions stream ended without finish_reason"
-        },
-        request_id,
-    ))
-}
-
-fn map_chat_finish_reason(reason: &str) -> Result<AssistantStopReason> {
-    match reason {
-        "stop" | "end" | "end_turn" => Ok(AssistantStopReason::Stop),
-        "length" | "max_tokens" => Ok(AssistantStopReason::Length),
-        "tool_calls" | "function_call" => Ok(AssistantStopReason::ToolUse),
-        "content_filter" | "network_error" => Err(OpenAiError::Protocol(format!(
-            "provider finish_reason: {reason}"
-        ))),
-        _ => Err(OpenAiError::Protocol(format!(
-            "unknown provider finish_reason: {reason}"
-        ))),
-    }
-}
-
-fn api_endpoint_url(base_url: &str, api: ApiProtocol) -> Result<Url> {
-    match api {
-        ApiProtocol::ChatCompletions => chat_completions_url(base_url),
-        ApiProtocol::Responses => responses_url(base_url),
-    }
-}
-
-fn chat_completions_url(base_url: &str) -> Result<Url> {
-    endpoint_url(base_url, "chat/completions")
-}
-
-fn responses_url(base_url: &str) -> Result<Url> {
-    endpoint_url(base_url, "responses")
-}
-
-fn endpoint_url(base_url: &str, path: &str) -> Result<Url> {
+fn api_endpoint_url(base_url: &str) -> Result<Url> {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(OpenAiError::Protocol(
             "base URL cannot be empty".to_string(),
         ));
     }
-    let endpoint = if trimmed.ends_with(&format!("/{path}")) {
-        trimmed.to_string()
-    } else {
-        let root = trimmed
-            .strip_suffix("/chat/completions")
-            .or_else(|| trimmed.strip_suffix("/responses"))
-            .unwrap_or(trimmed);
-        format!("{root}/{path}")
-    };
-    Ok(Url::parse(&endpoint)?)
+    Ok(Url::parse(&format!("{trimmed}/responses"))?)
 }
 
 fn summarize_error_body(body: &str) -> String {
@@ -1852,96 +1320,12 @@ mod tests {
     }
 
     #[test]
-    fn maps_only_known_chat_finish_reasons() {
-        assert_eq!(
-            map_chat_finish_reason("stop").unwrap(),
-            AssistantStopReason::Stop
-        );
-        assert_eq!(
-            map_chat_finish_reason("length").unwrap(),
-            AssistantStopReason::Length
-        );
-        assert_eq!(
-            map_chat_finish_reason("tool_calls").unwrap(),
-            AssistantStopReason::ToolUse
-        );
-        assert!(map_chat_finish_reason("content_filter").is_err());
-        assert!(map_chat_finish_reason("unexpected").is_err());
-    }
-
-    #[test]
-    fn builds_native_search_tools_for_supported_provider_protocols() {
+    fn builds_responses_web_search_tool() {
         assert_eq!(
             serde_json::to_value(responses_tools(&[], true)).unwrap(),
             serde_json::json!([{"type": "web_search"}])
         );
         assert!(responses_tools(&[], false).is_empty());
-
-        let glm = chat_tools(&[], "glm", true).unwrap();
-        assert_eq!(
-            glm,
-            vec![serde_json::json!({
-                "type": "web_search",
-                "web_search": {"enable": true, "search_result": true}
-            })]
-        );
-        let kimi = chat_tools(&[], "kimi", true).unwrap();
-        assert_eq!(
-            kimi,
-            vec![serde_json::json!({
-                "type": "builtin_function",
-                "function": {"name": "$web_search"}
-            })]
-        );
-        let messages = Vec::<ApiMessage<'_>>::new();
-        let request = ChatRequest {
-            model: "kimi-test",
-            messages: &messages,
-            tools: &kimi,
-            tool_choice: None,
-            reasoning_effort: None,
-            thinking: Some(ChatThinking { kind: "disabled" }),
-            max_tokens: None,
-            stream: true,
-            stream_options: None,
-        };
-        let request = serde_json::to_value(request).unwrap();
-        assert_eq!(request["thinking"]["type"], "disabled");
-        assert!(request.get("reasoning_effort").is_none());
-
-        let message = ChatMessage::named_tool_with_file_change(
-            "call_search",
-            "$web_search",
-            r#"{"query":"Rust"}"#,
-            None,
-        );
-        let api_message = serde_json::to_value(ApiMessage::from(&message)).unwrap();
-        assert_eq!(api_message["name"], "$web_search");
-
-        let mut builder = ToolCallBuilder::default();
-        builder.apply(ToolCallDelta {
-            index: 0,
-            id: Some("call_search".to_string()),
-            kind: Some("builtin_function".to_string()),
-            function: Some(FunctionDelta {
-                name: Some("$web_search".to_string()),
-                arguments: Some(r#"{"query":"Rust"}"#.to_string()),
-            }),
-        });
-        assert_eq!(builder.finish().unwrap().kind, "builtin_function");
-    }
-
-    #[test]
-    fn infers_chat_stop_only_when_finish_reasons_are_disabled() {
-        assert_eq!(
-            resolve_chat_stop_reason(None, false, false, true, None).unwrap(),
-            AssistantStopReason::Stop
-        );
-        assert_eq!(
-            resolve_chat_stop_reason(None, false, true, false, None).unwrap(),
-            AssistantStopReason::ToolUse
-        );
-        assert!(resolve_chat_stop_reason(None, true, false, true, None).is_err());
     }
 
     #[test]
@@ -1969,17 +1353,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_cached_tokens_from_chat_and_responses_usage() {
+    fn parses_cached_tokens_from_responses_usage() {
         let (events, _receiver) = mpsc::unbounded_channel();
-        let mut chat = ChatAccumulator::default();
-        apply_stream_chunk(
-            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}"#,
-            &mut chat,
-            &events,
-        )
-        .unwrap();
-        assert_eq!(chat.usage.unwrap().cached_prompt_tokens, Some(80));
-
         let mut state = ResponsesAccumulator::default();
         apply_responses_stream_event(
             r#"{"type":"response.completed","response":{"usage":{"input_tokens":200,"output_tokens":30,"total_tokens":230,"input_tokens_details":{"cached_tokens":160}},"output":[]}}"#,

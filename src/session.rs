@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::config::{ApiProtocol, AppConfig, ReasoningEffort, mcode_home_dir};
+use crate::config::{AppConfig, ReasoningEffort, mcode_home_dir};
 use crate::protocol::{ChatMessage, MessageRole, ToolCall, Usage};
 
 const SESSION_VERSION: u32 = 4;
@@ -24,7 +24,6 @@ const SESSION_VERSION: u32 = 4;
 pub struct SessionMetadata {
     pub provider: String,
     pub model: String,
-    pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
 }
 
@@ -33,7 +32,6 @@ impl From<&AppConfig> for SessionMetadata {
         Self {
             provider: config.provider.clone(),
             model: config.model.clone(),
-            api: config.api,
             reasoning_effort: config.reasoning_effort,
         }
     }
@@ -137,7 +135,6 @@ pub struct SessionSummary {
     pub created_at: u64,
     pub provider: String,
     pub model: String,
-    pub api: ApiProtocol,
     pub reasoning_effort: ReasoningEffort,
     pub message_count: usize,
     pub total_usage: Usage,
@@ -220,7 +217,6 @@ enum SessionRecord {
     ModelChanged {
         provider: String,
         model: String,
-        api: ApiProtocol,
     },
     ReasoningChanged {
         reasoning_effort: ReasoningEffort,
@@ -364,7 +360,6 @@ impl Session {
                     created_at: session.created_at,
                     provider: session.metadata.provider,
                     model: session.metadata.model,
-                    api: session.metadata.api,
                     reasoning_effort: session.metadata.reasoning_effort,
                     message_count: session.messages.len(),
                     total_usage: session.total_usage,
@@ -668,14 +663,9 @@ impl Session {
                     }
                     active_run = None;
                 }
-                SessionRecord::ModelChanged {
-                    provider,
-                    model,
-                    api,
-                } => {
+                SessionRecord::ModelChanged { provider, model } => {
                     metadata.provider = provider;
                     metadata.model = model;
-                    metadata.api = api;
                 }
                 SessionRecord::ReasoningChanged {
                     reasoning_effort: next_effort,
@@ -817,27 +807,21 @@ impl Session {
         Ok(())
     }
 
-    pub fn set_model(&mut self, provider: &str, model: &str, api: ApiProtocol) -> Result<()> {
-        if self.metadata.provider == provider
-            && self.metadata.model == model
-            && self.metadata.api == api
-        {
+    pub fn set_model(&mut self, provider: &str, model: &str) -> Result<()> {
+        if self.metadata.provider == provider && self.metadata.model == model {
             return Ok(());
         }
         if self.path.is_none() {
             self.metadata.provider = provider.to_string();
             self.metadata.model = model.to_string();
-            self.metadata.api = api;
             return Ok(());
         }
         self.persist_record(&SessionRecord::ModelChanged {
             provider: provider.to_string(),
             model: model.to_string(),
-            api,
         })?;
         self.metadata.provider = provider.to_string();
         self.metadata.model = model.to_string();
-        self.metadata.api = api;
         Ok(())
     }
 
@@ -1270,11 +1254,6 @@ impl Session {
     }
 
     #[must_use]
-    pub const fn api(&self) -> ApiProtocol {
-        self.metadata.api
-    }
-
-    #[must_use]
     pub const fn reasoning_effort(&self) -> ReasoningEffort {
         self.metadata.reasoning_effort
     }
@@ -1667,7 +1646,6 @@ mod tests {
         let metadata = SessionMetadata {
             provider: "deepseek".to_string(),
             model: "test-model".to_string(),
-            api: ApiProtocol::Responses,
             reasoning_effort: ReasoningEffort::Low,
         };
 
@@ -1681,9 +1659,7 @@ mod tests {
         assert!(!directory.exists());
 
         let mut session = Session::new_pending(cwd, metadata, Some(base.path().to_path_buf()));
-        session
-            .set_model("xai", "grok-test", ApiProtocol::Responses)
-            .unwrap();
+        session.set_model("xai", "grok-test").unwrap();
         session.set_reasoning_effort(ReasoningEffort::High).unwrap();
         assert!(session.path().is_none());
         assert!(!directory.exists());
@@ -1708,7 +1684,6 @@ mod tests {
         let metadata = SessionMetadata {
             provider: "deepseek".to_string(),
             model: "test-model".to_string(),
-            api: ApiProtocol::Responses,
             reasoning_effort: ReasoningEffort::High,
         };
         let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();
@@ -1768,7 +1743,6 @@ mod tests {
         let metadata = SessionMetadata {
             provider: "deepseek".to_string(),
             model: "test-model".to_string(),
-            api: ApiProtocol::Responses,
             reasoning_effort: ReasoningEffort::High,
         };
         let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();
@@ -1809,7 +1783,6 @@ mod tests {
         let metadata = SessionMetadata {
             provider: "deepseek".to_string(),
             model: "test-model".to_string(),
-            api: ApiProtocol::Responses,
             reasoning_effort: ReasoningEffort::High,
         };
         let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();

@@ -202,7 +202,6 @@ impl ToolRegistry {
                         "required": ["path", "offset", "limit"],
                         "additionalProperties": false
                     }),
-                    strict: Some(true),
                 },
             },
             ToolDefinition {
@@ -219,7 +218,6 @@ impl ToolRegistry {
                         "required": ["path", "content"],
                         "additionalProperties": false
                     }),
-                    strict: Some(true),
                 },
             },
             ToolDefinition {
@@ -238,7 +236,6 @@ impl ToolRegistry {
                         "required": ["path", "old_text", "new_text", "replace_all"],
                         "additionalProperties": false
                     }),
-                    strict: Some(true),
                 },
             },
             ToolDefinition {
@@ -259,7 +256,6 @@ impl ToolRegistry {
                         "required": ["command", "timeout_seconds"],
                         "additionalProperties": false
                     }),
-                    strict: Some(true),
                 },
             },
         ]
@@ -375,7 +371,6 @@ impl ToolRegistry {
                     name: exposed_name.clone(),
                     description,
                     parameters: serde_json::Value::Object((*tool.input_schema).clone()),
-                    strict: None,
                 },
             });
             self.mcp_routes.insert(
