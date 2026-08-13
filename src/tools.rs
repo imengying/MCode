@@ -4,7 +4,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rmcp::model::{CallToolRequestParams, CallToolResult};
+use futures_util::future::join_all;
+use rmcp::model::{CallToolRequestParams, CallToolResult, Tool as McpTool};
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
@@ -40,6 +41,8 @@ pub struct ToolRegistry {
     mcp_servers: Vec<McpService>,
     mcp_routes: BTreeMap<String, McpToolRoute>,
     mcp_startup_failures: Vec<McpStartupFailure>,
+    mcp_startup_rx: Option<mpsc::UnboundedReceiver<PreparedMcpServer>>,
+    mcp_startups_remaining: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,6 +57,11 @@ type McpService = RunningService<RoleClient, ()>;
 struct McpToolRoute {
     server_index: usize,
     tool_name: String,
+}
+
+struct PreparedMcpServer {
+    name: String,
+    result: Result<(McpService, Vec<McpTool>), String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,25 +120,108 @@ impl ToolRegistry {
             mcp_servers: Vec::new(),
             mcp_routes: BTreeMap::new(),
             mcp_startup_failures: Vec::new(),
+            mcp_startup_rx: None,
+            mcp_startups_remaining: 0,
         })
     }
 
     pub async fn with_mcp(root: impl AsRef<Path>, servers: &[McpServerConfig]) -> Result<Self> {
         let mut registry = Self::new(root)?;
-        for server in servers {
-            let result = async {
-                let service = connect_mcp_server(server, &registry.root).await?;
-                registry.register_mcp_server(&server.name, service).await
-            }
-            .await;
-            if let Err(error) = result {
-                registry.mcp_startup_failures.push(McpStartupFailure {
-                    server: server.name.clone(),
-                    message: format!("{error:#}"),
-                });
-            }
+        let results = join_all(
+            servers
+                .iter()
+                .map(|server| prepare_mcp_server(server, &registry.root)),
+        )
+        .await;
+        for (server, result) in servers.iter().zip(results) {
+            registry.finish_mcp_startup(
+                server.name.clone(),
+                result.map_err(|error| format!("{error:#}")),
+            );
         }
         Ok(registry)
+    }
+
+    pub fn with_deferred_mcp(root: impl AsRef<Path>, servers: &[McpServerConfig]) -> Result<Self> {
+        let mut registry = Self::new(root)?;
+        if servers.is_empty() {
+            return Ok(registry);
+        }
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for server in servers.iter().cloned() {
+            let root = registry.root.clone();
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let name = server.name.clone();
+                let result = prepare_mcp_server(&server, &root)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(PreparedMcpServer { name, result });
+            });
+        }
+        drop(sender);
+        registry.mcp_startups_remaining = servers.len();
+        registry.mcp_startup_rx = Some(receiver);
+        Ok(registry)
+    }
+
+    pub fn poll_mcp_startup(&mut self) -> bool {
+        let mut completed = Vec::new();
+        let mut disconnected = false;
+        if let Some(receiver) = self.mcp_startup_rx.as_mut() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => completed.push(result),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.mcp_startup_rx = None;
+        }
+        let changed = !completed.is_empty();
+        for completed in completed {
+            self.mcp_startups_remaining = self.mcp_startups_remaining.saturating_sub(1);
+            self.finish_mcp_startup(completed.name, completed.result);
+        }
+        if disconnected {
+            self.mcp_startups_remaining = 0;
+        }
+        changed
+    }
+
+    #[must_use]
+    pub const fn mcp_startups_remaining(&self) -> usize {
+        self.mcp_startups_remaining
+    }
+
+    pub async fn wait_for_mcp_startup(&mut self, cancel: &CancellationToken) {
+        while self.mcp_startups_remaining > 0 {
+            let result = match self.mcp_startup_rx.as_mut() {
+                Some(receiver) => {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = receiver.recv() => result,
+                    }
+                }
+                None => break,
+            };
+            let Some(result) = result else {
+                self.mcp_startups_remaining = 0;
+                self.mcp_startup_rx = None;
+                break;
+            };
+            self.mcp_startups_remaining = self.mcp_startups_remaining.saturating_sub(1);
+            self.finish_mcp_startup(result.name, result.result);
+        }
+        if self.mcp_startups_remaining == 0 {
+            self.mcp_startup_rx = None;
+        }
     }
 
     #[must_use]
@@ -340,18 +431,21 @@ impl ToolRegistry {
         }
     }
 
-    async fn register_mcp_server(&mut self, server_name: &str, service: McpService) -> Result<()> {
-        const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+    fn finish_mcp_startup(
+        &mut self,
+        server_name: String,
+        result: Result<(McpService, Vec<McpTool>), String>,
+    ) {
+        match result {
+            Ok((service, tools)) => self.register_mcp_server(&server_name, service, tools),
+            Err(message) => self.mcp_startup_failures.push(McpStartupFailure {
+                server: server_name,
+                message,
+            }),
+        }
+    }
 
-        let tools = tokio::time::timeout(DISCOVERY_TIMEOUT, service.peer().list_all_tools())
-            .await
-            .with_context(|| {
-                format!(
-                    "MCP server {server_name:?} did not list tools within {} seconds",
-                    DISCOVERY_TIMEOUT.as_secs()
-                )
-            })?
-            .with_context(|| format!("failed to list tools from MCP server {server_name:?}"))?;
+    fn register_mcp_server(&mut self, server_name: &str, service: McpService, tools: Vec<McpTool>) {
         let server_index = self.mcp_servers.len();
         let mut used_names = self
             .definitions
@@ -382,7 +476,6 @@ impl ToolRegistry {
             );
         }
         self.mcp_servers.push(service);
-        Ok(())
     }
 
     async fn execute_mcp(
@@ -771,6 +864,26 @@ async fn connect_mcp_server(server: &McpServerConfig, root: &Path) -> Result<Mcp
             bail!("{detail}; stderr: {stderr}");
         }
     }
+}
+
+async fn prepare_mcp_server(
+    server: &McpServerConfig,
+    root: &Path,
+) -> Result<(McpService, Vec<McpTool>)> {
+    const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+    let service = connect_mcp_server(server, root).await?;
+    let tools = tokio::time::timeout(DISCOVERY_TIMEOUT, service.peer().list_all_tools())
+        .await
+        .with_context(|| {
+            format!(
+                "MCP server {:?} did not list tools within {} seconds",
+                server.name,
+                DISCOVERY_TIMEOUT.as_secs()
+            )
+        })?
+        .with_context(|| format!("failed to list tools from MCP server {:?}", server.name))?;
+    Ok((service, tools))
 }
 
 async fn capture_mcp_stderr(mut stderr: ChildStderr) -> String {
@@ -1207,6 +1320,25 @@ mod tests {
 
         assert!(result.is_error);
         assert!(!project.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn deferred_mcp_startup_reports_failures_without_blocking_construction() {
+        let project = tempdir().unwrap();
+        let server = McpServerConfig {
+            name: "missing".to_string(),
+            command: project.path().join("does-not-exist").display().to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        };
+
+        let mut tools = ToolRegistry::with_deferred_mcp(project.path(), &[server]).unwrap();
+        assert_eq!(tools.mcp_startups_remaining(), 1);
+        tools.wait_for_mcp_startup(&CancellationToken::new()).await;
+
+        assert_eq!(tools.mcp_startups_remaining(), 0);
+        assert_eq!(tools.mcp_startup_failures().len(), 1);
+        assert_eq!(tools.mcp_server_count(), 0);
     }
 
     #[tokio::test]

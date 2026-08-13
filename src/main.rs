@@ -4,7 +4,9 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use mcode::agent::{Agent, RunStatus};
-use mcode::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
+use mcode::approval::{
+    ApprovalDecision, ApprovalGate, ApprovalRequest, SensitiveTextRedactor, format_tool_arguments,
+};
 use mcode::cli::{Cli, Command, join_prompt};
 use mcode::config::{AppConfig, ConfigOverrides, McpServerConfig};
 use mcode::event::{AgentEvent, CompactionReason};
@@ -60,7 +62,26 @@ async fn run() -> Result<()> {
             run_exec(agent, prompt, images, args.json, bypass_approvals).await
         }
         Some(Command::Resume(args)) => {
-            let session = Session::resume(&config.cwd, args.session.as_deref())?;
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+            let selector = if let Some(selector) = args.session {
+                selector
+            } else {
+                let sessions = Session::list(&config.cwd)?;
+                match sessions.as_slice() {
+                    [] => bail!("当前目录没有可恢复的会话"),
+                    [session] => session.id.to_string(),
+                    _ if interactive => {
+                        let Some(selector) = mcode::ui::select_session(sessions)? else {
+                            return Ok(());
+                        };
+                        selector
+                    }
+                    _ => {
+                        bail!("当前目录有多个会话；非交互模式请使用 mcode resume <SESSION_ID>")
+                    }
+                }
+            };
+            let session = Session::resume(&config.cwd, Some(&selector))?;
             let saved_model = session.model_selector();
             match (model_was_overridden, reasoning_was_overridden) {
                 (false, false) => {
@@ -74,9 +95,12 @@ async fn run() -> Result<()> {
             }
             let prompt = join_prompt(&args.prompt);
             let images = load_images(&cli.images, &config.cwd)?;
-            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
             prepare_mcp_servers(&mut config, bypass_approvals, interactive);
-            let agent = Agent::new(&config, session).await?;
+            let agent = if interactive {
+                Agent::new_deferred_mcp(&config, session).await?
+            } else {
+                Agent::new(&config, session).await?
+            };
             if interactive {
                 mcode::ui::run_interactive(agent, prompt, images, bypass_approvals)
             } else if agent.has_pending_run() {
@@ -110,7 +134,7 @@ async fn run() -> Result<()> {
             prepare_mcp_servers(&mut config, bypass_approvals, true);
             let session =
                 Session::create(&config.cwd, SessionMetadata::from(&config), !cli.no_session)?;
-            let agent = Agent::new(&config, session).await?;
+            let agent = Agent::new_deferred_mcp(&config, session).await?;
             let images = load_images(&cli.images, &config.cwd)?;
             mcode::ui::run_interactive(agent, root_prompt, images, bypass_approvals)
         }
@@ -500,6 +524,7 @@ async fn run_exec(
 
     let mut streamed_text = false;
     let mut streamed_tool_output_needs_newline = false;
+    let mut tool_redactor = SensitiveTextRedactor::default();
     while let Some(event) = rx.recv().await {
         if json {
             println!(
@@ -549,15 +574,24 @@ async fn run_exec(
                     streamed_text = false;
                 }
                 streamed_tool_output_needs_newline = false;
+                tool_redactor = SensitiveTextRedactor::default();
                 eprintln!("[工具] {}", sanitize_terminal_text(&name));
             }
             AgentEvent::ToolOutputDelta { delta, .. } => {
-                let delta = sanitize_terminal_text(&delta);
-                eprint!("{delta}");
-                io::stderr().flush().context("刷新标准错误失败")?;
-                streamed_tool_output_needs_newline = !delta.ends_with('\n');
+                let ready = tool_redactor.push(&sanitize_terminal_text(&delta));
+                if !ready.is_empty() {
+                    eprint!("{ready}");
+                    io::stderr().flush().context("刷新标准错误失败")?;
+                    streamed_tool_output_needs_newline = !ready.ends_with('\n');
+                }
             }
             AgentEvent::ToolFinished { name, is_error, .. } => {
+                let pending = tool_redactor.finish();
+                if !pending.is_empty() {
+                    eprint!("{pending}");
+                    io::stderr().flush().context("刷新标准错误失败")?;
+                    streamed_tool_output_needs_newline = !pending.ends_with('\n');
+                }
                 if streamed_tool_output_needs_newline {
                     eprintln!();
                 }

@@ -704,9 +704,11 @@ impl Session {
 
         let missing_newline = valid_len > 0 && bytes.get(valid_len - 1) != Some(&b'\n');
         if (recovered_tail || missing_newline)
-            && let Some(file) = writer.as_mut()
+            && let Some(file) = writer.take()
         {
-            repair_session_tail(file, path, valid_len, missing_newline)?;
+            let repaired = repair_session_tail(path, &bytes, valid_len, missing_newline)?;
+            drop(file);
+            writer = Some(repaired);
         }
 
         Ok(Self {
@@ -1400,27 +1402,49 @@ fn append_record(file: &mut File, path: &Path, record: &SessionRecord) -> Result
 }
 
 fn repair_session_tail(
-    file: &mut File,
     path: &Path,
+    bytes: &[u8],
     valid_len: usize,
     add_newline: bool,
-) -> Result<()> {
-    let valid_len = u64::try_from(valid_len).context("session is too large to recover")?;
-    file.set_len(valid_len).with_context(|| {
-        format!(
-            "failed to truncate damaged session tail: {}",
-            path.display()
-        )
-    })?;
-    file.sync_data()
-        .with_context(|| format!("failed to flush recovered session: {}", path.display()))?;
-    if add_newline {
-        file.write_all(b"\n")
-            .with_context(|| format!("failed to finish session recovery: {}", path.display()))?;
-        file.sync_data()
+) -> Result<SessionWriter> {
+    let valid_bytes = bytes
+        .get(..valid_len)
+        .ok_or_else(|| anyhow!("invalid recovery boundary for {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("session path has no parent: {}", path.display()))?;
+    let temporary = parent.join(format!(".{}.repair", Uuid::now_v7()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("failed to create recovered session: {}", path.display()))?;
+        file.try_lock()
+            .with_context(|| format!("failed to lock recovered session: {}", path.display()))?;
+        file.write_all(valid_bytes)
+            .with_context(|| format!("failed to write recovered session: {}", path.display()))?;
+        if add_newline {
+            file.write_all(b"\n").with_context(|| {
+                format!("failed to finish session recovery: {}", path.display())
+            })?;
+        }
+        file.sync_all()
             .with_context(|| format!("failed to flush recovered session: {}", path.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to atomically repair session: {}", path.display()))?;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync session directory: {}", parent.display()))?;
+        Ok(SessionWriter(file))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 
 fn default_session_base() -> Result<PathBuf> {
@@ -1804,5 +1828,45 @@ mod tests {
         let resumed =
             Session::resume_in(base.path(), project.path(), Some(&id.to_string())).unwrap();
         assert_eq!(resumed.messages(), [ChatMessage::user("写入文件")]);
+    }
+
+    #[test]
+    fn repairs_an_incomplete_tail_before_reopening_the_writer() {
+        let base = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let metadata = SessionMetadata {
+            provider: "deepseek".to_string(),
+            model: "test-model".to_string(),
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let session = Session::create_in(base.path(), project.path(), metadata).unwrap();
+        let id = session.id();
+        let path = session.path().unwrap().to_path_buf();
+        drop(session);
+
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"kind":"message","message"#).unwrap();
+        drop(file);
+
+        let mut resumed =
+            Session::resume_in(base.path(), project.path(), Some(&id.to_string())).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with('\n'));
+        resumed
+            .begin_run(ChatMessage::user("after repair"))
+            .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .all(|entry| entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "repair"))
+        );
     }
 }

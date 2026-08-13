@@ -151,6 +151,9 @@ mcode update
 mcode delete <SESSION_ID> --force
 ```
 
+`mcode resume` 在当前项目只有一个会话时直接恢复；有多个会话时打开选择器。也可传入
+会话 ID，或使用 `mcode resume last` 明确恢复最新会话。
+
 仅在完全可信、已隔离的自动化环境中使用：
 
 ```bash

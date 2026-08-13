@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
@@ -29,19 +30,22 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_crossterm::CrosstermBackend;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents, get_mime_types};
 
 use crate::agent::{Agent, ModelChoice};
-use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments};
+use crate::approval::{
+    ApprovalDecision, ApprovalGate, ApprovalRequest, format_tool_arguments, redact_sensitive_text,
+};
 use crate::compaction::{estimate_message_tokens, estimate_text_tokens};
 use crate::config::ReasoningEffort;
 use crate::event::{AgentEvent, CompactionReason};
 use crate::highlight::highlight_code;
 use crate::latex::{render_display, render_inline};
 use crate::protocol::{
-    ChatMessage, FileChangeKind, FileChangeLineKind, FileChangeSummary, ImageAttachment,
-    MAX_IMAGE_BYTES, MessageRole, Usage, sanitize_terminal_text,
+    ChatMessage, FileChangeKind, FileChangeLine, FileChangeLineKind, FileChangeSummary,
+    ImageAttachment, MAX_IMAGE_BYTES, MessageRole, Usage, sanitize_terminal_text,
 };
 use crate::sandbox::PermissionProfile;
 use crate::session::{Session, SessionSummary};
@@ -65,6 +69,8 @@ const TOOL_ARGUMENT_PREVIEW_LINES: usize = 2;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
 const X11_CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(500);
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const AGENT_EVENT_BUDGET: usize = 256;
+const BACKGROUND_EVENT_BUDGET: usize = 16;
 const ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTEXT_BASELINE_TOKENS: u64 = 12_000;
@@ -88,6 +94,13 @@ const CLIPBOARD_IMAGE_TYPES: [(&str, &str); 4] = [
     ("image/gif", "gif"),
     ("image/webp", "webp"),
 ];
+
+#[derive(Debug)]
+enum BackgroundEvent {
+    WorkspaceIndexed { generation: u64, files: Vec<String> },
+    DiffLoaded(std::result::Result<String, String>),
+    Terminate,
+}
 
 pub fn run_interactive(
     mut agent: Agent,
@@ -135,8 +148,13 @@ pub fn run_interactive(
             failure.server, failure.message
         ));
     }
+    let mut reported_mcp_failures = agent.mcp_startup_failures().len();
     let agent = Arc::new(Mutex::new(agent));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+    start_workspace_index(&mut state, &background_tx);
+    #[cfg(unix)]
+    let termination_task = start_termination_listener(&background_tx);
     let (channel_gate, mut approval_rx) = ApprovalGate::channel();
     let approvals = if bypass_approvals {
         ApprovalGate::allow_all()
@@ -168,6 +186,7 @@ pub fn run_interactive(
     state.protect_resumed_turn();
     state.hold_pending_tools(&pending_tool_ids);
     let mut active_cancel = None;
+    let mut pending_agent_event = None;
     if has_pending_run {
         if let Some(prompt) = initial_prompt.filter(|prompt| !prompt.trim().is_empty()) {
             state.editor.insert_str(&prompt);
@@ -199,18 +218,69 @@ pub fn run_interactive(
     let mut last_frame = now.checked_sub(FRAME_INTERVAL).unwrap_or(now);
     let mut needs_draw = true;
     'ui: loop {
+        if let Ok(mut current_agent) = agent.try_lock() {
+            let polled = current_agent.poll_mcp_startup();
+            let mcp_changed = polled
+                || state.mcp_server_count != current_agent.mcp_server_count()
+                || state.mcp_tool_count != current_agent.mcp_tool_count()
+                || state.mcp_startups_remaining != current_agent.mcp_startups_remaining()
+                || reported_mcp_failures != current_agent.mcp_startup_failures().len();
+            if mcp_changed {
+                state.sync_from_agent(&current_agent);
+                for failure in current_agent
+                    .mcp_startup_failures()
+                    .iter()
+                    .skip(reported_mcp_failures)
+                {
+                    state.push_error(format!(
+                        "MCP 服务器 {:?} 启动失败，已禁用：{}",
+                        failure.server, failure.message
+                    ));
+                }
+                reported_mcp_failures = current_agent.mcp_startup_failures().len();
+                needs_draw = true;
+            }
+        }
         if state.expire_quit_shortcut() {
             needs_draw = true;
         }
-        while let Ok(agent_event) = event_rx.try_recv() {
+        if drain_agent_events(
+            &mut event_rx,
+            &mut pending_agent_event,
+            &mut state,
+            AGENT_EVENT_BUDGET,
+        ) > 0
+        {
             needs_draw = true;
-            state.apply_agent_event(agent_event);
             if !state.running {
                 active_cancel = None;
                 if let Some(request) = pending_approval.take() {
                     request.resolve(ApprovalDecision::Deny);
                 }
                 state.clear_pending_approval();
+            }
+        }
+        for _ in 0..BACKGROUND_EVENT_BUDGET {
+            let Ok(background_event) = background_rx.try_recv() else {
+                break;
+            };
+            needs_draw = true;
+            match background_event {
+                BackgroundEvent::WorkspaceIndexed { generation, files } => {
+                    state.finish_workspace_index(generation, files);
+                }
+                BackgroundEvent::DiffLoaded(Ok(diff)) => state.push_notice(diff),
+                BackgroundEvent::DiffLoaded(Err(error)) => state.push_error(error),
+                BackgroundEvent::Terminate => {
+                    if let Some(cancel) = active_cancel.take() {
+                        cancel.cancel();
+                    }
+                    if let Some(request) = pending_approval.take() {
+                        request.resolve(ApprovalDecision::Deny);
+                    }
+                    state.clear_pending_approval();
+                    break 'ui;
+                }
             }
         }
         if state.advance_usage_animation(Instant::now()) {
@@ -240,6 +310,11 @@ pub fn run_interactive(
         }
 
         if needs_draw {
+            if state.history_rebuild == HistoryRebuild::Required {
+                let size = terminal.backend().size().context("读取终端尺寸失败")?;
+                rebuild_ui_terminal_history(&mut terminal, &mut state, size.width, size.height)?;
+                state.history_rebuild = HistoryRebuild::Clean;
+            }
             ensure_ui_terminal_capacity(&mut terminal, &state)?;
             archive_transcript_overflow(&mut terminal, &mut state)?;
             ensure_ui_terminal_capacity(&mut terminal, &state)?;
@@ -432,10 +507,10 @@ pub fn run_interactive(
                         state.clear_view();
                         terminal = create_ui_terminal(compact_viewport)?;
                     }
-                    UiAction::ShowDiff => match workspace_diff(&state.cwd) {
-                        Ok(diff) => state.push_notice(diff),
-                        Err(error) => state.push_error(format!("{error:#}")),
-                    },
+                    UiAction::ShowDiff => start_workspace_diff(&state.cwd, &background_tx),
+                    UiAction::RefreshWorkspaceIndex => {
+                        start_workspace_index(&mut state, &background_tx);
+                    }
                     UiAction::PasteClipboard => paste_from_clipboard(&mut state),
                     UiAction::ResolveApproval(decision) => {
                         if let Some(request) = pending_approval.take() {
@@ -457,7 +532,7 @@ pub fn run_interactive(
             Event::FocusGained => needs_draw = true,
             Event::Resize(width, height) => {
                 if compact_viewport {
-                    resize_ui_terminal(&mut terminal, width, height)?;
+                    rebuild_ui_terminal_for_resize(&mut terminal, &mut state, width, height)?;
                 } else {
                     terminal = create_ui_terminal(false)?;
                 }
@@ -470,6 +545,8 @@ pub fn run_interactive(
     clear_terminal_view(&mut terminal)?;
     drop(terminal);
     drop(screen);
+    #[cfg(unix)]
+    termination_task.abort();
     if let Some(id) = deleted_session {
         println!("已删除会话 {id}。");
     } else if let Some((id, _)) =
@@ -480,9 +557,170 @@ pub fn run_interactive(
     Ok(())
 }
 
+#[cfg(unix)]
+fn start_termination_listener(
+    events: &mpsc::UnboundedSender<BackgroundEvent>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let events = events.clone();
+    tokio::spawn(async move {
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+            return;
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+        let _ = events.send(BackgroundEvent::Terminate);
+    })
+}
+
+pub fn select_session(sessions: Vec<SessionSummary>) -> Result<Option<String>> {
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+    let mut picker = SessionPicker {
+        sessions,
+        selection: 0,
+    };
+    let screen = ScreenGuard::enter()?;
+    let mut terminal = create_ui_terminal(false)?;
+    #[cfg(unix)]
+    let (termination_tx, mut termination_rx) = mpsc::unbounded_channel();
+    #[cfg(unix)]
+    let termination_task = start_termination_listener(&termination_tx);
+
+    let selected = loop {
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    Block::default().style(Style::default().fg(THEME_TEXT).bg(THEME_BASE)),
+                    area,
+                );
+                let height = u16::try_from(picker.sessions.len().min(MAX_SESSION_PICKER_ROWS) + 5)
+                    .unwrap_or(u16::MAX)
+                    .min(area.height);
+                let picker_area = Rect::new(
+                    area.x,
+                    area.y
+                        .saturating_add(area.height.saturating_sub(height) / 2),
+                    area.width,
+                    height,
+                );
+                render_session_picker(frame, &picker, picker_area);
+            })
+            .context("绘制会话选择器失败")?;
+
+        #[cfg(unix)]
+        if matches!(termination_rx.try_recv(), Ok(BackgroundEvent::Terminate)) {
+            break None;
+        }
+        if !event::poll(Duration::from_millis(50)).context("轮询终端事件失败")? {
+            continue;
+        }
+
+        match event::read().context("读取终端事件失败")? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c' | 'C'))
+                    {
+                        break None;
+                    }
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Up | KeyCode::BackTab => picker.select_previous(),
+                    KeyCode::Down | KeyCode::Tab => picker.select_next(),
+                    KeyCode::Enter => break Some(picker.selected_id()),
+                    KeyCode::Esc => break None,
+                    _ => {}
+                }
+            }
+            Event::Resize(width, height) => {
+                terminal
+                    .resize(Rect::new(0, 0, width.max(1), height.max(1)))
+                    .context("调整会话选择器尺寸失败")?;
+            }
+            _ => {}
+        }
+    };
+
+    clear_terminal_view(&mut terminal)?;
+    drop(terminal);
+    drop(screen);
+    #[cfg(unix)]
+    termination_task.abort();
+    Ok(selected)
+}
+
 fn session_path_is_resumable(path: &Path) -> bool {
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
+
+fn drain_agent_events(
+    events: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    pending: &mut Option<AgentEvent>,
+    state: &mut UiState,
+    budget: usize,
+) -> usize {
+    let mut processed = 0;
+    while processed < budget {
+        let event = pending.take().or_else(|| events.try_recv().ok());
+        let Some(mut event) = event else {
+            break;
+        };
+        processed += 1;
+
+        loop {
+            if processed >= budget {
+                break;
+            }
+            let Ok(next) = events.try_recv() else {
+                break;
+            };
+            if let Some(next) = merge_agent_delta(&mut event, next) {
+                *pending = Some(next);
+                break;
+            }
+            processed += 1;
+        }
+        state.apply_agent_event(event);
+    }
+    processed
+}
+
+fn merge_agent_delta(current: &mut AgentEvent, next: AgentEvent) -> Option<AgentEvent> {
+    match (current, next) {
+        (AgentEvent::TextDelta { text }, AgentEvent::TextDelta { text: next })
+        | (
+            AgentEvent::ReasoningSummaryDelta { text },
+            AgentEvent::ReasoningSummaryDelta { text: next },
+        ) => {
+            text.push_str(&next);
+            None
+        }
+        (
+            AgentEvent::ToolOutputDelta { id, delta },
+            AgentEvent::ToolOutputDelta {
+                id: next_id,
+                delta: next,
+            },
+        ) if *id == next_id => {
+            delta.push_str(&next);
+            None
+        }
+        (_, next) => Some(next),
+    }
 }
 
 // Some PTYs do not answer cursor-position queries; retain Ratatui's last position as a fallback.
@@ -610,6 +848,34 @@ fn resize_ui_terminal(terminal: &mut UiTerminal, width: u16, height: u16) -> Res
             height.saturating_sub(top).max(1),
         ))
         .context("调整终端视口失败")
+}
+
+fn rebuild_ui_terminal_for_resize(
+    terminal: &mut UiTerminal,
+    state: &mut UiState,
+    width: u16,
+    height: u16,
+) -> Result<()> {
+    if terminal.get_frame().area().width == width || state.archived_messages.is_empty() {
+        return resize_ui_terminal(terminal, width, height);
+    }
+
+    rebuild_ui_terminal_history(terminal, state, width, height)
+}
+
+fn rebuild_ui_terminal_history(
+    terminal: &mut UiTerminal,
+    state: &mut UiState,
+    width: u16,
+    height: u16,
+) -> Result<()> {
+    state.restore_archived_messages();
+
+    *terminal = create_ui_terminal(true)?;
+    resize_ui_terminal(terminal, width, height)?;
+    ensure_ui_terminal_capacity(terminal, state)?;
+    archive_transcript_overflow(terminal, state)?;
+    ensure_ui_terminal_capacity(terminal, state)
 }
 
 fn minimum_active_viewport_height(screen_height: u16) -> u16 {
@@ -756,7 +1022,6 @@ where
     if !insert_transcript_lines(terminal, lines, width, minimum_active)? {
         return Ok(false);
     }
-    state.messages.drain(..count);
     state.current_assistant = state
         .current_assistant
         .and_then(|index| index.checked_sub(count));
@@ -766,6 +1031,10 @@ where
     state.protected_turn_start = state
         .protected_turn_start
         .map(|index| index.saturating_sub(count));
+    state
+        .archived_messages
+        .extend(state.messages.drain(..count));
+    state.invalidate_transcript();
     Ok(true)
 }
 
@@ -945,6 +1214,11 @@ where
         message.reasoning.clear();
         message.role = ViewRole::AssistantContinuation;
     }
+    state
+        .transient_archive_start
+        .get_or_insert(state.archived_messages.len());
+    state.archived_messages.push(fragment);
+    state.invalidate_transcript();
     Ok(true)
 }
 
@@ -1036,7 +1310,7 @@ fn contains_fenced_code(content: &str) -> bool {
 }
 
 fn transcript_archive_count(state: &UiState, width: u16, conversation_height: usize) -> usize {
-    if transcript_line_count(state, &state.messages, width) <= conversation_height {
+    if state.cached_transcript_line_count(width) <= conversation_height {
         return 0;
     }
     let archivable = state
@@ -1155,6 +1429,7 @@ enum UiAction {
     DeleteSession,
     Clear,
     ShowDiff,
+    RefreshWorkspaceIndex,
     PasteClipboard,
     ResolveApproval(ApprovalDecision),
 }
@@ -1534,19 +1809,15 @@ fn handle_key(
         }
         return match key.code {
             KeyCode::Up | KeyCode::BackTab => {
-                picker.selection = if picker.selection == 0 {
-                    picker.sessions.len() - 1
-                } else {
-                    picker.selection - 1
-                };
+                picker.select_previous();
                 UiAction::None
             }
             KeyCode::Down | KeyCode::Tab => {
-                picker.selection = (picker.selection + 1) % picker.sessions.len();
+                picker.select_next();
                 UiAction::None
             }
             KeyCode::Enter => {
-                let selector = picker.sessions[picker.selection].id.to_string();
+                let selector = picker.selected_id();
                 state.session_picker = None;
                 UiAction::ResumeSession(selector)
             }
@@ -1750,8 +2021,8 @@ fn handle_key(
         {
             state.prepare_input_edit();
             state.editor.insert(character);
-            if character == '@' {
-                state.refresh_workspace_files();
+            if character == '@' && state.workspace_index_state == WorkspaceIndexState::Idle {
+                return UiAction::RefreshWorkspaceIndex;
             }
         }
         KeyCode::Backspace => {
@@ -1922,6 +2193,25 @@ fn review_prompt(focus: &str) -> String {
     prompt
 }
 
+fn start_workspace_index(state: &mut UiState, events: &mpsc::UnboundedSender<BackgroundEvent>) {
+    let generation = state.begin_workspace_index();
+    let cwd = state.cwd.clone();
+    let events = events.clone();
+    tokio::task::spawn_blocking(move || {
+        let files = index_workspace_files(&cwd);
+        let _ = events.send(BackgroundEvent::WorkspaceIndexed { generation, files });
+    });
+}
+
+fn start_workspace_diff(cwd: &Path, events: &mpsc::UnboundedSender<BackgroundEvent>) {
+    let cwd = cwd.to_path_buf();
+    let events = events.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = workspace_diff(&cwd).map_err(|error| format!("{error:#}"));
+        let _ = events.send(BackgroundEvent::DiffLoaded(result));
+    });
+}
+
 fn workspace_diff(cwd: &Path) -> Result<String> {
     let status = git_output(cwd, &["status", "--short"])?;
     let unstaged = git_output(cwd, &["diff", "--no-ext-diff", "--no-color", "--"])?;
@@ -1948,20 +2238,54 @@ fn workspace_diff(cwd: &Path) -> Result<String> {
         output.push_str(unstaged.trim_end());
         output.push_str("\n```\n");
     }
-    Ok(truncate_for_ui(&output))
+    Ok(truncate_for_ui(&redact_sensitive_text(&output)))
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new("git")
+    const MAX_GIT_OUTPUT_BYTES: u64 = 256 * 1024;
+
+    let mut child = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("无法运行 git {}", args.join(" ")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut stdout = Vec::new();
+    let mut stdout_pipe = child.stdout.take().context("无法读取 git 标准输出")?;
+    let mut stderr_pipe = child.stderr.take().context("无法读取 git 标准错误")?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut stderr = Vec::new();
+        let _ = stderr_pipe
+            .by_ref()
+            .take(64 * 1024)
+            .read_to_end(&mut stderr);
+        let _ = io::copy(&mut stderr_pipe, &mut io::sink());
+        stderr
+    });
+    stdout_pipe
+        .by_ref()
+        .take(MAX_GIT_OUTPUT_BYTES.saturating_add(1))
+        .read_to_end(&mut stdout)
+        .context("读取 git 标准输出失败")?;
+    let truncated = u64::try_from(stdout.len()).unwrap_or(u64::MAX) > MAX_GIT_OUTPUT_BYTES;
+    if truncated {
+        stdout.truncate(usize::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(usize::MAX));
+        io::copy(&mut stdout_pipe, &mut io::sink()).context("丢弃过长的 git 标准输出失败")?;
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("等待 git {} 失败", args.join(" ")))?;
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         bail!("git {} 失败：{}", args.join(" "), stderr.trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let mut output = String::from_utf8_lossy(&stdout).into_owned();
+    if truncated {
+        output.push_str("\n…");
+    }
+    Ok(output)
 }
 
 fn paste_from_clipboard(state: &mut UiState) {
@@ -2225,14 +2549,16 @@ impl Editor {
 
     fn backspace(&mut self) {
         if self.cursor > 0 {
-            self.cursor -= 1;
-            self.items.remove(self.cursor);
+            let start = self.previous_grapheme_start();
+            self.items.drain(start..self.cursor);
+            self.cursor = start;
         }
     }
 
     fn delete(&mut self) {
         if self.cursor < self.items.len() {
-            self.items.remove(self.cursor);
+            let end = self.next_grapheme_end();
+            self.items.drain(self.cursor..end);
         }
     }
 
@@ -2242,28 +2568,74 @@ impl Editor {
     }
 
     fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = self.previous_grapheme_start();
     }
 
     fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.items.len());
+        self.cursor = self.next_grapheme_end();
+    }
+
+    fn previous_grapheme_start(&self) -> usize {
+        if self.cursor == 0 {
+            return 0;
+        }
+        if matches!(self.items[self.cursor - 1], EditorItem::Paste { .. }) {
+            return self.cursor - 1;
+        }
+
+        let mut start = self.cursor;
+        while start > 0 && matches!(self.items[start - 1], EditorItem::Character(_)) {
+            start -= 1;
+        }
+        let text = self.character_text(start, self.cursor);
+        text.graphemes(true)
+            .next_back()
+            .map_or(start, |grapheme| self.cursor - grapheme.chars().count())
+    }
+
+    fn next_grapheme_end(&self) -> usize {
+        if self.cursor >= self.items.len() {
+            return self.items.len();
+        }
+        if matches!(self.items[self.cursor], EditorItem::Paste { .. }) {
+            return self.cursor + 1;
+        }
+
+        let mut end = self.cursor;
+        while end < self.items.len() && matches!(self.items[end], EditorItem::Character(_)) {
+            end += 1;
+        }
+        let text = self.character_text(self.cursor, end);
+        text.graphemes(true)
+            .next()
+            .map_or(end, |grapheme| self.cursor + grapheme.chars().count())
+    }
+
+    fn character_text(&self, start: usize, end: usize) -> String {
+        self.items[start..end]
+            .iter()
+            .filter_map(|item| match item {
+                EditorItem::Character(character) => Some(*character),
+                EditorItem::Paste { .. } => None,
+            })
+            .collect()
     }
 
     fn move_word_left(&mut self) {
         while self.cursor > 0 && Self::is_whitespace(&self.items[self.cursor - 1]) {
-            self.cursor -= 1;
+            self.cursor = self.previous_grapheme_start();
         }
         while self.cursor > 0 && !Self::is_whitespace(&self.items[self.cursor - 1]) {
-            self.cursor -= 1;
+            self.cursor = self.previous_grapheme_start();
         }
     }
 
     fn move_word_right(&mut self) {
         while self.cursor < self.items.len() && Self::is_whitespace(&self.items[self.cursor]) {
-            self.cursor += 1;
+            self.cursor = self.next_grapheme_end();
         }
         while self.cursor < self.items.len() && !Self::is_whitespace(&self.items[self.cursor]) {
-            self.cursor += 1;
+            self.cursor = self.next_grapheme_end();
         }
     }
 
@@ -2382,30 +2754,41 @@ impl Editor {
         let width = usize::from(width.max(1));
         let mut row = 0usize;
         let mut column = 0usize;
-        let mut advance = |character: char| {
-            if character == '\n' {
+        let mut advance = |grapheme: &str| {
+            if matches!(grapheme, "\n" | "\r\n") {
                 row += 1;
                 column = 0;
                 return;
             }
-            let character_width = character.width().unwrap_or(0).max(1);
-            if column + character_width > width {
+            let grapheme_width = grapheme.width();
+            if grapheme_width > 0 && column + grapheme_width > width {
                 row += 1;
                 column = 0;
             }
-            column += character_width;
+            column += grapheme_width;
             if column >= width {
                 row += 1;
                 column = 0;
             }
         };
-        for item in self.items.iter().take(end) {
-            match item {
-                EditorItem::Character(character) => advance(*character),
-                EditorItem::Paste { label, .. } => {
-                    for character in label.chars() {
-                        advance(character);
+        let mut index = 0;
+        while index < end {
+            match &self.items[index] {
+                EditorItem::Character(_) => {
+                    let start = index;
+                    while index < end && matches!(self.items[index], EditorItem::Character(_)) {
+                        index += 1;
                     }
+                    let text = self.character_text(start, index);
+                    for grapheme in text.graphemes(true) {
+                        advance(grapheme);
+                    }
+                }
+                EditorItem::Paste { label, .. } => {
+                    for grapheme in label.graphemes(true) {
+                        advance(grapheme);
+                    }
+                    index += 1;
                 }
             }
         }
@@ -2461,7 +2844,7 @@ enum DeleteChoice {
     No,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ViewMessage {
     role: ViewRole,
     title: String,
@@ -2471,6 +2854,29 @@ struct ViewMessage {
     tool_id: Option<String>,
     file_change: Option<FileChangeSummary>,
     running: bool,
+}
+
+#[derive(Debug, Default)]
+struct TranscriptRenderCache {
+    revision: u64,
+    width: u16,
+    lines: Vec<Line<'static>>,
+    line_count: usize,
+    populated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum HistoryRebuild {
+    #[default]
+    Clean,
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum WorkspaceIndexState {
+    #[default]
+    Idle,
+    Loading,
 }
 
 #[derive(Debug)]
@@ -2483,6 +2889,24 @@ struct QueuedSubmission {
 struct SessionPicker {
     sessions: Vec<SessionSummary>,
     selection: usize,
+}
+
+impl SessionPicker {
+    fn select_previous(&mut self) {
+        self.selection = if self.selection == 0 {
+            self.sessions.len() - 1
+        } else {
+            self.selection - 1
+        };
+    }
+
+    fn select_next(&mut self) {
+        self.selection = (self.selection + 1) % self.sessions.len();
+    }
+
+    fn selected_id(&self) -> String {
+        self.sessions[self.selection].id.to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -2533,6 +2957,29 @@ impl ApprovalChoice {
 
 fn index_workspace_files(root: &Path) -> Vec<String> {
     const SKIPPED_DIRECTORIES: [&str; 4] = [".git", ".mcode", "node_modules", "target"];
+
+    if let Ok(output) = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .current_dir(root)
+        .output()
+        && output.status.success()
+    {
+        let mut files = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .take(MAX_WORKSPACE_FILES)
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+        files.sort();
+        return files;
+    }
 
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -2598,10 +3045,17 @@ struct UiState {
     cwd: std::path::PathBuf,
     current_session_id: String,
     workspace_files: Vec<String>,
+    workspace_index_generation: u64,
+    workspace_index_state: WorkspaceIndexState,
     model_choices: Vec<ModelChoice>,
     reasoning_choices: Vec<ReasoningEffort>,
     permission_profile: PermissionProfile,
+    archived_messages: Vec<ViewMessage>,
+    transient_archive_start: Option<usize>,
+    history_rebuild: HistoryRebuild,
     messages: Vec<ViewMessage>,
+    transcript_revision: u64,
+    transcript_cache: RefCell<TranscriptRenderCache>,
     editor: Editor,
     running: bool,
     run_started_at: Option<Instant>,
@@ -2637,6 +3091,7 @@ struct UiState {
     reasoning_activity_state: ReasoningActivityState,
     mcp_server_count: usize,
     mcp_tool_count: usize,
+    mcp_startups_remaining: usize,
     pending_approval: Option<ApprovalView>,
     quit_shortcut_expires_at: Option<Instant>,
     show_welcome: bool,
@@ -2645,7 +3100,6 @@ struct UiState {
 
 impl UiState {
     fn new(model: String, endpoint: String, cwd: std::path::PathBuf) -> Self {
-        let workspace_files = index_workspace_files(&cwd);
         Self {
             model,
             provider: "xai".to_string(),
@@ -2654,11 +3108,18 @@ impl UiState {
             endpoint,
             cwd,
             current_session_id: String::new(),
-            workspace_files,
+            workspace_files: Vec::new(),
+            workspace_index_generation: 0,
+            workspace_index_state: WorkspaceIndexState::Idle,
             model_choices: Vec::new(),
             reasoning_choices: ReasoningEffort::ALL.to_vec(),
             permission_profile: PermissionProfile::default(),
+            archived_messages: Vec::new(),
+            transient_archive_start: None,
+            history_rebuild: HistoryRebuild::Clean,
             messages: Vec::new(),
+            transcript_revision: 0,
+            transcript_cache: RefCell::new(TranscriptRenderCache::default()),
             editor: Editor::default(),
             running: false,
             run_started_at: None,
@@ -2694,6 +3155,7 @@ impl UiState {
             reasoning_activity_state: ReasoningActivityState::Inactive,
             mcp_server_count: 0,
             mcp_tool_count: 0,
+            mcp_startups_remaining: 0,
             pending_approval: None,
             quit_shortcut_expires_at: None,
             show_welcome: true,
@@ -2702,6 +3164,7 @@ impl UiState {
     }
 
     fn sync_from_agent(&mut self, agent: &Agent) {
+        self.invalidate_transcript();
         self.model = sanitize_terminal_text(agent.model());
         self.provider = sanitize_terminal_text(agent.provider());
         self.reasoning_effort = agent.reasoning_effort();
@@ -2719,10 +3182,46 @@ impl UiState {
         self.usage_estimated = agent.usage_estimated();
         self.mcp_server_count = agent.mcp_server_count();
         self.mcp_tool_count = agent.mcp_tool_count();
+        self.mcp_startups_remaining = agent.mcp_startups_remaining();
     }
 
-    fn refresh_workspace_files(&mut self) {
-        self.workspace_files = index_workspace_files(&self.cwd);
+    fn begin_workspace_index(&mut self) -> u64 {
+        self.workspace_index_generation = self.workspace_index_generation.wrapping_add(1);
+        self.workspace_index_state = WorkspaceIndexState::Loading;
+        self.workspace_index_generation
+    }
+
+    fn finish_workspace_index(&mut self, generation: u64, files: Vec<String>) {
+        if generation == self.workspace_index_generation {
+            self.workspace_files = files;
+            self.workspace_index_state = WorkspaceIndexState::Idle;
+        }
+    }
+
+    fn invalidate_transcript(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
+    fn cached_transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.refresh_transcript_cache(width);
+        self.transcript_cache.borrow().lines.clone()
+    }
+
+    fn cached_transcript_line_count(&self, width: u16) -> usize {
+        self.refresh_transcript_cache(width);
+        self.transcript_cache.borrow().line_count
+    }
+
+    fn refresh_transcript_cache(&self, width: u16) {
+        let width = width.max(1);
+        let mut cache = self.transcript_cache.borrow_mut();
+        if !cache.populated || cache.revision != self.transcript_revision || cache.width != width {
+            cache.lines = transcript_lines_for_messages(self, &self.messages, width);
+            cache.line_count = wrapped_line_count(&cache.lines, width);
+            cache.revision = self.transcript_revision;
+            cache.width = width;
+            cache.populated = true;
+        }
     }
 
     fn open_session_picker(&mut self) -> Result<bool> {
@@ -2750,10 +3249,18 @@ impl UiState {
     }
 
     fn protect_new_turn(&mut self) {
+        if self.transient_archive_start.is_some() {
+            self.restore_transient_archive();
+            self.history_rebuild = HistoryRebuild::Required;
+        }
         self.protected_turn_start = Some(self.messages.len());
     }
 
     fn protect_resumed_turn(&mut self) {
+        if self.transient_archive_start.is_some() {
+            self.restore_transient_archive();
+            self.history_rebuild = HistoryRebuild::Required;
+        }
         self.protected_turn_start = self
             .messages
             .iter()
@@ -2874,6 +3381,7 @@ impl UiState {
     }
 
     fn push_history(&mut self, message: ChatMessage) {
+        self.invalidate_transcript();
         self.show_welcome = false;
         match message.role {
             MessageRole::System => {}
@@ -2931,10 +3439,11 @@ impl UiState {
             }
             MessageRole::Tool => {
                 let tool_id = message.tool_call_id;
-                let file_change = message.file_change;
-                let content = truncate_for_ui(&sanitize_terminal_text(
+                let mut file_change = message.file_change;
+                redact_file_change(&mut file_change);
+                let content = truncate_for_ui(&sanitize_terminal_text(&redact_sensitive_text(
                     &message.content.unwrap_or_default(),
-                ));
+                )));
                 if let Some(existing) = tool_id.as_deref().and_then(|id| {
                     self.messages
                         .iter_mut()
@@ -2963,6 +3472,7 @@ impl UiState {
     }
 
     fn push_user(&mut self, prompt: String, images: &[ImageAttachment]) {
+        self.invalidate_transcript();
         self.show_welcome = false;
         self.push_turn_separator_if_needed();
         self.record_input(prompt.clone());
@@ -2982,16 +3492,21 @@ impl UiState {
         let has_previous_turn = self
             .messages
             .iter()
+            .chain(&self.archived_messages)
             .any(|message| message.role == ViewRole::User);
-        let already_separated = self.messages.last().is_some_and(|message| {
-            matches!(
-                message.role,
-                ViewRole::Separator
-                    | ViewRole::RunCompleted
-                    | ViewRole::RunCancelled
-                    | ViewRole::RunFailed
-            )
-        });
+        let already_separated = self
+            .messages
+            .last()
+            .or_else(|| self.archived_messages.last())
+            .is_some_and(|message| {
+                matches!(
+                    message.role,
+                    ViewRole::Separator
+                        | ViewRole::RunCompleted
+                        | ViewRole::RunCancelled
+                        | ViewRole::RunFailed
+                )
+            });
         if has_previous_turn && !already_separated {
             self.messages.push(ViewMessage {
                 role: ViewRole::Separator,
@@ -3011,6 +3526,7 @@ impl UiState {
     }
 
     fn push_notice(&mut self, content: impl AsRef<str>) {
+        self.invalidate_transcript();
         self.messages.push(ViewMessage {
             role: ViewRole::Notice,
             title: "MCode".to_string(),
@@ -3024,10 +3540,12 @@ impl UiState {
     }
 
     fn push_error(&mut self, content: impl AsRef<str>) {
+        self.invalidate_transcript();
+        let content = redact_sensitive_text(content.as_ref());
         self.messages.push(ViewMessage {
             role: ViewRole::Error,
             title: "错误".to_string(),
-            content: truncate_error_for_ui(&sanitize_terminal_text(content.as_ref())),
+            content: truncate_error_for_ui(&sanitize_terminal_text(&content)),
             reasoning: String::new(),
             tool_arguments: None,
             tool_id: None,
@@ -3056,6 +3574,10 @@ impl UiState {
     }
 
     fn reset_session(&mut self) {
+        self.invalidate_transcript();
+        self.archived_messages.clear();
+        self.transient_archive_start = None;
+        self.history_rebuild = HistoryRebuild::Clean;
         self.messages.clear();
         self.run_started_at = None;
         self.run_elapsed_before_pause = Duration::ZERO;
@@ -3081,6 +3603,10 @@ impl UiState {
     }
 
     fn clear_view(&mut self) {
+        self.invalidate_transcript();
+        self.archived_messages.clear();
+        self.transient_archive_start = None;
+        self.history_rebuild = HistoryRebuild::Clean;
         self.messages.clear();
         self.current_assistant = None;
         self.generation_start = None;
@@ -3115,6 +3641,7 @@ impl UiState {
     }
 
     fn hold_pending_tools(&mut self, tool_ids: &[String]) {
+        self.invalidate_transcript();
         for message in &mut self.messages {
             if message
                 .tool_id
@@ -3338,8 +3865,13 @@ impl UiState {
                     format_context_percent(cached, usage.prompt_tokens)
                 )
             });
+        let mcp_starting = if self.mcp_startups_remaining == 0 {
+            String::new()
+        } else {
+            format!("（{} 个连接中）", self.mcp_startups_remaining)
+        };
         format!(
-            "模型：{qualified_model}\nAPI：OpenAI Responses\neffort：{}\n权限：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具\n端点：{}\n工作目录：{}",
+            "模型：{qualified_model}\nAPI：OpenAI Responses\neffort：{}\n权限：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具{mcp_starting}\n端点：{}\n工作目录：{}",
             self.reasoning_effort,
             self.permission_profile.label(),
             format_tokens(context_tokens),
@@ -3355,6 +3887,7 @@ impl UiState {
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent) {
+        self.invalidate_transcript();
         match event {
             AgentEvent::RunStarted | AgentEvent::RunResumed => {
                 self.begin_run("处理中");
@@ -3371,6 +3904,7 @@ impl UiState {
                 self.status = "正在思考".to_string();
             }
             AgentEvent::AssistantDiscarded => {
+                self.discard_transient_archive();
                 self.discard_current_assistant();
                 self.status = "正在继续执行".to_string();
             }
@@ -3379,6 +3913,7 @@ impl UiState {
                 max_attempts,
                 message,
             } => {
+                self.discard_transient_archive();
                 self.live_completion.clear();
                 let index = self
                     .generation_start
@@ -3515,6 +4050,7 @@ impl UiState {
                     .find(|message| message.tool_id.as_deref() == Some(id.as_str()))
                 {
                     message.content.push_str(&sanitize_terminal_text(&delta));
+                    message.content = redact_sensitive_text(&message.content);
                     trim_live_tool_output(&mut message.content);
                 }
             }
@@ -3523,8 +4059,9 @@ impl UiState {
                 name,
                 output,
                 is_error,
-                file_change,
+                mut file_change,
             } => {
+                redact_file_change(&mut file_change);
                 if let Some(message) = self
                     .messages
                     .iter_mut()
@@ -3532,7 +4069,9 @@ impl UiState {
                     .find(|message| message.tool_id.as_deref() == Some(id.as_str()))
                 {
                     message.title = sanitize_terminal_text(&name);
-                    message.content = truncate_for_ui(&sanitize_terminal_text(&output));
+                    message.content = truncate_for_ui(&sanitize_terminal_text(
+                        &redact_sensitive_text(&output),
+                    ));
                     message.file_change = file_change;
                     message.running = false;
                     if is_error {
@@ -3646,7 +4185,9 @@ impl UiState {
                 self.messages.push(ViewMessage {
                     role: ViewRole::Error,
                     title: "错误".to_string(),
-                    content: truncate_error_for_ui(&sanitize_terminal_text(&message)),
+                    content: truncate_error_for_ui(&sanitize_terminal_text(
+                        &redact_sensitive_text(&message),
+                    )),
                     reasoning: String::new(),
                     tool_arguments: None,
                     tool_id: None,
@@ -3718,6 +4259,10 @@ impl UiState {
     }
 
     fn finish_current_assistant_for_tool(&mut self) {
+        if self.transient_archive_start.is_some() {
+            self.restore_transient_archive();
+            self.history_rebuild = HistoryRebuild::Required;
+        }
         self.finish_reasoning_summary();
         if let Some(index) = self.current_assistant {
             if self
@@ -3740,6 +4285,79 @@ impl UiState {
         }
         self.current_assistant = None;
         self.live_completion.clear();
+    }
+
+    fn discard_transient_archive(&mut self) {
+        if let Some(start) = self.transient_archive_start.take() {
+            self.archived_messages.truncate(start);
+            self.history_rebuild = HistoryRebuild::Required;
+            self.invalidate_transcript();
+        }
+    }
+
+    fn restore_transient_archive(&mut self) {
+        let Some(start) = self.transient_archive_start.take() else {
+            return;
+        };
+        let fragments = self.archived_messages.split_off(start);
+        if fragments.is_empty() {
+            return;
+        }
+        let mut prefix = fragments
+            .iter()
+            .map(|fragment| fragment.content.trim_end_matches(['\r', '\n']))
+            .filter(|content| !content.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(message) = self.messages.first_mut()
+            && is_assistant_role(message.role)
+        {
+            let suffix = message.content.trim_start_matches(['\r', '\n']);
+            if !prefix.is_empty() && !suffix.is_empty() {
+                prefix.push('\n');
+            }
+            prefix.push_str(suffix);
+            message.content = prefix;
+            if message.reasoning.is_empty()
+                && let Some(reasoning) = fragments.iter().find_map(|fragment| {
+                    (!fragment.reasoning.is_empty()).then_some(&fragment.reasoning)
+                })
+            {
+                message.reasoning.clone_from(reasoning);
+            }
+            message.role = ViewRole::Assistant;
+        }
+        self.invalidate_transcript();
+    }
+
+    fn restore_archived_messages(&mut self) {
+        self.restore_transient_archive();
+        let archived_count = self.archived_messages.len();
+        if archived_count == 0 {
+            return;
+        }
+        let mut messages = std::mem::take(&mut self.archived_messages);
+        messages.append(&mut self.messages);
+        self.messages = messages;
+        self.current_assistant = self
+            .current_assistant
+            .map(|index| index.saturating_add(archived_count));
+        self.generation_start = self
+            .generation_start
+            .map(|index| index.saturating_add(archived_count));
+        self.protected_turn_start = self
+            .protected_turn_start
+            .map(|index| index.saturating_add(archived_count));
+        self.invalidate_transcript();
+    }
+}
+
+fn redact_file_change(file_change: &mut Option<FileChangeSummary>) {
+    let Some(change) = file_change else {
+        return;
+    };
+    for FileChangeLine { content, .. } in &mut change.preview {
+        *content = redact_sensitive_text(content);
     }
 }
 
@@ -3842,7 +4460,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
     let input = if state.pending_approval.is_some() {
         APPROVAL_HEIGHT
     } else if let Some(picker) = &state.session_picker {
-        u16::try_from(picker.sessions.len().min(MAX_SESSION_PICKER_ROWS) + 4).unwrap_or(u16::MAX)
+        u16::try_from(picker.sessions.len().min(MAX_SESSION_PICKER_ROWS) + 5).unwrap_or(u16::MAX)
     } else if state.permission_picker.is_some() {
         PERMISSION_PICKER_HEIGHT
     } else if state.delete_confirmation != DeleteConfirmation::None {
@@ -3928,7 +4546,7 @@ fn render_activity_status(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
 
 fn render_conversation(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     let content_width = area.width.max(1);
-    let lines = transcript_lines(state, content_width);
+    let lines = state.cached_transcript_lines(content_width);
     if lines.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
@@ -3945,10 +4563,6 @@ fn render_conversation(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     let render_area = Rect::new(area.x, render_y, content_width, render_height);
     let scroll = u16::try_from(total_height.saturating_sub(visible_height)).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), render_area);
-}
-
-fn transcript_lines(state: &UiState, content_width: u16) -> Vec<Line<'static>> {
-    transcript_lines_for_messages(state, &state.messages, content_width)
 }
 
 fn transcript_lines_for_messages(
@@ -3968,11 +4582,18 @@ fn transcript_lines_for_messages(
 }
 
 fn transcript_line_count(state: &UiState, messages: &[ViewMessage], width: u16) -> usize {
+    if std::ptr::eq(messages, state.messages.as_slice()) {
+        return state.cached_transcript_line_count(width);
+    }
     let lines = transcript_lines_for_messages(state, messages, width);
+    wrapped_line_count(&lines, width)
+}
+
+fn wrapped_line_count(lines: &[Line<'static>], width: u16) -> usize {
     if lines.is_empty() {
         return 0;
     }
-    Paragraph::new(Text::from(lines))
+    Paragraph::new(Text::from(lines.to_vec()))
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
 }
@@ -4152,65 +4773,7 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     }
 
     if let Some(picker) = &state.session_picker {
-        let selected = picker
-            .selection
-            .min(picker.sessions.len().saturating_sub(1));
-        let visible = usize::from(area.height.saturating_sub(4));
-        let start = selected
-            .saturating_add(1)
-            .saturating_sub(visible)
-            .min(picker.sessions.len().saturating_sub(visible));
-        let mut lines = vec![
-            Line::default(),
-            Line::from(Span::styled(
-                "  恢复会话",
-                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
-            )),
-            Line::default(),
-        ];
-        for (index, session) in picker.sessions.iter().enumerate().skip(start).take(visible) {
-            let is_selected = index == selected;
-            let short_id = session.id.to_string();
-            let short_id = &short_id[..8];
-            let pending = if session.has_pending_run {
-                " · 中断"
-            } else {
-                ""
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if is_selected { "› " } else { "  " },
-                    Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{}. {short_id}  ", index + 1),
-                    if is_selected {
-                        Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(THEME_TEXT)
-                    },
-                ),
-                Span::styled(
-                    truncate_width(
-                        &format!(
-                            "{}/{} · {} 条消息{pending}",
-                            session.provider, session.model, session.message_count
-                        ),
-                        usize::from(area.width).saturating_sub(12),
-                    ),
-                    Style::default().fg(THEME_MUTED),
-                ),
-            ]));
-        }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "  ↑/↓ 选择 · Enter 恢复 · Esc 返回",
-            Style::default().fg(THEME_MUTED),
-        )));
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(THEME_BASE)),
-            area,
-        );
+        render_session_picker(frame, picker, area);
         return;
     }
 
@@ -4343,6 +4906,68 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             .y
             .saturating_add(cursor_y.min(input_area.height.saturating_sub(1))),
     ));
+}
+
+fn render_session_picker(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect) {
+    let selected = picker
+        .selection
+        .min(picker.sessions.len().saturating_sub(1));
+    let visible = usize::from(area.height.saturating_sub(5));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(picker.sessions.len().saturating_sub(visible));
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "  恢复会话",
+            Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
+    for (index, session) in picker.sessions.iter().enumerate().skip(start).take(visible) {
+        let is_selected = index == selected;
+        let session_id = session.id.to_string();
+        let short_id = &session_id[session_id.len().saturating_sub(8)..];
+        let pending = if session.has_pending_run {
+            " · 中断"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}. {short_id}  ", index + 1),
+                if is_selected {
+                    Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(THEME_TEXT)
+                },
+            ),
+            Span::styled(
+                truncate_width(
+                    &format!(
+                        "{}/{} · {} 条消息{pending}",
+                        session.provider, session.model, session.message_count
+                    ),
+                    usize::from(area.width).saturating_sub(12),
+                ),
+                Style::default().fg(THEME_MUTED),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ 选择 · Enter 恢复 · Esc 返回",
+        Style::default().fg(THEME_MUTED),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(THEME_BASE)),
+        area,
+    );
 }
 
 fn render_pending_images(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
@@ -5377,7 +6002,8 @@ fn truncate_preview_line(line: &str) -> String {
 }
 
 fn format_tool_input(name: &str, arguments: &str) -> String {
-    let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let arguments = format_tool_arguments(arguments);
+    let parsed = serde_json::from_str::<serde_json::Value>(&arguments).ok();
     let concise = parsed.as_ref().and_then(|value| match name {
         "shell" => value.get("command")?.as_str().map(ToString::to_string),
         "read_file" | "write_file" | "edit_file" => {
@@ -5393,7 +6019,7 @@ fn format_tool_input(name: &str, arguments: &str) -> String {
             .map(ToString::to_string),
         _ => None,
     });
-    let formatted = concise.unwrap_or_else(|| format_tool_arguments(arguments));
+    let formatted = concise.unwrap_or(arguments);
     truncate_for_ui(&sanitize_terminal_text(&formatted))
 }
 
@@ -5930,13 +6556,13 @@ fn truncate_width(text: &str, width: usize) -> String {
     }
     let mut output = String::new();
     let mut used = 0usize;
-    for character in text.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width >= width {
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if used + grapheme_width >= width {
             break;
         }
-        output.push(character);
-        used += character_width;
+        output.push_str(grapheme);
+        used += grapheme_width;
     }
     output
 }
@@ -6147,6 +6773,21 @@ mod tests {
             None,
         );
         assert_eq!(state.editor.text(), "alpha");
+    }
+
+    #[test]
+    fn edits_combining_text_and_emoji_as_grapheme_clusters() {
+        let mut editor = Editor::default();
+        editor.insert_str("Ae\u{301}👨‍👩‍👧‍👦Z");
+
+        editor.move_left();
+        editor.backspace();
+        assert_eq!(editor.text(), "Ae\u{301}Z");
+
+        editor.move_left();
+        editor.delete();
+        assert_eq!(editor.text(), "AZ");
+        assert_eq!(editor.cursor, 1);
     }
 
     #[test]
@@ -6394,6 +7035,19 @@ mod tests {
                 .take(40)
                 .any(|cell| !cell.symbol().trim().is_empty())
         );
+
+        assert!(state.transient_archive_start.is_some());
+        state.restore_archived_messages();
+        assert!(state.archived_messages.is_empty());
+        let restored = state
+            .messages
+            .iter()
+            .filter(|message| is_assistant_role(message.role))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(restored.contains("第 1 行稳定输出"));
+        assert!(restored.contains("第 30 行稳定输出"));
 
         let mut code_state = UiState::new(
             "model".to_string(),
@@ -7399,6 +8053,8 @@ mod tests {
             "http://localhost/v1/responses".to_string(),
             project.path().to_path_buf(),
         );
+        let generation = state.begin_workspace_index();
+        state.finish_workspace_index(generation, index_workspace_files(project.path()));
         state.editor.set_text("检查 @sl");
 
         let suggestions = file_suggestions(&state);
@@ -7407,5 +8063,47 @@ mod tests {
         assert_eq!(suggestions[0].label, "@src/lib.rs");
         assert!(complete_slash_suggestion(&mut state));
         assert_eq!(state.editor.text(), "检查 @src/lib.rs ");
+    }
+
+    #[test]
+    fn merges_stream_deltas_without_exceeding_the_event_budget() {
+        let mut state = UiState::new(
+            "model".to_string(),
+            "http://localhost/v1/responses".to_string(),
+            std::path::PathBuf::from("."),
+        );
+        state.apply_agent_event(AgentEvent::RunStarted);
+        state.apply_agent_event(AgentEvent::AssistantStarted);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for text in ["one", " ", "two", " ", "three"] {
+            tx.send(AgentEvent::TextDelta {
+                text: text.to_string(),
+            })
+            .unwrap();
+        }
+        tx.send(AgentEvent::RunFinished).unwrap();
+        let mut pending = None;
+
+        assert_eq!(drain_agent_events(&mut rx, &mut pending, &mut state, 3), 3);
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("one two")
+        );
+        assert!(state.running);
+        assert_eq!(drain_agent_events(&mut rx, &mut pending, &mut state, 3), 3);
+        assert!(!state.running);
+        assert!(state.messages.iter().any(|message| {
+            is_assistant_role(message.role) && message.content == "one two three"
+        }));
+    }
+
+    #[test]
+    fn truncates_terminal_labels_without_splitting_graphemes() {
+        let family = "A👨‍👩‍👧‍👦B";
+        assert_eq!(truncate_width(family, 4), "A👨‍👩‍👧‍👦");
+        assert_eq!(truncate_width("e\u{301}x", 2), "e\u{301}");
     }
 }

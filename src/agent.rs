@@ -98,7 +98,19 @@ pub struct CompactionResult {
 }
 
 impl Agent {
-    pub async fn new(config: &AppConfig, mut session: Session) -> Result<Self> {
+    pub async fn new(config: &AppConfig, session: Session) -> Result<Self> {
+        Self::new_with_mcp_mode(config, session, false).await
+    }
+
+    pub async fn new_deferred_mcp(config: &AppConfig, session: Session) -> Result<Self> {
+        Self::new_with_mcp_mode(config, session, true).await
+    }
+
+    async fn new_with_mcp_mode(
+        config: &AppConfig,
+        mut session: Session,
+        deferred_mcp: bool,
+    ) -> Result<Self> {
         session.set_model(&config.provider, &config.model)?;
         session.set_reasoning_effort(config.reasoning_effort)?;
         let client = OpenAiClient::new(
@@ -113,7 +125,11 @@ impl Agent {
             session.id().to_string(),
             Duration::from_secs(config.request_timeout_secs),
         )?;
-        let tools = ToolRegistry::with_mcp(&config.cwd, &config.mcp_servers).await?;
+        let tools = if deferred_mcp {
+            ToolRegistry::with_deferred_mcp(&config.cwd, &config.mcp_servers)?
+        } else {
+            ToolRegistry::with_mcp(&config.cwd, &config.mcp_servers).await?
+        };
         let system_prompt = build_system_prompt(&config.cwd)?;
         let total_usage = session.total_usage();
         let selected_profile = config
@@ -161,6 +177,7 @@ impl Agent {
         cancel: &CancellationToken,
         approvals: &ApprovalGate,
     ) -> Result<RunStatus> {
+        self.tools.wait_for_mcp_startup(cancel).await;
         if prompt.trim().is_empty() {
             bail!("prompt cannot be empty");
         }
@@ -192,6 +209,7 @@ impl Agent {
         cancel: &CancellationToken,
         approvals: &ApprovalGate,
     ) -> Result<RunStatus> {
+        self.tools.wait_for_mcp_startup(cancel).await;
         let run_id = self
             .session
             .active_run_id()
@@ -1074,6 +1092,15 @@ impl Agent {
     #[must_use]
     pub fn mcp_startup_failures(&self) -> &[McpStartupFailure] {
         self.tools.mcp_startup_failures()
+    }
+
+    pub fn poll_mcp_startup(&mut self) -> bool {
+        self.tools.poll_mcp_startup()
+    }
+
+    #[must_use]
+    pub const fn mcp_startups_remaining(&self) -> usize {
+        self.tools.mcp_startups_remaining()
     }
 
     fn current_profile(&self) -> Option<&ModelProfile> {

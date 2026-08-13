@@ -127,7 +127,7 @@ pub struct ExecArgs {
 
 #[derive(Debug, Args)]
 pub struct ResumeArgs {
-    /// 会话 ID 片段、JSONL 路径或 'last'；默认使用最新会话。
+    /// 会话 ID 片段、JSONL 路径或 'last'；多会话时省略将打开选择器。
     #[arg(value_name = "会话")]
     pub session: Option<String>,
 

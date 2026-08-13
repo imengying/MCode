@@ -1394,6 +1394,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "two-face",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "uuid",
