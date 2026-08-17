@@ -118,9 +118,7 @@ MCode 只使用 OpenAI Responses API，不包含 Chat Completions 回退。`mode
 effort。DeepSeek V4 Flash 与 V4 Pro 均使用 Responses API，支持 1M 上下文、384K 最大输出
 以及 `low` / `high` / `max` effort。未知 provider 会被拒绝。
 
-`MCODE_MODEL`、`MCODE_REASONING_EFFORT`、`MCODE_BASE_URL`、`MCODE_CONTEXT_WINDOW`、
-`MCODE_MAX_INPUT_TOKENS` 和 `MCODE_MAX_OUTPUT_TOKENS` 可覆盖当前选择；`--api-key-env`
-可临时指定密钥环境变量。
+`MCODE_MODEL` 和 `MCODE_BASE_URL` 可覆盖当前选择；`--api-key-env` 可临时指定密钥环境变量。
 
 Web Search 默认开启，不需要配置。四家模型均通过 Responses API 使用原生 `web_search`，
 并可使用 `fetch_content` 读取公开网页正文；中转站需要实现对应工具协议。
@@ -164,8 +162,7 @@ TUI 命令：
 
 | 命令 | 作用 |
 |---|---|
-| `/model [provider/model]` | 查看或切换模型 |
-| `/effort [LEVEL]` | 查看或切换思考强度 |
+| `/model` | 依次选择模型与思考等级 |
 | `/permissions` | 选择只读、工作区可写或完全访问 |
 | `/diff` | 显示当前 Git 改动 |
 | `/review [FOCUS]` | 审查当前工作区改动 |

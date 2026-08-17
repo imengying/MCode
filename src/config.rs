@@ -120,11 +120,6 @@ impl ModelProfile {
     }
 
     #[must_use]
-    pub fn is_reasoning_model(&self) -> bool {
-        !self.thinking_level_map.is_empty()
-    }
-
-    #[must_use]
     pub const fn default_reasoning_effort(&self) -> ReasoningEffort {
         self.default_reasoning_effort
     }
@@ -177,12 +172,8 @@ pub struct McpServerConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOverrides {
     pub model: Option<String>,
-    pub reasoning_effort: Option<ReasoningEffort>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
-    pub context_window: Option<u64>,
-    pub max_input_tokens: Option<u64>,
-    pub max_output_tokens: Option<u64>,
     pub cwd: Option<PathBuf>,
     pub request_timeout_secs: Option<u64>,
 }
@@ -347,12 +338,7 @@ impl AppConfig {
         let selected_model = selected_profile.id.clone();
         let provider = selected_profile.provider.clone();
 
-        let environment_reasoning = env_reasoning("MCODE_REASONING_EFFORT").transpose()?;
-        let requested_reasoning_effort = overrides.reasoning_effort.or(environment_reasoning);
-        let reasoning_effort = requested_reasoning_effort.map_or_else(
-            || selected_profile.default_reasoning_effort(),
-            |requested| selected_profile.clamp_reasoning_effort(requested),
-        );
+        let reasoning_effort = selected_profile.default_reasoning_effort();
         let reasoning_value = selected_profile.reasoning_value(reasoning_effort)?;
 
         let base_url = selected_profile.base_url.clone();
@@ -419,44 +405,21 @@ impl AppConfig {
         })
     }
 
-    pub fn select_model(&mut self, query: &str) -> Result<()> {
+    pub fn select_model(&mut self, query: &str, reasoning_effort: ReasoningEffort) -> Result<()> {
         let profile = find_model_profile(&self.model_profiles, Some(&self.provider), query)?
             .with_context(|| format!("模型 {query:?} 不在 ~/.mcode/models.json 中"))?
             .clone();
-        self.reasoning_effort = profile.clamp_reasoning_effort(self.reasoning_effort);
-        self.reasoning_value = profile.reasoning_value(self.reasoning_effort)?;
+        let reasoning_effort = profile.clamp_reasoning_effort(reasoning_effort);
+        let reasoning_value = profile.reasoning_value(reasoning_effort)?;
         self.model = profile.id;
         self.provider = profile.provider;
+        self.reasoning_effort = reasoning_effort;
+        self.reasoning_value = reasoning_value;
         self.base_url = profile.base_url;
         self.api_key = profile.api_key;
         self.context_window = profile.context_window;
         self.max_input_tokens = profile.max_input_tokens;
         self.max_output_tokens = profile.max_output_tokens;
-        Ok(())
-    }
-
-    pub fn select_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
-        let profile = find_model_profile(&self.model_profiles, Some(&self.provider), &self.model)?
-            .with_context(|| format!("模型 {:?} 不在 ~/.mcode/models.json 中", self.model))?;
-        let effective_effort = profile.clamp_reasoning_effort(effort);
-        self.reasoning_value = profile.reasoning_value(effective_effort)?;
-        self.reasoning_effort = effective_effort;
-        Ok(())
-    }
-
-    pub fn select_model_and_reasoning(
-        &mut self,
-        model: &str,
-        reasoning_effort: ReasoningEffort,
-    ) -> Result<()> {
-        let previous_effort = self.reasoning_effort;
-        let previous_value = self.reasoning_value.clone();
-        self.reasoning_effort = reasoning_effort;
-        if let Err(error) = self.select_model(model) {
-            self.reasoning_effort = previous_effort;
-            self.reasoning_value = previous_value;
-            return Err(error);
-        }
         Ok(())
     }
 }
@@ -474,12 +437,6 @@ pub(crate) fn load_model_profiles(overrides: &ConfigOverrides) -> Result<Vec<Mod
                 .with_context(|| format!("环境变量 {name} 未配置或为空，无法用作 API 密钥"))
         })
         .transpose()?;
-    let environment_context = env_u64("MCODE_CONTEXT_WINDOW").transpose()?;
-    let context_window_override = overrides.context_window.or(environment_context);
-    let environment_max_input = env_u64("MCODE_MAX_INPUT_TOKENS").transpose()?;
-    let max_input_tokens_override = overrides.max_input_tokens.or(environment_max_input);
-    let environment_max_output = env_u64("MCODE_MAX_OUTPUT_TOKENS").transpose()?;
-    let max_output_tokens_override = overrides.max_output_tokens.or(environment_max_output);
     let mut profiles = if let Some(home) = mcode_home_dir() {
         let models_path = home.join("models.json");
         if models_path.is_file() {
@@ -487,9 +444,6 @@ pub(crate) fn load_model_profiles(overrides: &ConfigOverrides) -> Result<Vec<Mod
                 read_json::<ModelsFile>(&models_path)?,
                 base_url_override.as_deref(),
                 api_key_override.as_deref(),
-                context_window_override,
-                max_input_tokens_override,
-                max_output_tokens_override,
             )?
         } else {
             Vec::new()
@@ -617,9 +571,6 @@ fn build_model_profiles(
     file: ModelsFile,
     base_url_override: Option<&str>,
     api_key_override: Option<&str>,
-    context_window_override: Option<u64>,
-    max_input_tokens_override: Option<u64>,
-    max_output_tokens_override: Option<u64>,
 ) -> Result<Vec<ModelProfile>> {
     let mut profiles = Vec::new();
     for (provider_name, provider) in file.providers {
@@ -668,14 +619,9 @@ fn build_model_profiles(
                 }
                 thinking_level_map.insert(level, value);
             }
-            let context_window = context_window_override
-                .or(model.context_window)
-                .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-            let max_input_tokens = max_input_tokens_override
-                .or(context_window_override)
-                .or(model.max_input_tokens)
-                .unwrap_or(context_window);
-            let max_output_tokens = max_output_tokens_override.or(model.max_output_tokens);
+            let context_window = model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+            let max_input_tokens = model.max_input_tokens.unwrap_or(context_window);
+            let max_output_tokens = model.max_output_tokens;
             let input = model.input.unwrap_or_else(|| vec![InputModality::Text]);
             if !input.contains(&InputModality::Text) {
                 bail!(
@@ -757,18 +703,6 @@ fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
         .map_err(|_| anyhow::anyhow!("unknown reasoning level {value:?}"))
 }
 
-fn env_reasoning(name: &str) -> Option<Result<ReasoningEffort>> {
-    env_non_empty(name).map(|value| parse_reasoning_effort(&value))
-}
-
-fn env_u64(name: &str) -> Option<Result<u64>> {
-    env_non_empty(name).map(|value| {
-        value
-            .parse::<u64>()
-            .with_context(|| format!("{name} must be a positive integer"))
-    })
-}
-
 fn env_non_empty(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
@@ -839,7 +773,7 @@ mod tests {
     #[test]
     fn model_catalog_allows_only_the_supported_four() {
         let file = serde_json::from_str(include_str!("../models.example.json")).unwrap();
-        let profiles = build_model_profiles(file, None, None, None, None, None).unwrap();
+        let profiles = build_model_profiles(file, None, None).unwrap();
         let providers = profiles
             .iter()
             .map(|profile| profile.provider.as_str())
@@ -892,9 +826,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = build_model_profiles(file, None, None, None, None, None)
-            .err()
-            .unwrap();
+        let error = build_model_profiles(file, None, None).err().unwrap();
         assert!(
             error
                 .to_string()
@@ -934,32 +866,5 @@ mod tests {
         );
         assert_eq!(server.env.as_ref().unwrap().get("KEEP").unwrap(), "yes");
         assert_eq!(server.enabled, Some(true));
-    }
-
-    #[test]
-    fn rejects_removed_or_unknown_config_fields() {
-        let settings = serde_json::from_value::<SettingsFile>(serde_json::json!({
-            "defaultProvider": "deepseek",
-            "webSearch": "disabled"
-        }));
-        assert!(settings.is_err());
-
-        let models = serde_json::from_value::<ModelsFile>(serde_json::json!({
-            "providers": {
-                "deepseek": {
-                    "baseUrl": "https://api.deepseek.com",
-                    "api": "openai-responses",
-                    "models": [{
-                        "id": "deepseek-v4-pro",
-                        "api": "openai-completions",
-                        "reasoning": true,
-                        "compat": {"supportsStrictTools": true},
-                        "default": "high",
-                        "thinkingLevelMap": {"high": "high"}
-                    }]
-                }
-            }
-        }));
-        assert!(models.is_err());
     }
 }

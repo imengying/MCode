@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use crate::config::ReasoningEffort;
-
 const HELP_TEMPLATE: &str = "{before-help}{about-with-newline}\
 用法：{usage}\n\n\
 {all-args}{after-help}";
@@ -31,17 +29,6 @@ pub struct Cli {
     #[arg(short = 'm', long, global = true, value_name = "模型")]
     pub model: Option<String>,
 
-    /// 独立于模型选择的思考强度：off、minimal、low、medium、high、xhigh 或 max。
-    #[arg(
-        short = 'r',
-        long = "reasoning",
-        global = true,
-        value_enum,
-        value_name = "级别",
-        hide_possible_values = true
-    )]
-    pub reasoning_effort: Option<ReasoningEffort>,
-
     /// 覆盖所选供应商的 API 根地址。
     #[arg(long, global = true, value_name = "URL")]
     pub base_url: Option<String>,
@@ -49,18 +36,6 @@ pub struct Cli {
     /// 保存 API 密钥的环境变量。
     #[arg(long, global = true, value_name = "环境变量")]
     pub api_key_env: Option<String>,
-
-    /// 用于状态和上下文用量计算的上下文窗口。
-    #[arg(long, global = true, value_name = "TOKEN数")]
-    pub context_window: Option<u64>,
-
-    /// 模型可接受的最大输入 token 数。
-    #[arg(long, global = true, value_name = "TOKEN数")]
-    pub max_input_tokens: Option<u64>,
-
-    /// 单次模型响应允许的最大输出 token 数。
-    #[arg(long, global = true, value_name = "TOKEN数")]
-    pub max_output_tokens: Option<u64>,
 
     /// 以指定目录作为工作目录运行。
     #[arg(short = 'C', long = "cd", global = true, value_name = "目录")]

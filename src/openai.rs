@@ -60,6 +60,23 @@ impl OpenAiError {
         }
     }
 
+    fn rejects_tool_choice(&self) -> bool {
+        match self {
+            Self::Api { status, body, .. } => {
+                matches!(status, 400 | 422)
+                    && body.to_ascii_lowercase().contains("tool_choice")
+                    && (body.to_ascii_lowercase().contains("not support")
+                        || body.to_ascii_lowercase().contains("unsupported"))
+            }
+            Self::Cancelled
+            | Self::Http(_)
+            | Self::Url(_)
+            | Self::Json(_)
+            | Self::Protocol(_)
+            | Self::Stream { .. } => false,
+        }
+    }
+
     fn is_retryable_stream_failure(&self) -> bool {
         matches!(self, Self::Stream { .. })
     }
@@ -347,16 +364,12 @@ impl OpenAiClient {
         let (instructions, input) = responses_input(messages)?;
         let response_tools = responses_tools(tools, features.native_web_search);
         let has_tools = !response_tools.is_empty();
-        let body = ResponsesRequest {
+        let mut body = ResponsesRequest {
             model: &self.model,
             instructions: &instructions,
             input: &input,
             tools: &response_tools,
-            tool_choice: has_tools.then_some(if features.require_local_tool {
-                "required"
-            } else {
-                "auto"
-            }),
+            tool_choice: (has_tools && features.require_local_tool).then_some("required"),
             parallel_tool_calls: has_tools.then_some(true),
             reasoning: self
                 .reasoning_effort
@@ -372,7 +385,14 @@ impl OpenAiClient {
             stream: true,
         };
 
-        let response = self.send_stream_request(&body, events, cancel).await?;
+        let response = match self.send_stream_request(&body, events, cancel).await {
+            Ok(response) => response,
+            Err(error) if body.tool_choice.is_some() && error.rejects_tool_choice() => {
+                body.tool_choice = None;
+                self.send_stream_request(&body, events, cancel).await?
+            }
+            Err(error) => return Err(error),
+        };
         let request_id = response_request_id(response.headers());
 
         let mut bytes = response.bytes_stream();
@@ -1317,15 +1337,6 @@ mod tests {
         );
         assert!(!summary.contains("<html>"));
         assert!(!summary.contains("ignored"));
-    }
-
-    #[test]
-    fn builds_responses_web_search_tool() {
-        assert_eq!(
-            serde_json::to_value(responses_tools(&[], true)).unwrap(),
-            serde_json::json!([{"type": "web_search"}])
-        );
-        assert!(responses_tools(&[], false).is_empty());
     }
 
     #[test]

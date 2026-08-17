@@ -90,11 +90,6 @@ impl ChatMessage {
     }
 
     #[must_use]
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self::tool_with_file_change(tool_call_id, content, None)
-    }
-
-    #[must_use]
     pub fn tool_with_file_change(
         tool_call_id: impl Into<String>,
         content: impl Into<String>,

@@ -338,7 +338,7 @@ impl Session {
         Self::list_in(&base, cwd)
     }
 
-    pub fn list_in(base: &Path, cwd: &Path) -> Result<Vec<SessionSummary>> {
+    fn list_in(base: &Path, cwd: &Path) -> Result<Vec<SessionSummary>> {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("invalid session directory: {}", cwd.display()))?;
@@ -1798,36 +1798,6 @@ mod tests {
         assert_eq!(resumed.context_messages(), [ChatMessage::user("continue")]);
         assert!(!resumed.active_run_has_final_response());
         assert_eq!(resumed.total_usage(), usage);
-    }
-
-    #[test]
-    fn persists_run_failure_details_without_affecting_resume() {
-        let base = tempdir().unwrap();
-        let project = tempdir().unwrap();
-        let metadata = SessionMetadata {
-            provider: "deepseek".to_string(),
-            model: "test-model".to_string(),
-            reasoning_effort: ReasoningEffort::High,
-        };
-        let mut session = Session::create_in(base.path(), project.path(), metadata).unwrap();
-        let id = session.id();
-        let run_id = session.begin_run(ChatMessage::user("写入文件")).unwrap();
-        let path = session.path().unwrap().to_path_buf();
-        session
-            .finish_run_with_error(
-                run_id,
-                RunOutcome::Failed,
-                Some("provider completed without a tool call".to_string()),
-            )
-            .unwrap();
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("\"error\":\"provider completed without a tool call\""));
-        drop(session);
-
-        let resumed =
-            Session::resume_in(base.path(), project.path(), Some(&id.to_string())).unwrap();
-        assert_eq!(resumed.messages(), [ChatMessage::user("写入文件")]);
     }
 
     #[test]

@@ -53,6 +53,7 @@ use crate::session::{Session, SessionSummary};
 const APPROVAL_HEIGHT: u16 = 10;
 const DELETE_CONFIRMATION_HEIGHT: u16 = 7;
 const PERMISSION_PICKER_HEIGHT: u16 = 8;
+const MAX_MODEL_PICKER_ROWS: usize = 8;
 const MAX_SESSION_PICKER_ROWS: usize = 8;
 const COLLAPSED_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const COLLAPSED_PASTE_LINE_THRESHOLD: usize = 8;
@@ -73,7 +74,6 @@ const AGENT_EVENT_BUDGET: usize = 256;
 const BACKGROUND_EVENT_BUDGET: usize = 16;
 const ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(1);
-const CONTEXT_BASELINE_TOKENS: u64 = 12_000;
 // Match Codex's terminal-native palette: inherit the configured foreground/background and use
 // ANSI semantic colors so accents remain legible across terminal themes.
 const THEME_BASE: Color = Color::Reset;
@@ -363,36 +363,25 @@ pub fn run_interactive(
                             &mut active_cancel,
                         );
                     }
-                    UiAction::ListModels => match agent.try_lock() {
+                    UiAction::OpenModelPicker => match agent.try_lock() {
                         Ok(mut agent) => match agent.refresh_model_profiles() {
                             Ok(()) => {
                                 state.sync_from_agent(&agent);
-                                let notice = state.model_list_notice();
-                                state.push_notice(notice);
+                                if !state.open_model_picker() {
+                                    state.push_error("~/.mcode/models.json 中没有可用模型。");
+                                }
                             }
                             Err(error) => state.push_error(format!("{error:#}")),
                         },
                         Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
                     },
-                    UiAction::SelectModel(query) => match agent.try_lock() {
-                        Ok(mut agent) => match agent
-                            .refresh_model_profiles()
-                            .and_then(|()| agent.select_model(&query))
-                        {
-                            Ok(()) => {
-                                state.sync_from_agent(&agent);
-                                state.push_notice(format!("模型已切换为 {}。", state.model));
-                            }
-                            Err(error) => state.push_error(format!("{error:#}")),
-                        },
-                        Err(_) => state.push_error("Agent 正忙，请等待当前任务完成。"),
-                    },
-                    UiAction::SetReasoning(effort) => match agent.try_lock() {
-                        Ok(mut agent) => match agent.set_reasoning_effort(effort) {
+                    UiAction::SelectModel { query, effort } => match agent.try_lock() {
+                        Ok(mut agent) => match agent.select_model(&query, effort) {
                             Ok(()) => {
                                 state.sync_from_agent(&agent);
                                 state.push_notice(format!(
-                                    "effort 已切换为 {}。",
+                                    "已切换至 {} · effort {}",
+                                    state.qualified_model(),
                                     state.reasoning_effort
                                 ));
                             }
@@ -522,6 +511,7 @@ pub fn run_interactive(
             }
             Event::Paste(text)
                 if state.pending_approval.is_none()
+                    && state.model_picker.is_none()
                     && state.permission_picker.is_none()
                     && state.session_picker.is_none()
                     && state.delete_confirmation == DeleteConfirmation::None =>
@@ -1419,9 +1409,11 @@ enum UiAction {
         prompt: String,
         images: Vec<ImageAttachment>,
     },
-    ListModels,
-    SelectModel(String),
-    SetReasoning(ReasoningEffort),
+    OpenModelPicker,
+    SelectModel {
+        query: String,
+        effort: ReasoningEffort,
+    },
     SetPermissions(PermissionProfile),
     Compact(String),
     NewSession,
@@ -1452,13 +1444,8 @@ struct SlashSuggestion {
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
-        accepts_argument: true,
-        description: "查看或切换模型",
-    },
-    SlashCommand {
-        name: "effort",
-        accepts_argument: true,
-        description: "查看或设置 effort",
+        accepts_argument: false,
+        description: "选择模型与思考等级",
     },
     SlashCommand {
         name: "compact",
@@ -1534,87 +1521,23 @@ fn slash_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
     if state.dismissed_slash_input.as_deref() == Some(text.as_str()) {
         return Vec::new();
     }
-    let Some((name, argument)) = slash_input(&text) else {
+    let Some((name, None)) = slash_input(&text) else {
         return Vec::new();
     };
-    let Some(argument) = argument else {
-        let query = name.to_ascii_lowercase();
-        return SLASH_COMMANDS
-            .iter()
-            .filter(|command| command.name.starts_with(&query))
-            .map(|command| {
-                let trailing_space = if command.accepts_argument { " " } else { "" };
-                SlashSuggestion {
-                    label: format!("/{}", command.name),
-                    replacement: format!("/{}{trailing_space}", command.name),
-                    description: command.description.to_string(),
-                    replacement_range: None,
-                }
-            })
-            .collect();
-    };
-
-    let query = argument.to_ascii_lowercase();
-    match name.to_ascii_lowercase().as_str() {
-        "model" => state
-            .model_choices
-            .iter()
-            .filter_map(|choice| {
-                let qualified = format!("{}/{}", choice.provider, choice.id);
-                let matches = qualified.to_ascii_lowercase().starts_with(&query)
-                    || choice.id.to_ascii_lowercase().starts_with(&query)
-                    || choice
-                        .name
-                        .as_deref()
-                        .is_some_and(|value| value.to_ascii_lowercase().contains(&query));
-                if !matches {
-                    return None;
-                }
-                let qualified = sanitize_terminal_text(&qualified);
-                let current = choice.provider == state.provider && choice.id == state.model;
-                let detail = choice
-                    .name
-                    .as_deref()
-                    .map_or("Responses".to_string(), sanitize_terminal_text);
-                let description = if current {
-                    format!("当前 · {detail}")
-                } else {
-                    detail
-                };
-                Some(SlashSuggestion {
-                    label: format!("/model {qualified}"),
-                    replacement: format!("/model {qualified}"),
-                    description,
-                    replacement_range: None,
-                })
-            })
-            .collect(),
-        "effort" => state
-            .reasoning_choices
-            .iter()
-            .filter(|effort| effort.as_str().starts_with(&query))
-            .map(|effort| {
-                let mut markers = Vec::new();
-                if *effort == state.reasoning_effort {
-                    markers.push("当前");
-                }
-                if *effort == state.default_reasoning_effort {
-                    markers.push("默认");
-                }
-                SlashSuggestion {
-                    label: format!("/effort {effort}"),
-                    replacement: format!("/effort {effort}"),
-                    description: if markers.is_empty() {
-                        "思考强度".to_string()
-                    } else {
-                        markers.join("、")
-                    },
-                    replacement_range: None,
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+    let query = name.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(&query))
+        .map(|command| {
+            let trailing_space = if command.accepts_argument { " " } else { "" };
+            SlashSuggestion {
+                label: format!("/{}", command.name),
+                replacement: format!("/{}{trailing_space}", command.name),
+                description: command.description.to_string(),
+                replacement_range: None,
+            }
+        })
+        .collect()
 }
 
 fn file_suggestions(state: &UiState) -> Vec<SlashSuggestion> {
@@ -1764,6 +1687,43 @@ fn handle_key(
                 UiAction::ResolveApproval(ApprovalDecision::ApproveForSession)
             }
             KeyCode::Char('3' | 'n' | 'N') => UiAction::ResolveApproval(ApprovalDecision::Deny),
+            _ => UiAction::None,
+        };
+    }
+
+    if state.model_picker.is_some() {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return UiAction::None;
+        }
+        return match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(picker) = state.model_picker.as_mut() {
+                    picker.select_previous();
+                }
+                UiAction::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(picker) = state.model_picker.as_mut() {
+                    picker.select_next();
+                }
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                let selection = state.model_picker.as_mut().and_then(ModelPicker::confirm);
+                selection.map_or(UiAction::None, |(query, effort)| {
+                    state.model_picker = None;
+                    UiAction::SelectModel { query, effort }
+                })
+            }
+            KeyCode::Esc => {
+                if state.model_picker.as_mut().is_some_and(ModelPicker::back) {
+                    state.model_picker = None;
+                }
+                UiAction::None
+            }
             _ => UiAction::None,
         };
     }
@@ -2141,29 +2101,9 @@ fn submit_editor(state: &mut UiState) -> UiAction {
             state.push_error("用法：/delete");
             UiAction::None
         }
-        "model" if argument.is_empty() => UiAction::ListModels,
-        "model" => UiAction::SelectModel(argument.to_string()),
-        "effort" if argument.is_empty() => {
-            let notice = state.effort_list_notice();
-            state.push_notice(notice);
-            UiAction::None
-        }
-        "effort" => {
-            if let Some(effort) = parse_reasoning_effort(argument)
-                && state.reasoning_choices.contains(&effort)
-            {
-                return UiAction::SetReasoning(effort);
-            }
-            let choices = state
-                .reasoning_choices
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("、");
-            state.push_error(format!(
-                "当前模型 {} 未配置 effort {argument:?}。可选值：{choices}。",
-                state.qualified_model()
-            ));
+        "model" if argument.is_empty() => UiAction::OpenModelPicker,
+        "model" => {
+            state.push_error("用法：/model");
             UiAction::None
         }
         "status" => {
@@ -2173,7 +2113,7 @@ fn submit_editor(state: &mut UiState) -> UiAction {
         }
         "help" => {
             state.push_notice(
-                "命令：/model、/effort、/permissions、/diff、/review、/compact、/status、/new、/resume、/delete、/clear、/help、/exit",
+                "命令：/model、/permissions、/diff、/review、/compact、/status、/new、/resume、/delete、/clear、/help、/exit",
             );
             UiAction::None
         }
@@ -2452,12 +2392,6 @@ fn attachment_status(count: usize) -> String {
     } else {
         format!("已附加 {count} 张图片")
     }
-}
-
-fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
-    ReasoningEffort::ALL
-        .into_iter()
-        .find(|effort| effort.as_str().eq_ignore_ascii_case(value))
 }
 
 #[derive(Debug, Clone)]
@@ -2910,6 +2844,131 @@ impl SessionPicker {
 }
 
 #[derive(Debug)]
+struct ModelPicker {
+    models: Vec<ModelChoice>,
+    stage: ModelPickerStage,
+    current_model: Option<usize>,
+    current_effort: ReasoningEffort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPickerStage {
+    Model {
+        selection: usize,
+    },
+    Effort {
+        model_index: usize,
+        selection: usize,
+    },
+}
+
+impl ModelPicker {
+    fn new(
+        models: Vec<ModelChoice>,
+        current_provider: &str,
+        current_model: &str,
+        current_effort: ReasoningEffort,
+    ) -> Option<Self> {
+        if models.is_empty() {
+            return None;
+        }
+        let current_model = models
+            .iter()
+            .position(|model| model.provider == current_provider && model.id == current_model);
+        Some(Self {
+            models,
+            stage: ModelPickerStage::Model {
+                selection: current_model.unwrap_or(0),
+            },
+            current_model,
+            current_effort,
+        })
+    }
+
+    fn row_count(&self) -> usize {
+        match self.stage {
+            ModelPickerStage::Model { .. } => self.models.len(),
+            ModelPickerStage::Effort { model_index, .. } => {
+                self.models[model_index].reasoning_efforts.len()
+            }
+        }
+    }
+
+    fn select_previous(&mut self) {
+        let count = self.row_count();
+        if count == 0 {
+            return;
+        }
+        let selection = self.selection_mut();
+        *selection = if *selection == 0 {
+            count - 1
+        } else {
+            *selection - 1
+        };
+    }
+
+    fn select_next(&mut self) {
+        let count = self.row_count();
+        if count == 0 {
+            return;
+        }
+        let selection = self.selection_mut();
+        *selection = (*selection + 1) % count;
+    }
+
+    fn selection_mut(&mut self) -> &mut usize {
+        match &mut self.stage {
+            ModelPickerStage::Model { selection } | ModelPickerStage::Effort { selection, .. } => {
+                selection
+            }
+        }
+    }
+
+    fn confirm(&mut self) -> Option<(String, ReasoningEffort)> {
+        match self.stage {
+            ModelPickerStage::Model { selection } => {
+                let model = &self.models[selection];
+                let preferred = if self.current_model == Some(selection) {
+                    self.current_effort
+                } else {
+                    model.default_reasoning_effort
+                };
+                let effort_selection = model
+                    .reasoning_efforts
+                    .iter()
+                    .position(|effort| *effort == preferred)
+                    .unwrap_or(0);
+                self.stage = ModelPickerStage::Effort {
+                    model_index: selection,
+                    selection: effort_selection,
+                };
+                None
+            }
+            ModelPickerStage::Effort {
+                model_index,
+                selection,
+            } => {
+                let model = &self.models[model_index];
+                let effort = model.reasoning_efforts[selection];
+                Some((format!("{}/{}", model.provider, model.id), effort))
+            }
+        }
+    }
+
+    fn back(&mut self) -> bool {
+        match self.stage {
+            ModelPickerStage::Model { .. } => true,
+            ModelPickerStage::Effort { model_index, .. } => {
+                self.stage = ModelPickerStage::Model {
+                    selection: model_index,
+                };
+                false
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct ApprovalView {
     name: String,
     arguments: String,
@@ -3040,7 +3099,6 @@ struct UiState {
     model: String,
     provider: String,
     reasoning_effort: ReasoningEffort,
-    default_reasoning_effort: ReasoningEffort,
     endpoint: String,
     cwd: std::path::PathBuf,
     current_session_id: String,
@@ -3048,7 +3106,6 @@ struct UiState {
     workspace_index_generation: u64,
     workspace_index_state: WorkspaceIndexState,
     model_choices: Vec<ModelChoice>,
-    reasoning_choices: Vec<ReasoningEffort>,
     permission_profile: PermissionProfile,
     archived_messages: Vec<ViewMessage>,
     transient_archive_start: Option<usize>,
@@ -3075,6 +3132,7 @@ struct UiState {
     max_input_tokens: u64,
     usage_estimated: bool,
     delete_confirmation: DeleteConfirmation,
+    model_picker: Option<ModelPicker>,
     permission_picker: Option<usize>,
     session_picker: Option<SessionPicker>,
     pending_images: Vec<ImageAttachment>,
@@ -3104,7 +3162,6 @@ impl UiState {
             model,
             provider: "xai".to_string(),
             reasoning_effort: ReasoningEffort::Off,
-            default_reasoning_effort: ReasoningEffort::Off,
             endpoint,
             cwd,
             current_session_id: String::new(),
@@ -3112,7 +3169,6 @@ impl UiState {
             workspace_index_generation: 0,
             workspace_index_state: WorkspaceIndexState::Idle,
             model_choices: Vec::new(),
-            reasoning_choices: ReasoningEffort::ALL.to_vec(),
             permission_profile: PermissionProfile::default(),
             archived_messages: Vec::new(),
             transient_archive_start: None,
@@ -3139,6 +3195,7 @@ impl UiState {
             max_input_tokens: 128_000,
             usage_estimated: false,
             delete_confirmation: DeleteConfirmation::None,
+            model_picker: None,
             permission_picker: None,
             session_picker: None,
             pending_images: Vec::new(),
@@ -3168,10 +3225,8 @@ impl UiState {
         self.model = sanitize_terminal_text(agent.model());
         self.provider = sanitize_terminal_text(agent.provider());
         self.reasoning_effort = agent.reasoning_effort();
-        self.default_reasoning_effort = agent.default_reasoning_effort();
         self.endpoint = sanitize_terminal_text(agent.endpoint());
         self.model_choices = agent.model_choices();
-        self.reasoning_choices = agent.available_reasoning_efforts();
         self.permission_profile = agent.permission_profile();
         self.current_session_id = agent.session().id().to_string();
         self.usage = agent.total_usage();
@@ -3236,6 +3291,16 @@ impl UiState {
             selection: 0,
         });
         Ok(true)
+    }
+
+    fn open_model_picker(&mut self) -> bool {
+        self.model_picker = ModelPicker::new(
+            self.model_choices.clone(),
+            &self.provider,
+            &self.model,
+            self.reasoning_effort,
+        );
+        self.model_picker.is_some()
     }
 
     fn begin_run(&mut self, status: impl Into<String>) {
@@ -3467,6 +3532,7 @@ impl UiState {
             }
         }
         self.delete_confirmation = DeleteConfirmation::None;
+        self.model_picker = None;
         self.permission_picker = None;
         self.session_picker = None;
     }
@@ -3591,6 +3657,9 @@ impl UiState {
         self.usage_estimated = false;
         self.status = "就绪".to_string();
         self.delete_confirmation = DeleteConfirmation::None;
+        self.model_picker = None;
+        self.permission_picker = None;
+        self.session_picker = None;
         self.pending_images.clear();
         self.queued_submissions.clear();
         self.dismissed_slash_input = None;
@@ -3612,6 +3681,9 @@ impl UiState {
         self.generation_start = None;
         self.protected_turn_start = None;
         self.delete_confirmation = DeleteConfirmation::None;
+        self.model_picker = None;
+        self.permission_picker = None;
+        self.session_picker = None;
         self.reset_reasoning_summary();
     }
 
@@ -3771,76 +3843,6 @@ impl UiState {
         self.dismissed_slash_input = None;
     }
 
-    fn model_list_notice(&self) -> String {
-        if self.model_choices.is_empty() {
-            return format!(
-                "当前模型：{}\n~/.mcode/models.json 中没有可用模型。",
-                self.model
-            );
-        }
-        let mut lines = vec!["已配置的模型：".to_string()];
-        for choice in &self.model_choices {
-            let selected = if choice.provider == self.provider && choice.id == self.model {
-                "*"
-            } else {
-                " "
-            };
-            let name = choice.name.as_deref().map_or_else(String::new, |name| {
-                format!(" ({})", sanitize_terminal_text(name))
-            });
-            let reasoning = if choice.reasoning {
-                "，支持思考"
-            } else {
-                ""
-            };
-            let limits = if choice.max_input_tokens == choice.context_window {
-                format!("{} 上下文/输入", format_tokens(choice.context_window))
-            } else {
-                format!(
-                    "{} 上下文，{} 最大输入",
-                    format_tokens(choice.context_window),
-                    format_tokens(choice.max_input_tokens)
-                )
-            };
-            lines.push(format!(
-                "{selected} {}/{}{} - {limits}, Responses{reasoning}",
-                sanitize_terminal_text(&choice.provider),
-                sanitize_terminal_text(&choice.id),
-                name,
-            ));
-        }
-        lines.push("使用 /model <提供商/模型> 选择。".to_string());
-        lines.join("\n")
-    }
-
-    fn effort_list_notice(&self) -> String {
-        let mut lines = vec![format!(
-            "当前模型 {} 配置的 effort 级别：",
-            self.qualified_model()
-        )];
-        for effort in &self.reasoning_choices {
-            let selected = if *effort == self.reasoning_effort {
-                "*"
-            } else {
-                " "
-            };
-            let default = if *effort == self.default_reasoning_effort {
-                "（默认）"
-            } else {
-                ""
-            };
-            lines.push(format!("{selected} {effort}{default}"));
-        }
-        let choices = self
-            .reasoning_choices
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("|");
-        lines.push(format!("使用 /effort <{choices}> 选择。"));
-        lines.join("\n")
-    }
-
     fn qualified_model(&self) -> String {
         format!("{}/{}", self.provider, self.model)
     }
@@ -3871,7 +3873,7 @@ impl UiState {
             format!("（{} 个连接中）", self.mcp_startups_remaining)
         };
         format!(
-            "模型：{qualified_model}\nAPI：OpenAI Responses\neffort：{}\n权限：{}\n网页搜索：原生开启\n输入：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\nToken：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具{mcp_starting}\n端点：{}\n工作目录：{}",
+            "模型：{qualified_model}\nAPI：OpenAI Responses\neffort：{}\n权限：{}\n网页搜索：原生开启\n上下文已用：{estimate}{}/{}（{percent}%）\n模型上下文窗口：{}\n累计 Token：{estimate}输入 {}，输出 {}{cache}\nMCP：{} 个服务器，{} 个工具{mcp_starting}\n端点：{}\n工作目录：{}",
             self.reasoning_effort,
             self.permission_profile.label(),
             format_tokens(context_tokens),
@@ -4459,6 +4461,8 @@ struct UiSectionHeights {
 fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeights {
     let input = if state.pending_approval.is_some() {
         APPROVAL_HEIGHT
+    } else if let Some(picker) = &state.model_picker {
+        u16::try_from(picker.row_count().min(MAX_MODEL_PICKER_ROWS) + 5).unwrap_or(u16::MAX)
     } else if let Some(picker) = &state.session_picker {
         u16::try_from(picker.sessions.len().min(MAX_SESSION_PICKER_ROWS) + 5).unwrap_or(u16::MAX)
     } else if state.permission_picker.is_some() {
@@ -4473,6 +4477,7 @@ fn ui_section_heights(state: &UiState, width: u16, height: u16) -> UiSectionHeig
         editor_height.saturating_add(u16::from(!state.pending_images.is_empty()))
     };
     let modal = state.pending_approval.is_some()
+        || state.model_picker.is_some()
         || state.permission_picker.is_some()
         || state.session_picker.is_some()
         || state.delete_confirmation != DeleteConfirmation::None;
@@ -4777,6 +4782,11 @@ fn render_input(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         return;
     }
 
+    if let Some(picker) = &state.model_picker {
+        render_model_picker(frame, picker, area);
+        return;
+    }
+
     if let Some(selection) = state.permission_picker {
         let mut lines = vec![
             Line::default(),
@@ -4970,6 +4980,133 @@ fn render_session_picker(frame: &mut Frame<'_>, picker: &SessionPicker, area: Re
     );
 }
 
+fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker, area: Rect) {
+    let (title, selected, rows, footer) = match picker.stage {
+        ModelPickerStage::Model { selection } => {
+            let rows = picker
+                .models
+                .iter()
+                .enumerate()
+                .map(|(index, model)| {
+                    let qualified =
+                        sanitize_terminal_text(&format!("{}/{}", model.provider, model.id));
+                    let current = if picker.current_model == Some(index) {
+                        "当前"
+                    } else {
+                        ""
+                    };
+                    let detail = model
+                        .name
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_default();
+                    (qualified, current.to_string(), detail)
+                })
+                .collect::<Vec<_>>();
+            (
+                "选择模型".to_string(),
+                selection,
+                rows,
+                "  ↑/↓ 选择 · Enter 继续 · Esc 返回",
+            )
+        }
+        ModelPickerStage::Effort {
+            model_index,
+            selection,
+        } => {
+            let model = &picker.models[model_index];
+            let rows = model
+                .reasoning_efforts
+                .iter()
+                .map(|effort| {
+                    let marker = if *effort == model.default_reasoning_effort {
+                        "默认"
+                    } else {
+                        ""
+                    };
+                    (effort.to_string(), marker.to_string(), String::new())
+                })
+                .collect::<Vec<_>>();
+            (
+                format!(
+                    "选择思考等级 · {}/{}",
+                    sanitize_terminal_text(&model.provider),
+                    sanitize_terminal_text(&model.id)
+                ),
+                selection,
+                rows,
+                "  ↑/↓ 选择 · Enter 确认 · Esc 返回",
+            )
+        }
+    };
+
+    let visible = usize::from(area.height.saturating_sub(5));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(rows.len().saturating_sub(visible));
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            format!(
+                "  {}",
+                truncate_width(
+                    &title,
+                    usize::from(area.width.saturating_sub(2)).saturating_add(1)
+                )
+            ),
+            Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
+    for (index, (label, marker, detail)) in rows.iter().enumerate().skip(start).take(visible) {
+        let is_selected = index == selected;
+        let suffix = [marker.as_str(), detail.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let label = truncate_width(
+            label,
+            usize::from(area.width.saturating_sub(4)).saturating_add(1),
+        );
+        let available = usize::from(area.width)
+            .saturating_sub(display_width(&label))
+            .saturating_sub(7);
+        lines.push(Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                label,
+                if is_selected {
+                    Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(THEME_TEXT)
+                },
+            ),
+            Span::styled(
+                if suffix.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", truncate_width(&suffix, available.saturating_add(1)))
+                },
+                Style::default().fg(THEME_MUTED),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(THEME_MUTED),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(THEME_BASE)),
+        area,
+    );
+}
+
 fn render_pending_images(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     let names = state
         .pending_images
@@ -5048,9 +5185,9 @@ fn footer_line(state: &UiState, width: usize) -> Line<'static> {
     } else {
         ""
     };
-    let remaining = context_remaining_percent(context_tokens, state.max_input_tokens);
-    let context_full = format!("context {estimate}{remaining}%");
-    let context_compact = format!("{estimate}{remaining}%");
+    let used = context_used_percent(context_tokens, state.max_input_tokens);
+    let context_full = format!("context {estimate}{used}%");
+    let context_compact = format!("{estimate}{used}%");
     let input = format!("in {}", format_tokens(usage_values.prompt_tokens));
     let output = format!("out {}", format_tokens(usage_values.completion_tokens));
     let effort = state.reasoning_effort.to_string();
@@ -5128,19 +5265,14 @@ fn footer_right_width(context: &str, input: &str, output: &str, show_usage: bool
             * (display_width(" · ") * 2 + display_width(input) + display_width(output))
 }
 
-fn context_remaining_percent(tokens: u64, limit: u64) -> u64 {
-    if limit <= CONTEXT_BASELINE_TOKENS {
+fn context_used_percent(tokens: u64, limit: u64) -> u64 {
+    if limit == 0 {
         return 0;
     }
-    let effective_limit = limit - CONTEXT_BASELINE_TOKENS;
-    let used = tokens
-        .saturating_sub(CONTEXT_BASELINE_TOKENS)
-        .min(effective_limit);
-    let remaining = effective_limit - used;
-    let rounded = u128::from(remaining)
+    let rounded = u128::from(tokens.min(limit))
         .saturating_mul(100)
-        .saturating_add(u128::from(effective_limit) / 2)
-        / u128::from(effective_limit);
+        .saturating_add(u128::from(limit) / 2)
+        / u128::from(limit);
     u64::try_from(rounded).unwrap_or(100).min(100)
 }
 
@@ -6971,21 +7103,21 @@ mod tests {
 
         let wide = footer_line(&state, 120).to_string();
         assert!(wide.starts_with("  grok-4.5 effort high"));
-        assert!(wide.ends_with("context 80% · in 1.2k · out 300"));
+        assert!(wide.ends_with("context 29% · in 1.2k · out 300"));
         assert_eq!(display_width(&wide), 120);
         let medium = footer_line(&state, 50).to_string();
         assert!(medium.starts_with("  grok-4.5 effort high"));
-        assert!(medium.ends_with("context 80%"));
+        assert!(medium.ends_with("context 29%"));
         assert!(!medium.contains("in 1.2k"));
         let narrow = footer_line(&state, 20);
-        assert!(narrow.to_string().ends_with("context 80%"));
+        assert!(narrow.to_string().ends_with("context 29%"));
         assert_eq!(narrow.width(), 20);
 
         state.usage_estimated = true;
         assert!(
             footer_line(&state, 120)
                 .to_string()
-                .contains("context ~80%")
+                .contains("context ~29%")
         );
     }
 
@@ -7796,25 +7928,16 @@ mod tests {
             "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
-        state.editor.insert('/');
+        state.editor.insert_str("/mo");
         assert!(matches!(
             handle_key(
-                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 &mut state,
                 None,
             ),
-            UiAction::None
+            UiAction::OpenModelPicker
         ));
-        assert!(matches!(
-            handle_key(
-                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-                &mut state,
-                None,
-            ),
-            UiAction::None
-        ));
-        assert_eq!(state.editor.text(), "/effort ");
-        assert_eq!(slash_suggestions(&state).len(), ReasoningEffort::ALL.len());
+        assert!(state.editor.is_empty());
 
         state.editor.set_text("/sta");
         assert!(matches!(
@@ -7830,21 +7953,40 @@ mod tests {
     }
 
     #[test]
-    fn slash_effort_lists_and_accepts_only_the_current_model_configuration() {
+    fn model_picker_selects_model_then_effort_and_returns_by_stage() {
         let mut state = UiState::new(
             "grok".to_string(),
             "http://localhost/v1/responses".to_string(),
             std::path::PathBuf::from("."),
         );
         state.reasoning_effort = ReasoningEffort::Medium;
-        state.default_reasoning_effort = ReasoningEffort::High;
-        state.reasoning_choices = vec![
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
+        state.model_choices = vec![
+            ModelChoice {
+                provider: "xai".to_string(),
+                id: "grok".to_string(),
+                name: Some("Grok".to_string()),
+                reasoning_efforts: vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ],
+                default_reasoning_effort: ReasoningEffort::High,
+            },
+            ModelChoice {
+                provider: "deepseek".to_string(),
+                id: "deepseek-v4-pro".to_string(),
+                name: None,
+                reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                default_reasoning_effort: ReasoningEffort::High,
+            },
         ];
+        assert!(state.open_model_picker());
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let model_screen = rendered_terminal(&terminal);
+        assert!(model_screen.contains("xai/grok"));
+        assert!(model_screen.contains("deepseek/deepseek-v4-pro"));
 
-        state.editor.insert_str("/effort");
         assert!(matches!(
             handle_key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -7853,35 +7995,57 @@ mod tests {
             ),
             UiAction::None
         ));
-        let notice = &state.messages.last().unwrap().content;
-        assert!(notice.contains("xai/grok"));
-        assert!(notice.contains("* medium"));
-        assert!(notice.contains("high（默认）"));
-        assert!(notice.contains("/effort <low|medium|high>"));
-        assert!(!notice.contains("xhigh"));
-
-        state.editor.insert_str("/effort xhigh");
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let effort_screen = rendered_terminal(&terminal);
+        assert!(effort_screen.contains("low"));
+        assert!(effort_screen.contains("high"));
         assert!(matches!(
             handle_key(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                 &mut state,
                 None,
             ),
             UiAction::None
         ));
-        let error = &state.messages.last().unwrap().content;
-        assert!(error.contains("未配置 effort \"xhigh\""));
-        assert!(error.contains("可选值：low、medium、high"));
-
-        state.editor.insert_str("/effort low");
         assert!(matches!(
             handle_key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 &mut state,
                 None,
             ),
-            UiAction::SetReasoning(ReasoningEffort::Low)
+            UiAction::SelectModel {
+                query,
+                effort: ReasoningEffort::High,
+            } if query == "xai/grok"
         ));
+        assert!(state.model_picker.is_none());
+
+        assert!(state.open_model_picker());
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert!(matches!(
+            state.model_picker.as_ref().map(|picker| picker.stage),
+            Some(ModelPickerStage::Model { selection: 1 })
+        ));
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            None,
+        );
+        assert!(state.model_picker.is_none());
     }
 
     #[test]

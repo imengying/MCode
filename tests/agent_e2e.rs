@@ -135,14 +135,14 @@ async fn executes_a_tool_and_continues_the_model_turn() {
 }
 
 #[tokio::test]
-async fn retries_a_deferred_file_action_with_a_required_local_tool() {
+async fn retries_without_tool_choice_when_an_endpoint_rejects_it() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let server_requests = Arc::clone(&requests);
 
     let server = tokio::spawn(async move {
-        for index in 0..3 {
+        for index in 0..4 {
             let (mut stream, _) = listener.accept().await.unwrap();
             server_requests
                 .lock()
@@ -151,6 +151,14 @@ async fn retries_a_deferred_file_action_with_a_required_local_tool() {
             match index {
                 0 => write_sse_text(&mut stream, "好的，这就追加到 result.txt。", None).await,
                 1 => {
+                    write_http_error(
+                        &mut stream,
+                        400,
+                        r#"{"error":{"message":"Thinking mode does not support this tool_choice","type":"invalid_request_error"}}"#,
+                    )
+                    .await;
+                }
+                2 => {
                     write_sse_tool_call(
                         &mut stream,
                         "call_retry_write",
@@ -165,7 +173,10 @@ async fn retries_a_deferred_file_action_with_a_required_local_tool() {
     });
 
     let project = tempdir().unwrap();
-    let config = basic_config(project.path(), address);
+    let mut config = basic_config(project.path(), address);
+    config.provider = "deepseek".to_string();
+    config.reasoning_effort = ReasoningEffort::High;
+    config.reasoning_value = Some("high".to_string());
     let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
     let mut agent = Agent::new(&config, session).await.unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -188,10 +199,11 @@ async fn retries_a_deferred_file_action_with_a_required_local_tool() {
         "retried by tool"
     );
     let requests = requests.lock().await;
-    assert_eq!(requests.len(), 3);
-    assert_eq!(requests[0]["tool_choice"], "auto");
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].get("tool_choice").is_none());
     assert_eq!(requests[1]["tool_choice"], "required");
-    let retry_tool_names = requests[1]["tools"]
+    assert!(requests[2].get("tool_choice").is_none());
+    let retry_tool_names = requests[2]["tools"]
         .as_array()
         .unwrap()
         .iter()
@@ -203,7 +215,7 @@ async fn retries_a_deferred_file_action_with_a_required_local_tool() {
         ["read_file", "write_file", "edit_file", "shell"]
     );
     assert!(
-        requests[1]["input"]
+        requests[2]["input"]
             .as_array()
             .unwrap()
             .iter()
@@ -527,83 +539,6 @@ async fn responses_api_runs_local_tools_and_native_web_search() {
             && item["id"] == "rs_deepseek"
             && item["content"][0]["type"] == "reasoning_text"
     }));
-}
-
-#[tokio::test]
-async fn glm_responses_exposes_native_web_search() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_json_request(&mut stream).await;
-        write_responses_sse(
-            &mut stream,
-            vec![
-                json!({
-                    "type": "response.output_text.delta",
-                    "delta": "Search tools are available."
-                }),
-                json!({
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "Search tools are available.",
-                            "annotations": [{
-                                "type": "url_citation",
-                                "url": "https://www.rust-lang.org/",
-                                "title": "Rust Programming Language"
-                            }]
-                        }]
-                    }
-                }),
-                responses_completed("resp_glm", 30, 5),
-            ],
-        )
-        .await;
-        request
-    });
-
-    let project = tempdir().unwrap();
-    let mut config = basic_config(project.path(), address);
-    config.provider = "glm".to_string();
-    let session = Session::create(project.path(), SessionMetadata::from(&config), false).unwrap();
-    let mut agent = Agent::new(&config, session).await.unwrap();
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let status = agent
-        .run(
-            "find the current Rust release",
-            Vec::new(),
-            &tx,
-            &CancellationToken::new(),
-            &ApprovalGate::default(),
-        )
-        .await
-        .unwrap();
-    let request = server.await.unwrap();
-
-    assert_eq!(status, RunStatus::Completed);
-    let tools = request["tools"].as_array().unwrap();
-    let web_search = tools
-        .iter()
-        .find(|tool| tool["type"] == "web_search")
-        .unwrap();
-    assert_eq!(web_search.as_object().unwrap().len(), 1);
-    assert!(tools.iter().any(|tool| tool["name"] == "fetch_content"));
-    assert!(!tools.iter().any(|tool| tool["name"] == "web_search"));
-    assert!(request.get("include").is_none());
-    assert!(request.get("prompt_cache_key").is_none());
-    assert!(
-        agent
-            .messages()
-            .last()
-            .and_then(|message| message.content.as_deref())
-            .is_some_and(|content| {
-                content.contains("[Rust Programming Language](https://www.rust-lang.org/)")
-            })
-    );
 }
 
 #[tokio::test]

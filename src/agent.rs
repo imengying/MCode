@@ -78,14 +78,13 @@ pub struct Agent {
     auto_compaction_failed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelChoice {
-    pub provider: String,
-    pub id: String,
-    pub name: Option<String>,
-    pub context_window: u64,
-    pub max_input_tokens: u64,
-    pub reasoning: bool,
+#[derive(Debug, Clone)]
+pub(crate) struct ModelChoice {
+    pub(crate) provider: String,
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) reasoning_efforts: Vec<ReasoningEffort>,
+    pub(crate) default_reasoning_effort: ReasoningEffort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -904,44 +903,34 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn model_choices(&self) -> Vec<ModelChoice> {
+    pub(crate) fn model_choices(&self) -> Vec<ModelChoice> {
         self.model_profiles
             .iter()
             .map(|profile| ModelChoice {
                 provider: profile.provider.clone(),
                 id: profile.id.clone(),
                 name: profile.name.clone(),
-                context_window: profile.context_window,
-                max_input_tokens: profile.max_input_tokens,
-                reasoning: profile.is_reasoning_model(),
+                reasoning_efforts: profile.supported_reasoning_efforts(),
+                default_reasoning_effort: profile.default_reasoning_effort(),
             })
             .collect()
     }
 
-    pub fn refresh_model_profiles(&mut self) -> Result<()> {
+    pub(crate) fn refresh_model_profiles(&mut self) -> Result<()> {
         self.model_profiles = load_model_profiles(&self.reload_overrides)?;
         Ok(())
     }
 
-    #[must_use]
-    pub fn available_reasoning_efforts(&self) -> Vec<ReasoningEffort> {
-        self.current_profile().map_or_else(
-            || ReasoningEffort::ALL.to_vec(),
-            ModelProfile::supported_reasoning_efforts,
-        )
-    }
-
-    #[must_use]
-    pub const fn default_reasoning_effort(&self) -> ReasoningEffort {
-        self.default_reasoning_effort
-    }
-
-    pub fn select_model(&mut self, query: &str) -> Result<()> {
+    pub(crate) fn select_model(&mut self, query: &str, effort: ReasoningEffort) -> Result<()> {
         let profile = find_model_profile(&self.model_profiles, Some(&self.provider), query)?
             .with_context(|| format!("模型 {query:?} 不在 ~/.mcode/models.json 中"))?
             .clone();
-        let effective_effort = profile.default_reasoning_effort();
-        let reasoning_value = profile.reasoning_value(effective_effort)?;
+        self.apply_model(profile, effort)
+    }
+
+    fn apply_model(&mut self, profile: ModelProfile, effort: ReasoningEffort) -> Result<()> {
+        let default_effort = profile.default_reasoning_effort();
+        let reasoning_value = profile.reasoning_value(effort)?;
         self.client.reconfigure(OpenAiModelConfig {
             provider: profile.provider.clone(),
             base_url: profile.base_url.clone(),
@@ -951,8 +940,8 @@ impl Agent {
             reasoning_effort: reasoning_value,
         })?;
         self.provider = profile.provider;
-        self.reasoning_effort = effective_effort;
-        self.default_reasoning_effort = effective_effort;
+        self.reasoning_effort = effort;
+        self.default_reasoning_effort = default_effort;
         self.context_window = profile.context_window;
         self.max_input_tokens = profile.max_input_tokens;
         self.supports_images = profile.supports_images;
@@ -961,23 +950,6 @@ impl Agent {
         self.session.set_reasoning_effort(self.reasoning_effort)?;
         self.context_tokens = self.estimated_context_tokens();
         self.usage_estimated = true;
-        Ok(())
-    }
-
-    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) -> Result<()> {
-        let effective_effort = self
-            .current_profile()
-            .map_or(effort, |profile| profile.clamp_reasoning_effort(effort));
-        let reasoning_value = self.current_profile().map_or_else(
-            || {
-                Ok((effective_effort != ReasoningEffort::Off)
-                    .then(|| effective_effort.as_str().to_string()))
-            },
-            |profile| profile.reasoning_value(effective_effort),
-        )?;
-        self.client.set_reasoning_effort(reasoning_value);
-        self.session.set_reasoning_effort(effective_effort)?;
-        self.reasoning_effort = effective_effort;
         Ok(())
     }
 
@@ -1548,11 +1520,16 @@ mod tests {
         .unwrap();
         let mut agent = Agent::new(&config, session).await.unwrap();
 
-        agent.set_reasoning_effort(ReasoningEffort::Low).unwrap();
+        agent.reasoning_effort = ReasoningEffort::Low;
+        agent.client.set_reasoning_effort(Some("low".to_string()));
+        agent
+            .session
+            .set_reasoning_effort(ReasoningEffort::Low)
+            .unwrap();
         agent.new_session().unwrap();
 
         assert_eq!(agent.reasoning_effort(), ReasoningEffort::High);
-        assert_eq!(agent.default_reasoning_effort(), ReasoningEffort::High);
+        assert_eq!(agent.default_reasoning_effort, ReasoningEffort::High);
         assert_eq!(agent.client.reasoning_effort(), Some("high"));
         assert_eq!(agent.session.reasoning_effort(), ReasoningEffort::High);
     }

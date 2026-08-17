@@ -36,16 +36,10 @@ async fn run() -> Result<()> {
     let root_prompt = cli.root_prompt();
     let model_was_overridden =
         cli.model.is_some() || env::var("MCODE_MODEL").is_ok_and(|value| !value.trim().is_empty());
-    let reasoning_was_overridden = cli.reasoning_effort.is_some()
-        || env::var("MCODE_REASONING_EFFORT").is_ok_and(|value| !value.trim().is_empty());
     let overrides = ConfigOverrides {
         model: cli.model.clone(),
-        reasoning_effort: cli.reasoning_effort,
         base_url: cli.base_url.clone(),
         api_key_env: cli.api_key_env.clone(),
-        context_window: cli.context_window,
-        max_input_tokens: cli.max_input_tokens,
-        max_output_tokens: cli.max_output_tokens,
         cwd: cli.cwd.clone(),
         request_timeout_secs: cli.request_timeout,
     };
@@ -83,15 +77,8 @@ async fn run() -> Result<()> {
             };
             let session = Session::resume(&config.cwd, Some(&selector))?;
             let saved_model = session.model_selector();
-            match (model_was_overridden, reasoning_was_overridden) {
-                (false, false) => {
-                    config.select_model_and_reasoning(&saved_model, session.reasoning_effort())?;
-                }
-                (false, true) => config.select_model(&saved_model)?,
-                (true, false) => {
-                    config.select_reasoning_effort(session.reasoning_effort())?;
-                }
-                (true, true) => {}
+            if !model_was_overridden {
+                config.select_model(&saved_model, session.reasoning_effort())?;
             }
             let prompt = join_prompt(&args.prompt);
             let images = load_images(&cli.images, &config.cwd)?;
